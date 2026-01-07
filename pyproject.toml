@@ -13,6 +13,7 @@ dependencies = [
   "scikit-image>=0.9",
   "spectral-cube>=0.5",
   "radio-beam>=0.3",
+  "jax>=0.3",
 ]
 requires-python = ">=3.7"
 authors = [{ name = "Jaime E. Pineda", email = "jpineda@mpe.mpg.de" }]
