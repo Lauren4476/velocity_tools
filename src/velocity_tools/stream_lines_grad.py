@@ -1,5 +1,5 @@
 '''
-This file provides streamline functions that are fully differentiable using JAX.
+This file will provide streamline functions that are fully differentiable using JAX.
 
 JAX numpy does not accept units. Therefore, all inputs for jax must be unitless.
 The wrapper function is xyz_stream. Currently, user inputs quantities with astropy units into this 
@@ -13,11 +13,12 @@ The assumed input units are:
 
 '''
 TODO:
-- Replace root finder (scipy.optimize) with differentiable version
+- Add bounds to minimisation code for getting theta?
+- Replace python for loops with vectorisation or lax.scan
+- Remove unused imports
 - Test
 '''
 
-import numpy as np
 import astropy.units as u
 from scipy import optimize
 from .helper_functions import *
@@ -25,6 +26,8 @@ from .helper_functions import *
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax import debug
+from jax.scipy.optimize import minimize
 
 
 #
@@ -65,7 +68,7 @@ def r_cent(mass, omega=1e-14, r0=1e4):
 
 
 def theta_abs(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
-              orb_ang=90):
+              orb_ang=jnp.pi / 2):
     """
     function to determine theta numerically by finding the root of a function
     This is equation (9) in Mendoza+(2009)
@@ -74,16 +77,16 @@ def theta_abs(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
     :param r_to_rc: radius in units of the centrifugal radius
     :param theta0: Initial angle of the streamline, radians
     :param ecc: eccentricity of the orbit (equation 6)
-    :param orb_ang: angle in the orbital motion (equation 7), DEGREES
+    :param orb_ang: angle in the orbital motion (equation 7), radians
     :return: returns the difference between the radius and the predicted one,
            a value of 0 corresponds to a proper streamline
     """
     cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
     safe_cos_ratio = jnp.clip(cos_ratio, -1.0 + eps, 1.0 - eps)
-    orb_ang_rad = orb_ang * jnp.pi / 180
-    xi = jnp.arccos(safe_cos_ratio) + orb_ang_rad # <- thi is in radians
+    xi = jnp.arccos(safe_cos_ratio) + orb_ang # <- this is in radians
     geom = jnp.sin(theta0)**2 / (1 - ecc * jnp.cos(xi))
-    return jnp.abs(r_to_rc - geom)
+    return jnp.sum((r_to_rc - geom)**2) #new, gradient is smooth
+    #return jnp.sum(jnp.abs(r_to_rc - geom)) # old, gradient has kink at 0
 
 
 def get_dphi(theta, theta0=jnp.radians(30)):
@@ -115,7 +118,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :return: theta, radians
     """
     rc = r_cent(mass=mass, omega=omega, r0=r0)
-    print("rc={0}".format(rc))
+    #print("rc={0}".format(rc))
     theta = jnp.zeros_like(r) + jnp.nan
     # mu and nu are dimensionless
     mu = (rc / r0)
@@ -123,19 +126,51 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     # epsilon is the dimensionless energy
     epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
     ecc = jnp.sqrt(1 + epsilon * jnp.sin(theta0)**2)
-    orb_ang = jnp.arccos((1 - mu * jnp.sin(theta0)**2) / ecc) #this is in radians
+    # definition of orb_ang here
+    orb_ang = jnp.arccos((1 - mu * jnp.sin(theta0)**2) / ecc) #<- this is in radians
 
     # the first element in the streamline is the starting point
     theta = theta.at[0].set(theta0)
     # Initial guess at largest radius is theta0 +- initguess towards the midplane
     deltar = jnp.amin(jnp.abs(jnp.roll(r,1) - r))
-    print(deltar)
+    #print(deltar)
     # we use a constant of 6e-5 for an epsilon of 0.01 km/s
     # this result will be in radians
     tol = (6.e-5 * (au_to_m(deltar) / 1000) * omega / (v_r0+ 0.1))
     # the initial guess will be 10 times the tolerance for now, in testing
     initguess = 10 * tol
-    print('tolerance ', tol)
+    #print('tolerance ', tol)
+
+    ### New minimisation code (jax compatible):
+    # theta_bracket unused so far as BFGS does not take bounds...
+    if theta0 < jnp.radians(90):
+        theta_i = theta0 + initguess
+        theta_bracket = [(theta0, jnp.pi/2.)]
+    else:
+        theta_i = theta0 - initguess
+        theta_bracket = [(jnp.pi/2., theta0)]
+    theta_i_vec = jnp.atleast_1d(theta_i) # jax minimize expects an array
+
+    for ind in jnp.arange(1, len(r)):
+        r_i = (r[ind] / rc)
+        if r_i > 0.5:
+            # Using jax.scipy.optimize.minimize
+            # It uses the BFGS method (currently this is the only method supported)
+            # It DOES NOT TAKE BOUNDS
+            # It does not parse any optimiser-specific options (e.g. from an options_dict)
+            result = minimize(theta_abs, theta_i_vec,
+                              args=(r_i, theta0, ecc, orb_ang),
+                              method='BFGS',
+                              tol=tol)
+            theta_i = result.x
+            theta_i = theta_i[0] # get the scalar out of the array
+            # These prints are to diagnose if the minimization is converging
+            #print(ind, result.success)
+            #print(result.message, result.status, result.nit)
+            theta = theta.at[ind].set(theta_i)
+            
+    ''' OLD minimisation code (not jax compatible):
+    
     if theta0 < jnp.radians(90):
         theta_i = theta0 + initguess
         theta_bracket = [(theta0, jnp.pi/2.)]
@@ -148,7 +183,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
             # print('initial guess of theta_i = {0}'.format(theta_i))
             # result = optimize.minimize(theta_abs, theta_i,
             #                            bounds=theta_bracket,
-            #                            args=(r_i, rad_theta0, ecc, orb_ang))
+            #                            args=(r_i, theta0, ecc, orb_ang))
             # By default, when minimize receives bounds and no constrains,
             # it uses the L-BFGS-B method:
             # ftol is the tolerance in the function evaluation
@@ -167,6 +202,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
             # print(result.message, result.status, result.nit)
             theta_i = theta_i[0] # get the scalar out of the array
             theta = theta.at[ind].set(theta_i)
+    '''
     return theta #in radians
 
 
@@ -187,24 +223,22 @@ def stream_line_vel(r, theta, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :param v_r0: Initial radial velocity, km/s
     :return: v_r, v_theta, v_phi in units of km/s
     """
-    # convert theta0 into radians
-    rad_theta0 = theta0 * jnp.pi / 180
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     r_to_rc = (r / rc)
     v_k0 = v_k(rc, mass=mass)
     # mu and nu are dimensionless
     mu = (rc / r0)
     nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
-    epsilon = nu**2 + mu**2 * jnp.sin(rad_theta0)**2 - 2 * mu
-    ecc = jnp.sqrt(1 + epsilon*jnp.sin(rad_theta0)**2)
-    orb_ang = jnp.arccos((1 - mu * jnp.sin(rad_theta0)**2) / ecc) # <- this is in radians
-    cos_ratio = jnp.cos(theta) / jnp.cos(rad_theta0)
+    epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
+    ecc = jnp.sqrt(1 + epsilon*jnp.sin(theta0)**2)
+    orb_ang = jnp.arccos((1 - mu * jnp.sin(theta0)**2) / ecc) # <- this is in radians
+    cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
     xi = jnp.arccos(cos_ratio) + orb_ang # <- this is in radians
     #
-    v_r_all = -ecc * jnp.sin(rad_theta0) * jnp.sin(xi) / r_to_rc /(1 - ecc*jnp.cos(xi))
-    v_theta_all = jnp.sin(rad_theta0) / jnp.sin(theta) / r_to_rc \
-                  * jnp.sqrt(jnp.cos(rad_theta0)**2 - jnp.cos(theta)**2)
-    v_phi_all = jnp.sin(rad_theta0)**2 / jnp.sin(theta) / r_to_rc
+    v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(xi) / r_to_rc /(1 - ecc*jnp.cos(xi))
+    v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
+                  * jnp.sqrt(jnp.cos(theta0)**2 - jnp.cos(theta)**2)
+    v_phi_all = jnp.sin(theta0)**2 / jnp.sin(theta) / r_to_rc
 
     return v_r_all * v_k0, v_theta_all * v_k0, v_phi_all * v_k0
 
@@ -230,15 +264,18 @@ def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
     same units as the input ones.
 
     """
-    xyz = jnp.column_stack((x, y, z))
+    xyz = jnp.stack([x, y, z], axis=0)
+
     rot_inc = jnp.array([[1, 0, 0],
                         [0, jnp.cos(inc), jnp.sin(inc)],
                         [0, -jnp.sin(inc), jnp.cos(inc)]])
     rot_pa = jnp.array([[jnp.cos(pa), 0, -jnp.sin(pa)],
                        [0, 1, 0],
                        [jnp.sin(pa), 0, jnp.cos(pa)]])
-    xyz_new = rot_pa.dot(rot_inc.dot(xyz.T))
-    return xyz_new[0], xyz_new[1], xyz_new[2]
+    
+    xyz_new = rot_pa @ rot_inc @ xyz
+    x_new, y_new, z_new = jnp.unstack(xyz_new, axis=0)
+    return x_new, y_new, z_new
 
 
 # Astropy wrapper - handles astropy units and calls jax-compatible maths
@@ -280,8 +317,8 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
 
     #rest of function
     rc = r_cent(mass=mass, omega=omega, r0=r0)
-    if rc > r0:
-        print('Centrifugal radius is larger than start of streamline')
+    #if rc > r0:
+        #print('Centrifugal radius is larger than start of streamline')
     r = jnp.arange(r0, rc*0.5, step=-1*deltar)
     theta = stream_line(r, mass=mass, r0=r0, theta0=theta0,
                         omega=omega, v_r0=v_r0)
@@ -302,7 +339,27 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     x = r * jnp.sin(theta) * jnp.cos(phi)
     y = r * jnp.sin(theta) * jnp.sin(phi)
     z = r * jnp.cos(theta)
-    if rmin is not None:
+    # Get mask from smallest radius for calculation
+    if rmin is None:
+        gd_rmin = jnp.ones_like(r, dtype=bool)
+    else:
+        gd_rmin = (r > rmin)
+    gd_rmin = gd_rmin.astype(x.dtype)
+    # Apply mask before rotation
+    x = jnp.where(gd_rmin, x, jnp.nan)
+    y = jnp.where(gd_rmin, y, jnp.nan)
+    z = jnp.where(gd_rmin, z, jnp.nan)
+    v_x = jnp.where(gd_rmin, v_x, jnp.nan)
+    v_y = jnp.where(gd_rmin, v_y, jnp.nan)
+    v_z = jnp.where(gd_rmin, v_z, jnp.nan)
+    # Rotate
+    return rotate_xyz(x, y, z, inc=inc, pa=pa), \
+           rotate_xyz(v_x, v_y, v_z, inc=inc, pa=pa)
+
+    '''
+    OLD mask and rotation logic:
+
+        if rmin is not None:
         gd_rmin = (r > rmin)
         if gd_rmin.sum() > 0:
             return rotate_xyz(x[gd_rmin], y[gd_rmin], z[gd_rmin], inc=inc, pa=pa),\
@@ -312,3 +369,4 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     else:
         return rotate_xyz(x, y, z, inc=inc, pa=pa), \
                rotate_xyz(v_x, v_y, v_z, inc=inc, pa=pa)
+    '''
