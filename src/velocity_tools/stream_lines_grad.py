@@ -97,7 +97,10 @@ def get_dphi(theta, theta0=jnp.radians(30)):
     :param theta0: radians
     :return: difference in Phi angle, radians
     """
-    return jnp.arccos(jnp.tan(theta0) / jnp.tan(theta))
+    arg = jnp.tan(theta0) / jnp.tan(theta)
+    arg = jnp.clip(arg, -1 + eps, 1 - eps)
+    return jnp.arccos(arg)
+
 
 
 #TODO: come back and check this function at end
