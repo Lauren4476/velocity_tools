@@ -21,7 +21,7 @@ TODO:
 
 import astropy.units as u
 from scipy import optimize
-from .helper_functions import *
+from ..helper_functions import *
 #from astropy.constants import G
 import jax
 import jax.numpy as jnp

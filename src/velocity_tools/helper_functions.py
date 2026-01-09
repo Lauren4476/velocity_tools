@@ -1,5 +1,8 @@
 '''
 This file contains helper functions for the larger functions in velocity-tools.
+
+TODO:
+- Check these functions all work with jax. e.g. define constants as JAX scalars
 '''
 
 # Constants
