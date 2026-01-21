@@ -1,6 +1,6 @@
 import os
 import matplotlib.pyplot as plt
-import velocity_tools.stream_lines_grad as stream_lines_grad
+import velocity_tools.streamfit.stream_lines_grad as stream_lines_grad
 from astropy import units as u
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, FK5
