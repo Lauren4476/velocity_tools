@@ -87,6 +87,10 @@ def reduce_to_1D(streamer_cube, n_elements=10):
         pc_stds[:, i] = np.sqrt(np.average((pc_coords.T[distance_indices] - pc_means[:, i])**2,
                                          axis=0,
                                          weights=flux[distance_indices]))
+        
+    # flip arrays so that they go from large to small distance (towards star)
+    pc_means = pc_means[:, ::-1]
+    pc_stds = pc_stds[:, ::-1]
     
     return pc_coords, pc_means, pc_stds
 
