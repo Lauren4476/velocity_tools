@@ -2,18 +2,15 @@
 This file will provide streamline functions that are fully differentiable using JAX.
 
 JAX numpy does not accept units. Therefore, all inputs for jax must be unitless.
-The wrapper function is xyz_stream. Currently, user inputs quantities with astropy units into this 
 The assumed input units are:
 - Distance: au
 - Velocity: km/s
 - Mass: solar masses
-- Angles (PA, i, theta, phi...): degrees
-    - these are then immediately converted into radians for calculations in all other functions in this file.
+- Angles (PA, i, theta, phi...): radians
 '''
 
 '''
 TODO:
-- Add bounds to minimisation code for getting theta?
 - Replace python for loops with vectorisation or lax.scan
 - Remove unused imports
 - Test
@@ -28,7 +25,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax import debug
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
-from jaxopt import ScipyBoundedMinimize
+from jaxopt import LBFGSB
 
 #
 # Implementation of stream lines using the prescription from
@@ -144,7 +141,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     initguess = 10 * tol
     #print('tolerance ', tol)
 
-    ### New minimisation code using jaxopt
+    ### New minimisation code using jaxopt's bounded L-BFGS-B
     if theta0 < jnp.radians(90):
         theta_i = theta0 + initguess
         lower_bound = theta0
@@ -154,12 +151,15 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
         lower_bound = jnp.pi/2.
         upper_bound = theta0
 
-    # make solver using jaxopt's bounded LBFGS
-    theta_solver = ScipyBoundedMinimize(
+    bounds = (jnp.array([lower_bound]), jnp.array([upper_bound]))
+
+    # make solver using jaxopt's bounded L-BFGS-B
+    theta_solver = LBFGSB(
         fun=theta_abs,
-        method='L-BFGS-B',
         tol=tol,
-        options={'gtol': tol/10., 'eps': tol, 'ftol': tol}
+        maxiter=100,
+        implicit_diff=True, #needed for JAX compatibility
+        jit=True
     )
 
     for ind in jnp.arange(1, len(r)):
@@ -168,10 +168,14 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
             # use solver
             result = theta_solver.run(
                 theta_i,
-                (lower_bound, upper_bound),
-                r_i, theta0, ecc, orb_ang
+                bounds,
+                r_i,
+                theta0,
+                ecc,
+                orb_ang,
             )
-            theta_i = result.params
+
+            theta_i = result.params # extract from array
             theta = theta.at[ind].set(theta_i)
 
     return theta #in radians
@@ -250,7 +254,6 @@ def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
 
 
 # Astropy wrapper - handles astropy units and calls jax-compatible maths
-@u.quantity_input
 def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
                phi0=15*u.deg, omega=1e-14/u.s, v_r0=0*u.km/u.s,
                inc=0*u.deg, pa=0*u.deg, rmin=None, deltar=1*u.au):
@@ -275,16 +278,6 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     :param deltar: spacing between two consecutive radii in the sampling of the streamer, in au
     :return: x, y, z in au, v_x, v_y, v_z in km/s
     """
-    # First we convert angles to radians, and strip units from all quantities
-    mass = mass.to(u.Msun).value
-    r0 = r0.to(u.au).value
-    theta0 = theta0.to(u.rad).value
-    phi0 = phi0.to(u.rad).value
-    omega = omega.to(1/u.s).value
-    v_r0 = v_r0.to(u.km/u.s).value
-    inc = inc.to(u.rad).value
-    pa = pa.to(u.rad).value
-    deltar = deltar.to(u.au).value
 
     #rest of function
     rc = r_cent(mass=mass, omega=omega, r0=r0)
