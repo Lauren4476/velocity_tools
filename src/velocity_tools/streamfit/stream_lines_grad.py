@@ -27,8 +27,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax import debug
-from jax.scipy.optimize import minimize
-
+from jax.scipy.optimize import minimize # may not be needed if using jaxopt
+from jaxopt import ScipyBoundedMinimize
 
 #
 # Implementation of stream lines using the prescription from
@@ -144,68 +144,36 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     initguess = 10 * tol
     #print('tolerance ', tol)
 
-    ### New minimisation code (jax compatible):
-    # theta_bracket unused so far as BFGS does not take bounds...
+    ### New minimisation code using jaxopt
     if theta0 < jnp.radians(90):
         theta_i = theta0 + initguess
-        theta_bracket = [(theta0, jnp.pi/2.)]
+        lower_bound = theta0
+        upper_bound = jnp.pi/2.
     else:
         theta_i = theta0 - initguess
-        theta_bracket = [(jnp.pi/2., theta0)]
-    theta_i_vec = jnp.atleast_1d(theta_i) # jax minimize expects an array
+        lower_bound = jnp.pi/2.
+        upper_bound = theta0
+
+    # make solver using jaxopt's bounded LBFGS
+    theta_solver = ScipyBoundedMinimize(
+        fun=theta_abs,
+        method='L-BFGS-B',
+        tol=tol,
+        options={'gtol': tol/10., 'eps': tol, 'ftol': tol}
+    )
 
     for ind in jnp.arange(1, len(r)):
         r_i = (r[ind] / rc)
         if r_i > 0.5:
-            # Using jax.scipy.optimize.minimize
-            # It uses the BFGS method (currently this is the only method supported)
-            # It DOES NOT TAKE BOUNDS
-            # It does not parse any optimiser-specific options (e.g. from an options_dict)
-            result = minimize(theta_abs, theta_i_vec,
-                              args=(r_i, theta0, ecc, orb_ang),
-                              method='BFGS',
-                              tol=tol)
-            theta_i = result.x
-            theta_i = theta_i[0] # get the scalar out of the array
-            # These prints are to diagnose if the minimization is converging
-            #print(ind, result.success)
-            #print(result.message, result.status, result.nit)
+            # use solver
+            result = theta_solver.run(
+                theta_i,
+                (lower_bound, upper_bound),
+                r_i, theta0, ecc, orb_ang
+            )
+            theta_i = result.params
             theta = theta.at[ind].set(theta_i)
-            
-    ''' OLD minimisation code (not jax compatible):
-    
-    if theta0 < jnp.radians(90):
-        theta_i = theta0 + initguess
-        theta_bracket = [(theta0, jnp.pi/2.)]
-    else:
-        theta_i = theta0 - initguess
-        theta_bracket = [(jnp.pi/2., theta0)]
-    for ind in jnp.arange(1, len(r)):
-        r_i = (r[ind] / rc)
-        if r_i > 0.5:
-            # print('initial guess of theta_i = {0}'.format(theta_i))
-            # result = optimize.minimize(theta_abs, theta_i,
-            #                            bounds=theta_bracket,
-            #                            args=(r_i, theta0, ecc, orb_ang))
-            # By default, when minimize receives bounds and no constrains,
-            # it uses the L-BFGS-B method:
-            # ftol is the tolerance in the function evaluation
-            # "The iteration stops when (f^k - f^{k+1})/max{|f^k|,|f^{k+1}|,1} <= ftol"
-            # gtol corresponds to the parameter pgtol in fmin_l_bfgs_b
-            # "The iteration will stop when max{|proj g_i | i = 1, ..., n} <= gtol"
-            # eps corresponds to the absolute step size used for numerical approximation of the jacobian via forward differences.
-            options_dict = {'gtol': tol/10., 'eps': tol, 'ftol': tol}
-            result = optimize.minimize(theta_abs, theta_i,
-                                       bounds=theta_bracket,
-                                       args=(r_i, theta0, ecc, orb_ang),
-                                       options=options_dict)
-            theta_i = result.x
-            # These prints are to diagnose if the minimization is converging
-            # print(ind, result.success)
-            # print(result.message, result.status, result.nit)
-            theta_i = theta_i[0] # get the scalar out of the array
-            theta = theta.at[ind].set(theta_i)
-    '''
+
     return theta #in radians
 
 
