@@ -25,7 +25,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax import debug
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
-from jaxopt import LBFGSB
+from jaxopt import LBFGSB # may not be needed if using custom Newton method
 
 #
 # Implementation of stream lines using the prescription from
@@ -33,7 +33,7 @@ from jaxopt import LBFGSB
 #
 
 # Constants 
-eps = 1e-8
+eps = 1e-8 # small value to avoid division by zero
 
 
 # JAX functions (no Astropy units allowed here)
@@ -82,8 +82,52 @@ def theta_abs(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
     safe_cos_ratio = jnp.clip(cos_ratio, -1.0 + eps, 1.0 - eps)
     xi = jnp.arccos(safe_cos_ratio) + orb_ang # <- this is in radians
     geom = jnp.sin(theta0)**2 / (1 - ecc * jnp.cos(xi))
-    return jnp.sum((r_to_rc - geom)**2) #new, gradient is smooth
-    #return jnp.sum(jnp.abs(r_to_rc - geom)) # old, gradient has kink at 0
+    return jnp.sum(jnp.abs(r_to_rc - geom)) 
+
+def newton_step(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
+                orb_ang=jnp.pi / 2):
+    """
+    One step of Newton's method to determine theta numerically by root-finding
+ 
+    :param theta: angle of streamline, radians
+    :param r_to_rc: radius in units of the centrifugal radius
+    :param theta0: Initial angle of the streamline, radians
+    :param ecc: eccentricity of the orbit (equation 6)
+    :param orb_ang: angle in the orbital motion (equation 7), radians
+    :return: updated theta after one Newton step
+    """
+    f = theta_abs(theta, r_to_rc, theta0, ecc, orb_ang)
+    df = jax.grad(theta_abs)(theta, r_to_rc, theta0, ecc, orb_ang)
+    theta_new = theta - (f / (df + eps)) # avoid division by zero
+    return theta_new
+
+def solve_theta(theta_init, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
+                orb_ang=jnp.pi / 2, n_iter=50, lower=None, upper=None):
+    """
+    Docstring for solve_theta
+    
+    :param theta_init: initial guess at what
+    :param r_to_rc: radius in units of the centrifugal radius
+    :param theta0: Initial angle of the streamline, radians
+    :param ecc: eccentricity of the orbit (equation 6)
+    :param orb_ang: angle in the orbital motion (equation 7), radians
+    :param n_iter: number of iterations to do
+    :param lower: lower bound on theta
+    :param upper: upper bound on theta
+    """
+    def body(_, theta):
+        theta_new = newton_step(theta, r_to_rc, theta0, ecc, orb_ang)
+        if lower is not None and upper is not None:
+            theta_new = jnp.clip(theta_new, lower, upper)
+        elif lower is not None:
+            theta_new = jnp.maximum(theta_new, lower)
+        elif upper is not None:
+            theta_new = jnp.minimum(theta_new, upper)
+        return theta_new
+
+    theta_final = jax.lax.fori_loop(0, n_iter, body, theta_init)
+    return theta_final
+
 
 
 def get_dphi(theta, theta0=jnp.radians(30)):
@@ -151,15 +195,16 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
         lower_bound = jnp.pi/2.
         upper_bound = theta0
 
-    bounds = (jnp.array([lower_bound]), jnp.array([upper_bound]))
+    #bounds = (jnp.array([lower_bound]), jnp.array([upper_bound]))
 
     # make solver using jaxopt's bounded L-BFGS-B
+    '''
     theta_solver = LBFGSB(
         fun=theta_abs,
         tol=tol,
         maxiter=100,
-        implicit_diff=True, #needed for JAX compatibility
-        jit=True
+        implicit_diff=False,
+        unroll=True
     )
 
     for ind in jnp.arange(1, len(r)):
@@ -176,6 +221,23 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
             )
 
             theta_i = result.params # extract from array
+            theta = theta.at[ind].set(theta_i)
+    '''
+
+    # using Newton solver
+    for ind in range(1, len(r)):
+        r_i = (r[ind] / rc)
+        if r_i > 0.5:
+            theta_i = solve_theta(
+                theta_i,
+                r_i,
+                theta0,
+                ecc,
+                orb_ang,
+                n_iter=50,
+                lower=lower_bound,
+                upper=upper_bound
+            )
             theta = theta.at[ind].set(theta_i)
 
     return theta #in radians
@@ -283,7 +345,9 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     #if rc > r0:
         #print('Centrifugal radius is larger than start of streamline')
-    r = jnp.arange(r0, rc*0.5, step=-1*deltar)
+    r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
+    r = jnp.arange(r0, r_low, step=-1*deltar)
+    
     theta = stream_line(r, mass=mass, r0=r0, theta0=theta0,
                         omega=omega, v_r0=v_r0)
     d_phi = get_dphi(theta, theta0=theta0)
