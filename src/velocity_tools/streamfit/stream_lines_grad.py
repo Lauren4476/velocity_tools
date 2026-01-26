@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax import debug
+#jax.config.update("jax_debug_nans", True)
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
 from jaxopt import LBFGSB # may not be needed if using custom Newton method
 
@@ -61,10 +62,28 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     :return: r_cent, au
     """
     r_cent = (r0 ** 4 * omega ** 2 / (G * mass)) # in au^3 km^-2
-    return r_cent * (au_in_km**2) # in au
+    r_cent_au = r_cent * (au_in_km**2) # in au
+    print("rc={0} au".format(r_cent_au))
+    return r_cent_au
+
+def safe_arccos(x, eps=1e-6):
+    """
+    Safe arccos function with smooth handling of out of range values,
+    using tanh to smoothly approach the limits.
+    Should be fully differentiable
+
+    :param x: input value
+    :param eps: smoothness parameter
+    :return: arccos of clipped input
+    """
+    x_safe = jnp.tanh(x / eps)
+    jax.debug.print("safe_arccos: x={x}, x_safe={x_safe}", x=x, x_safe=x_safe)
+    result = jnp.arccos(x_safe)
+    jax.debug.print("safe_arccos result={result}", result=result)
+    return result
 
 
-def theta_abs(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
+def theta_residual(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
               orb_ang=jnp.pi / 2):
     """
     function to determine theta numerically by finding the root of a function
@@ -80,9 +99,18 @@ def theta_abs(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
     """
     cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
     safe_cos_ratio = jnp.clip(cos_ratio, -1.0 + eps, 1.0 - eps)
-    xi = jnp.arccos(safe_cos_ratio) + orb_ang # <- this is in radians
-    geom = jnp.sin(theta0)**2 / (1 - ecc * jnp.cos(xi))
-    return jnp.sum(jnp.abs(r_to_rc - geom)) 
+    jax.debug.print("theta_residual: safe_cos_ratio={scr}, calling safe_arccos", scr=safe_cos_ratio)
+    xi = safe_arccos(safe_cos_ratio) + orb_ang # <- this is in radians
+    jax.debug.print("theta_residual: xi={xi}, has_nan_xi={has_nan}", xi=xi, has_nan=jnp.isnan(xi))
+    # Guard against division by zero in geom
+    denom = 1 - ecc * jnp.cos(xi)
+    jax.debug.print("has_tiny={has_tiny}",
+                    has_tiny=jnp.any(jnp.abs(denom) < eps))
+    denom_safe = jnp.where(jnp.abs(denom) < eps, eps, denom)  # Replace tiny values with eps
+    geom = jnp.sin(theta0)**2 / denom_safe
+    result = jnp.sum((r_to_rc - geom))
+    jax.debug.print("theta_residual: result={res}, has_nan={has_nan}", res=result, has_nan=jnp.isnan(result))
+    return result 
 
 def newton_step(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
                 orb_ang=jnp.pi / 2):
@@ -96,9 +124,18 @@ def newton_step(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
     :param orb_ang: angle in the orbital motion (equation 7), radians
     :return: updated theta after one Newton step
     """
-    f = theta_abs(theta, r_to_rc, theta0, ecc, orb_ang)
-    df = jax.grad(theta_abs)(theta, r_to_rc, theta0, ecc, orb_ang)
+    f = theta_residual(theta, r_to_rc, theta0, ecc, orb_ang)
+    df = jax.grad(theta_residual)(theta, r_to_rc, theta0, ecc, orb_ang)
     theta_new = theta - (f / (df + eps)) # avoid division by zero
+    # Log values during JIT: pass placeholders explicitly to avoid KeyError
+    jax.debug.print(        
+        "theta={theta}, f={f}, df={df}, theta_new={theta_new}",
+        theta=theta,
+        f=f,
+        df=df,
+        theta_new=theta_new,
+    )
+    jax.debug.print("---------------------------------------")
     return theta_new
 
 def solve_theta(theta_init, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
@@ -163,15 +200,23 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     """
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     #print("rc={0}".format(rc))
-    theta = jnp.zeros_like(r) + jnp.nan
+    theta = jnp.zeros_like(r) #+ jnp.nan ()
     # mu and nu are dimensionless
     mu = (rc / r0)
     nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
     # epsilon is the dimensionless energy
     epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
     ecc = jnp.sqrt(1 + epsilon * jnp.sin(theta0)**2)
+    print("ecc={0}".format(ecc))
+    print("mu={0}".format(mu))
+    print("theta0={0}".format(theta0))
+
     # definition of orb_ang here
-    orb_ang = jnp.arccos((1 - mu * jnp.sin(theta0)**2) / ecc) #<- this is in radians
+    orb_ang_arg = (1 - mu * jnp.sin(theta0)**2) / ecc
+    # Clip to avoid arccos singularity at ±1
+    orb_ang_arg_clipped = jnp.clip(orb_ang_arg, -0.9999999, 0.9999999)
+    orb_ang = safe_arccos(orb_ang_arg_clipped)  #<- this is in radians
+    print("orb_ang={0}".format(orb_ang))
 
     # the first element in the streamline is the starting point
     theta = theta.at[0].set(theta0)
@@ -200,7 +245,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     # make solver using jaxopt's bounded L-BFGS-B
     '''
     theta_solver = LBFGSB(
-        fun=theta_abs,
+        fun=theta_residual,
         tol=tol,
         maxiter=100,
         implicit_diff=False,
@@ -228,7 +273,8 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     for ind in range(1, len(r)):
         r_i = (r[ind] / rc)
         if r_i > 0.5:
-            theta_i = solve_theta(
+            # don't allow gradients to flow through here
+            theta_i = jax.lax.stop_gradient(solve_theta(
                 theta_i,
                 r_i,
                 theta0,
@@ -237,9 +283,10 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
                 n_iter=50,
                 lower=lower_bound,
                 upper=upper_bound
-            )
+            ))
             theta = theta.at[ind].set(theta_i)
 
+    print(theta[:10])
     return theta #in radians
 
 
@@ -268,9 +315,9 @@ def stream_line_vel(r, theta, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
     epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
     ecc = jnp.sqrt(1 + epsilon*jnp.sin(theta0)**2)
-    orb_ang = jnp.arccos((1 - mu * jnp.sin(theta0)**2) / ecc) # <- this is in radians
+    orb_ang = safe_arccos((1 - mu * jnp.sin(theta0)**2) / ecc) # <- this is in radians
     cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
-    xi = jnp.arccos(cos_ratio) + orb_ang # <- this is in radians
+    xi = safe_arccos(cos_ratio) + orb_ang # <- this is in radians
     #
     v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(xi) / r_to_rc /(1 - ecc*jnp.cos(xi))
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
