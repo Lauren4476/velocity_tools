@@ -228,9 +228,9 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     tol = (6.e-5 * (au_to_m(deltar) / 1000) * omega / (v_r0+ 0.1))
     # the initial guess will be 10 times the tolerance for now, in testing
     initguess = 10 * tol
-    #print('tolerance ', tol)
+    print('tolerance ', tol)
 
-    ### New minimisation code using jaxopt's bounded L-BFGS-B
+    ### New minimisation code
     if theta0 < jnp.radians(90):
         theta_i = theta0 + initguess
         lower_bound = theta0
