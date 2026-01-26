@@ -93,6 +93,10 @@ def stream_line(r, mass=0.5 * u.Msun, r0=1e4 * u.au, theta0=30 * u.deg,
     epsilon = nu**2 + mu**2 * np.sin(theta0)**2 - 2 * mu
     ecc = np.sqrt(1 + epsilon * np.sin(theta0)**2)
     orb_ang = np.arccos((1 - mu * np.sin(theta0)**2) / ecc)
+    print("ecc={0}".format(ecc))
+    print("mu={0}".format(mu))
+    print("theta0={0}".format(theta0))
+    print("orb_ang={0}".format(orb_ang))
     # the first element in the streamline is the starting point
     theta[0] = rad_theta0
     # Initial guess at largest radius is theta0 +- initguess towards the midplane
@@ -134,6 +138,7 @@ def stream_line(r, mass=0.5 * u.Msun, r0=1e4 * u.au, theta0=30 * u.deg,
             # print(ind, result.success)
             # print(result.message, result.status, result.nit)
             theta[ind] = theta_i
+    print("theta = {0}".format(theta[:10]))
     return theta * u.rad
 
 
