@@ -58,14 +58,19 @@ def forward_model(opt_params, fixed_params, distance_pc):
         deltar=fixed_params['deltar']
     )
     
+    # Filter out sentinel values (used for points below rmin)
+    # Sentinel value is -1e10, which is unphysical for positions
+    sentinel = -1e10
+    valid_mask = (x > sentinel + 1e8)  # Points where x is NOT the sentinel
+    
     # Convert positions from au to arcsec offsets
     # x = RA offset (with negative for standard RA convention)
     # z = Dec offset
     # y = line-of-sight velocity
-    ra_model = -x / distance_pc  # arcsec
-    dec_model = z / distance_pc  # arcsec
-    v_model = vy + fixed_params['v_lsr']  # km/s (add systemic velocity)
-    
+    ra_model = jnp.where(valid_mask, -x / distance_pc, jnp.nan)  # arcsec
+    dec_model = jnp.where(valid_mask, z / distance_pc, jnp.nan)  # arcsec
+    v_model = jnp.where(valid_mask, vy + fixed_params['v_lsr'], jnp.nan)  # km/s (add systemic velocity)
+
     return ra_model, dec_model, v_model
 
 
@@ -98,18 +103,20 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     # arc-lengths
     s_model = arc_length_2d(ra_model, dec_model)
     s_data = arc_length_2d(ra_data, dec_data)
+
     # cut off where model ends
     s_max = jnp.max(s_model)
-    valid = s_data <= s_max
-    s_data = s_data[valid]
-    ra_data = ra_data[valid]
-    dec_data = dec_data[valid]
-    # interpolate model quantities to data arc-lengths
-    ra_model_interp = jnp.interp(s_data, s_model, ra_model)
-    dec_model_interp = jnp.interp(s_data, s_model, dec_model)
-    v_model_interp = jnp.interp(s_data, s_model, v_model)
 
-    return ra_model_interp, dec_model_interp, v_model_interp, valid
+    # instead of boolean indexing, use jnp.where to pad invalid points
+    # clamp s_data to valid range [0, s_max]
+    s_data_clamped = jnp.clip(s_data, 0.0, s_max)
+
+    # interpolate model quantities to data arc-lengths
+    ra_model_interp = jnp.interp(s_data_clamped, s_model, ra_model)
+    dec_model_interp = jnp.interp(s_data_clamped, s_model, dec_model)
+    v_model_interp = jnp.interp(s_data_clamped, s_model, v_model)
+
+    return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones_like(s_data, dtype=bool)
 
 
 
@@ -138,24 +145,20 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
 
     ra_data, dec_data, v_data = data
     ra_sigma, dec_sigma, v_sigma = uncertainties
+    # small values to avoid division by zero
+    eps = 1e-8
+    ra_sigma = jnp.maximum(ra_sigma, eps)
+    dec_sigma = jnp.maximum(dec_sigma, eps)
+    v_sigma = jnp.maximum(v_sigma, eps)
     
     # Run forward model
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
-    # Remove NaNs (due to rmin) from model
-    not_nan = ~jnp.isnan(ra_model) & ~jnp.isnan(dec_model) & ~jnp.isnan(v_model)
-    ra_model = ra_model[not_nan]
-    dec_model = dec_model[not_nan]
-    v_model = v_model[not_nan]
     
+
     # Match model to data using arc-length parameterisation
-    ra_model_interp, dec_model_interp, v_model_interp, valid = match_model_to_data_curve(
+    ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
         ra_model, dec_model, v_model, ra_data, dec_data)
-    
-    # mask for valid (only for arrays that haven't already been masked in matching)
-    v_data = v_data[valid]
-    ra_sigma = ra_sigma[valid]
-    dec_sigma = dec_sigma[valid]
-    v_sigma = v_sigma[valid]
+
 
     # Compute chi-squared components
     chi2_ra = jnp.sum(((ra_data - ra_model_interp) / ra_sigma)**2)
