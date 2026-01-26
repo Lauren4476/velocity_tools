@@ -66,106 +66,48 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     print("rc={0} au".format(r_cent_au))
     return r_cent_au
 
-def safe_arccos(x, eps=1e-6):
+def safe_arccos(x, eps=1e-7):
     """
-    Safe arccos function with smooth handling of out of range values,
-    using tanh to smoothly approach the limits.
-    Should be fully differentiable
+    Safe arccos function with clipping to valid range [-1, 1].
+    Fully differentiable with JAX.
 
     :param x: input value
-    :param eps: smoothness parameter
+    :param eps: small offset from boundaries to avoid numerical issues
     :return: arccos of clipped input
     """
-    x_safe = jnp.tanh(x / eps)
+    x_safe = jnp.clip(x, -1.0 + eps, 1.0 - eps)
     jax.debug.print("safe_arccos: x={x}, x_safe={x_safe}", x=x, x_safe=x_safe)
     result = jnp.arccos(x_safe)
     jax.debug.print("safe_arccos result={result}", result=result)
     return result
 
 
-def theta_residual(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
-              orb_ang=jnp.pi / 2):
+def get_theta(theta0, orb_ang, orb_ang0):
     """
-    function to determine theta numerically by finding the root of a function
-    This is equation (9) in Mendoza+(2009)
-
-    :param theta: angle of streamline, radians
-    :param r_to_rc: radius in units of the centrifugal radius
-    :param theta0: Initial angle of the streamline, radians
-    :param ecc: eccentricity of the orbit (equation 6)
-    :param orb_ang: angle in the orbital motion (equation 7), radians
-    :return: returns the difference between the radius and the predicted one,
-           a value of 0 corresponds to a proper streamline
-    """
-    cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
-    safe_cos_ratio = jnp.clip(cos_ratio, -1.0 + eps, 1.0 - eps)
-    jax.debug.print("theta_residual: safe_cos_ratio={scr}, calling safe_arccos", scr=safe_cos_ratio)
-    xi = safe_arccos(safe_cos_ratio) + orb_ang # <- this is in radians
-    jax.debug.print("theta_residual: xi={xi}, has_nan_xi={has_nan}", xi=xi, has_nan=jnp.isnan(xi))
-    # Guard against division by zero in geom
-    denom = 1 - ecc * jnp.cos(xi)
-    jax.debug.print("has_tiny={has_tiny}",
-                    has_tiny=jnp.any(jnp.abs(denom) < eps))
-    denom_safe = jnp.where(jnp.abs(denom) < eps, eps, denom)  # Replace tiny values with eps
-    geom = jnp.sin(theta0)**2 / denom_safe
-    result = jnp.sum((r_to_rc - geom))
-    jax.debug.print("theta_residual: result={res}, has_nan={has_nan}", res=result, has_nan=jnp.isnan(result))
-    return result 
-
-def newton_step(theta, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
-                orb_ang=jnp.pi / 2):
-    """
-    One step of Newton's method to determine theta numerically by root-finding
- 
-    :param theta: angle of streamline, radians
-    :param r_to_rc: radius in units of the centrifugal radius
-    :param theta0: Initial angle of the streamline, radians
-    :param ecc: eccentricity of the orbit (equation 6)
-    :param orb_ang: angle in the orbital motion (equation 7), radians
-    :return: updated theta after one Newton step
-    """
-    f = theta_residual(theta, r_to_rc, theta0, ecc, orb_ang)
-    df = jax.grad(theta_residual)(theta, r_to_rc, theta0, ecc, orb_ang)
-    theta_new = theta - (f / (df + eps)) # avoid division by zero
-    # Log values during JIT: pass placeholders explicitly to avoid KeyError
-    jax.debug.print(        
-        "theta={theta}, f={f}, df={df}, theta_new={theta_new}",
-        theta=theta,
-        f=f,
-        df=df,
-        theta_new=theta_new,
-    )
-    jax.debug.print("---------------------------------------")
-    return theta_new
-
-def solve_theta(theta_init, r_to_rc=0.1, theta0=jnp.radians(30), ecc=1.,
-                orb_ang=jnp.pi / 2, n_iter=50, lower=None, upper=None):
-    """
-    Docstring for solve_theta
+    Gets theta from theta0, orb_ang, and orb_ang0, in radians.
+    Eqn (8) in Mendoza+2009
     
-    :param theta_init: initial guess at what
-    :param r_to_rc: radius in units of the centrifugal radius
-    :param theta0: Initial angle of the streamline, radians
-    :param ecc: eccentricity of the orbit (equation 6)
-    :param orb_ang: angle in the orbital motion (equation 7), radians
-    :param n_iter: number of iterations to do
-    :param lower: lower bound on theta
-    :param upper: upper bound on theta
+    :param theta0: radians
+    :param orb_ang: radians
+    :param orb_ang0: radians
     """
-    def body(_, theta):
-        theta_new = newton_step(theta, r_to_rc, theta0, ecc, orb_ang)
-        if lower is not None and upper is not None:
-            theta_new = jnp.clip(theta_new, lower, upper)
-        elif lower is not None:
-            theta_new = jnp.maximum(theta_new, lower)
-        elif upper is not None:
-            theta_new = jnp.minimum(theta_new, upper)
-        return theta_new
-
-    theta_final = jax.lax.fori_loop(0, n_iter, body, theta_init)
-    return theta_final
+    cos_theta = jnp.cos(theta0) * jnp.cos(orb_ang - orb_ang0)
+    theta = safe_arccos(cos_theta)
+    return theta
 
 
+def get_orb_ang(r_to_rc, theta0, ecc):
+    """
+    Gets orb_ang (varphi in Mendoza+2009), in radians.
+    To get initial orb_ang, set r_to_rc = r0/rc = 1/mu
+    
+    :param r_to_rc: Description
+    :param theta0: Description
+    :param ecc: Description
+    """
+    cos_orb_ang = (1/ecc) * (1 - (jnp.sin(theta0)**2) / r_to_rc)
+    orb_ang = safe_arccos(cos_orb_ang)
+    return orb_ang
 
 def get_dphi(theta, theta0=jnp.radians(30)):
     """
@@ -176,13 +118,12 @@ def get_dphi(theta, theta0=jnp.radians(30)):
     :return: difference in Phi angle, radians
     """
     arg = jnp.tan(theta0) / jnp.tan(theta)
-    arg = jnp.clip(arg, -1 + eps, 1 - eps)
-    return jnp.arccos(arg)
+    return safe_arccos(arg)
 
 
 
 #TODO: come back and check this function at end
-def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
+def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15),
                 omega=1e-14, v_r0=0):
     """
     It calculates the stream line following Mendoza et al. (2009)
@@ -201,6 +142,8 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     #print("rc={0}".format(rc))
     theta = jnp.zeros_like(r) #+ jnp.nan ()
+    phi = jnp.zeros_like(r)
+    orb_ang = jnp.zeros_like(r)
     # mu and nu are dimensionless
     mu = (rc / r0)
     nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
@@ -211,86 +154,33 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     print("mu={0}".format(mu))
     print("theta0={0}".format(theta0))
 
-    # definition of orb_ang here
-    orb_ang_arg = (1 - mu * jnp.sin(theta0)**2) / ecc
-    # Clip to avoid arccos singularity at ±1
-    orb_ang_arg_clipped = jnp.clip(orb_ang_arg, -0.9999999, 0.9999999)
-    orb_ang = safe_arccos(orb_ang_arg_clipped)  #<- this is in radians
-    print("orb_ang={0}".format(orb_ang))
-
     # the first element in the streamline is the starting point
     theta = theta.at[0].set(theta0)
-    # Initial guess at largest radius is theta0 +- initguess towards the midplane
+    phi = phi.at[0].set(phi0)
+    # orb_ang is varphi in Mendoza+2009
+    #at initial position r_to_rc = r0/rc = 1/mu
+    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
+    orb_ang = orb_ang.at[0].set(orb_ang0)
+
     deltar = jnp.amin(jnp.abs(jnp.roll(r,1) - r))
-    #print(deltar)
-    # we use a constant of 6e-5 for an epsilon of 0.01 km/s
-    # this result will be in radians
-    tol = (6.e-5 * (au_to_m(deltar) / 1000) * omega / (v_r0+ 0.1))
-    # the initial guess will be 10 times the tolerance for now, in testing
-    initguess = 10 * tol
-    print('tolerance ', tol)
 
-    ### New minimisation code
-    if theta0 < jnp.radians(90):
-        theta_i = theta0 + initguess
-        lower_bound = theta0
-        upper_bound = jnp.pi/2.
-    else:
-        theta_i = theta0 - initguess
-        lower_bound = jnp.pi/2.
-        upper_bound = theta0
-
-    #bounds = (jnp.array([lower_bound]), jnp.array([upper_bound]))
-
-    # make solver using jaxopt's bounded L-BFGS-B
-    '''
-    theta_solver = LBFGSB(
-        fun=theta_residual,
-        tol=tol,
-        maxiter=100,
-        implicit_diff=False,
-        unroll=True
-    )
-
-    for ind in jnp.arange(1, len(r)):
-        r_i = (r[ind] / rc)
-        if r_i > 0.5:
-            # use solver
-            result = theta_solver.run(
-                theta_i,
-                bounds,
-                r_i,
-                theta0,
-                ecc,
-                orb_ang,
-            )
-
-            theta_i = result.params # extract from array
-            theta = theta.at[ind].set(theta_i)
-    '''
-
-    # using Newton solver
     for ind in range(1, len(r)):
         r_i = (r[ind] / rc)
+        print("r_to_rc={0}".format(r_i)) 
         if r_i > 0.5:
-            # don't allow gradients to flow through here
-            theta_i = jax.lax.stop_gradient(solve_theta(
-                theta_i,
-                r_i,
-                theta0,
-                ecc,
-                orb_ang,
-                n_iter=50,
-                lower=lower_bound,
-                upper=upper_bound
-            ))
+            orb_ang_i = get_orb_ang(r_to_rc=r_i, theta0=theta0, ecc=ecc)
+            orb_ang = orb_ang.at[ind].set(orb_ang_i)
+            theta_i = get_theta(theta0, orb_ang_i, orb_ang0)
             theta = theta.at[ind].set(theta_i)
+            dphi = get_dphi(theta_i, theta0=theta0)
+            phi = phi.at[ind].set(phi0 + dphi)
 
-    print(theta[:10])
-    return theta #in radians
+    jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang[:10])
+    jax.debug.print("theta = {theta}", theta=theta[:10])
+    return orb_ang, theta, phi #in radians
 
 
-def stream_line_vel(r, theta, mass=0.5, r0=1e4, theta0=jnp.radians(30),
+def stream_line_vel(r, theta, orb_ang, mass=0.5, r0=1e4, theta0=jnp.radians(30),
                 omega=1e-14, v_r0=0):
     """
     It calculates the velocity along the stream line following Mendoza+(2009)
@@ -315,11 +205,8 @@ def stream_line_vel(r, theta, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
     epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
     ecc = jnp.sqrt(1 + epsilon*jnp.sin(theta0)**2)
-    orb_ang = safe_arccos((1 - mu * jnp.sin(theta0)**2) / ecc) # <- this is in radians
-    cos_ratio = jnp.cos(theta) / jnp.cos(theta0)
-    xi = safe_arccos(cos_ratio) + orb_ang # <- this is in radians
     #
-    v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(xi) / r_to_rc /(1 - ecc*jnp.cos(xi))
+    v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(orb_ang) / r_to_rc /(1 - ecc*jnp.cos(orb_ang))
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
                   * jnp.sqrt(jnp.cos(theta0)**2 - jnp.cos(theta)**2)
     v_phi_all = jnp.sin(theta0)**2 / jnp.sin(theta) / r_to_rc
@@ -395,12 +282,10 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     r = jnp.arange(r0, r_low, step=-1*deltar)
     
-    theta = stream_line(r, mass=mass, r0=r0, theta0=theta0,
+    orb_ang, theta, phi = stream_line(r, mass=mass, r0=r0, theta0=theta0, phi0=phi0,
                         omega=omega, v_r0=v_r0)
-    d_phi = get_dphi(theta, theta0=theta0)
-    phi = phi0 + d_phi
     #
-    v_r, v_theta, v_phi = stream_line_vel(r, theta, mass=mass, r0=r0,
+    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, mass=mass, r0=r0,
                                           theta0=theta0, omega=omega, v_r0=v_r0)
     v_x = v_r * jnp.sin(theta) * jnp.cos(phi) \
           + v_theta * jnp.cos(theta) * jnp.cos(phi) \
