@@ -63,7 +63,7 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     """
     r_cent = (jnp.power(r0, 4) * jnp.power(omega, 2) / (G * mass)) # in au^3 km^-2
     r_cent_au = r_cent * (jnp.power(au_in_km, 2)) # in au
-    jax.debug.print("rc={0} au", r_cent_au)
+    # jax.debug.print("rc={0} au", r_cent_au)
     return r_cent_au
 
 def safe_arccos(x, eps=1e-7):
@@ -148,9 +148,9 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     # epsilon is the dimensionless energy
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
     ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
-    jax.debug.print("ecc={0}", ecc)
-    jax.debug.print("mu={0}", mu)
-    jax.debug.print("theta0={0}", theta0)
+    # jax.debug.print("ecc={0}", ecc)
+    # jax.debug.print("mu={0}", mu)
+    # jax.debug.print("theta0={0}", theta0)
 
 
     # orb_ang is varphi in Mendoza+2009
@@ -177,8 +177,8 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     theta = jnp.where(mask, theta, jnp.nan)
     phi = jnp.where(mask, phi, jnp.nan)
 
-    jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang[:10])
-    jax.debug.print("theta = {theta}", theta=theta[:10])
+    # jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang[:10])
+    # jax.debug.print("theta = {theta}", theta=theta[:10])
     return orb_ang, theta, phi #in radians
 
 
@@ -279,10 +279,13 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
 
     # quantities we will need later
     rc = r_cent(mass=mass, omega=omega, r0=r0)
+    jax.debug.print("rc={0} au", rc)
     mu = (rc / r0)
     nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
     ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
+    if rc > r0:
+        raise ValueError('Centrifugal radius is larger than start of streamline')
     #if rc > r0:
         #print('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
