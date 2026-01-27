@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax import debug
-#jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_nans", True)
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
 from jaxopt import LBFGSB # may not be needed if using custom Newton method
 
@@ -48,8 +48,8 @@ def v_k(radius, mass=0.5):
     :param mass: Msun
     :return: v_k, km/s
     """
-    return jnp.sqrt(G * mass / radius)
-
+    arg = G * mass / radius
+    return jnp.power(arg, 0.5)
 
 def r_cent(mass, omega=1e-14, r0=1e4):
     """
@@ -61,9 +61,9 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     :param r0: Initial radius of the streamline, au
     :return: r_cent, au
     """
-    r_cent = (r0 ** 4 * omega ** 2 / (G * mass)) # in au^3 km^-2
-    r_cent_au = r_cent * (au_in_km**2) # in au
-    print("rc={0} au".format(r_cent_au))
+    r_cent = (jnp.power(r0, 4) * jnp.power(omega, 2) / (G * mass)) # in au^3 km^-2
+    r_cent_au = r_cent * (jnp.power(au_in_km, 2)) # in au
+    jax.debug.print("rc={0} au", r_cent_au)
     return r_cent_au
 
 def safe_arccos(x, eps=1e-7):
@@ -76,9 +76,9 @@ def safe_arccos(x, eps=1e-7):
     :return: arccos of clipped input
     """
     x_safe = jnp.clip(x, -1.0 + eps, 1.0 - eps)
-    jax.debug.print("safe_arccos: x={x}, x_safe={x_safe}", x=x, x_safe=x_safe)
+    # jax.debug.print("safe_arccos: x={x}, x_safe={x_safe}", x=x, x_safe=x_safe)
     result = jnp.arccos(x_safe)
-    jax.debug.print("safe_arccos result={result}", result=result)
+    # jax.debug.print("safe_arccos result={result}", result=result)
     return result
 
 
@@ -105,7 +105,7 @@ def get_orb_ang(r_to_rc, theta0, ecc):
     :param theta0: Description
     :param ecc: Description
     """
-    cos_orb_ang = (1/ecc) * (1 - (jnp.sin(theta0)**2) / r_to_rc)
+    cos_orb_ang = (1/ecc) * (1 - (jnp.power(jnp.sin(theta0), 2) / r_to_rc))
     orb_ang = safe_arccos(cos_orb_ang)
     return orb_ang
 
@@ -126,7 +126,8 @@ def get_dphi(theta, theta0=jnp.radians(30)):
 def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15),
                 omega=1e-14, v_r0=0):
     """
-    It calculates the stream line following Mendoza et al. (2009)
+    It calculates the stream line following Mendoza et al. (2009),
+    only for r < r0. Point r = r0 is handled outside the function.
     It takes the radial velocity and rotation at the streamline
     initial radius and it describes the entire trajectory.
 
@@ -140,40 +141,41 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     :return: theta, radians
     """
     rc = r_cent(mass=mass, omega=omega, r0=r0)
-    #print("rc={0}".format(rc))
-    theta = jnp.zeros_like(r) #+ jnp.nan ()
-    phi = jnp.zeros_like(r)
-    orb_ang = jnp.zeros_like(r)
+
     # mu and nu are dimensionless
     mu = (rc / r0)
-    nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
+    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
     # epsilon is the dimensionless energy
-    epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
-    ecc = jnp.sqrt(1 + epsilon * jnp.sin(theta0)**2)
-    print("ecc={0}".format(ecc))
-    print("mu={0}".format(mu))
-    print("theta0={0}".format(theta0))
+    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
+    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
+    jax.debug.print("ecc={0}", ecc)
+    jax.debug.print("mu={0}", mu)
+    jax.debug.print("theta0={0}", theta0)
 
-    # the first element in the streamline is the starting point
-    theta = theta.at[0].set(theta0)
-    phi = phi.at[0].set(phi0)
+
     # orb_ang is varphi in Mendoza+2009
     #at initial position r_to_rc = r0/rc = 1/mu
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-    orb_ang = orb_ang.at[0].set(orb_ang0)
 
-    deltar = jnp.amin(jnp.abs(jnp.roll(r,1) - r))
+    # Initialise arrays
+    orb_ang = jnp.zeros_like(r)
+    theta = jnp.zeros_like(r)
+    phi = jnp.zeros_like(r)
 
-    for ind in range(1, len(r)):
+    for ind in range(len(r)):
         r_i = (r[ind] / rc)
-        print("r_to_rc={0}".format(r_i)) 
-        if r_i > 0.5:
-            orb_ang_i = get_orb_ang(r_to_rc=r_i, theta0=theta0, ecc=ecc)
-            orb_ang = orb_ang.at[ind].set(orb_ang_i)
-            theta_i = get_theta(theta0, orb_ang_i, orb_ang0)
-            theta = theta.at[ind].set(theta_i)
-            dphi = get_dphi(theta_i, theta0=theta0)
-            phi = phi.at[ind].set(phi0 + dphi)
+        orb_ang_i = get_orb_ang(r_to_rc=r_i, theta0=theta0, ecc=ecc)
+        orb_ang = orb_ang.at[ind].set(orb_ang_i)
+        theta_i = get_theta(theta0, orb_ang_i, orb_ang0)
+        theta = theta.at[ind].set(theta_i)
+        dphi = get_dphi(theta_i, theta0=theta0)
+        phi = phi.at[ind].set(phi0 + dphi)
+
+    # remove values where r_to_rc < 0.5 (inside centrifugal radius)
+    mask = (r / rc) >= 0.5
+    orb_ang = jnp.where(mask, orb_ang, jnp.nan)
+    theta = jnp.where(mask, theta, jnp.nan)
+    phi = jnp.where(mask, phi, jnp.nan)
 
     jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang[:10])
     jax.debug.print("theta = {theta}", theta=theta[:10])
@@ -202,14 +204,14 @@ def stream_line_vel(r, theta, orb_ang, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     v_k0 = v_k(rc, mass=mass)
     # mu and nu are dimensionless
     mu = (rc / r0)
-    nu = (v_r0 * jnp.sqrt(rc / (G * mass)))
-    epsilon = nu**2 + mu**2 * jnp.sin(theta0)**2 - 2 * mu
-    ecc = jnp.sqrt(1 + epsilon*jnp.sin(theta0)**2)
+    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
+    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
+    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
     #
     v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(orb_ang) / r_to_rc /(1 - ecc*jnp.cos(orb_ang))
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
-                  * jnp.sqrt(jnp.cos(theta0)**2 - jnp.cos(theta)**2)
-    v_phi_all = jnp.sin(theta0)**2 / jnp.sin(theta) / r_to_rc
+                  * jnp.power((jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2)), 0.5)
+    v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
 
     return v_r_all * v_k0, v_theta_all * v_k0, v_phi_all * v_k0
 
@@ -275,18 +277,38 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     :return: x, y, z in au, v_x, v_y, v_z in km/s
     """
 
-    #rest of function
+    # quantities we will need later
     rc = r_cent(mass=mass, omega=omega, r0=r0)
+    mu = (rc / r0)
+    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
+    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
+    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
     #if rc > r0:
         #print('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
-    r = jnp.arange(r0, r_low, step=-1*deltar)
-    
+    # r is values internal to the initial radius r0 for computation
+    r = jnp.arange(r0 - deltar, r_low, step=-1*deltar)
+
+    # calculate positions and velocities inside r0
     orb_ang, theta, phi = stream_line(r, mass=mass, r0=r0, theta0=theta0, phi0=phi0,
                         omega=omega, v_r0=v_r0)
     #
     v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, mass=mass, r0=r0,
                                           theta0=theta0, omega=omega, v_r0=v_r0)
+    # prepend initial positions and velocities at r0
+    r_full = jnp.concatenate((jnp.array([r0]), r))
+    theta_full = jnp.concatenate((jnp.array([theta0]), theta))
+    phi_full = jnp.concatenate((jnp.array([phi0]), phi))
+    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
+    orb_ang_full = jnp.concatenate((jnp.array([orb_ang0]), orb_ang))
+    v_r0_full = jnp.concatenate((jnp.array([v_r0]), v_r))
+    v_theta0_full = jnp.concatenate((jnp.array([0.0]), v_theta))
+    # we need to calculate v_phi0 (multiply by v_k0)
+    v_k0 = v_k(rc, mass=mass)
+    v_phi0 = v_k0 * jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta0) * (r0/rc))
+    v_phi0_full = jnp.concatenate((jnp.array([v_phi0]), v_phi))
+
+
     v_x = v_r * jnp.sin(theta) * jnp.cos(phi) \
           + v_theta * jnp.cos(theta) * jnp.cos(phi) \
           - v_phi * jnp.sin(phi)
