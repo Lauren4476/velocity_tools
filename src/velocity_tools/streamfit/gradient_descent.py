@@ -8,7 +8,7 @@ Last updated: 22-01-26
 '''
 
 import jax.numpy as jnp
-from jax import jit, grad, value_and_grad
+from jax import jit, grad, value_and_grad, lax
 import jax
 from . import stream_lines_grad
 
@@ -74,9 +74,40 @@ def forward_model(opt_params, fixed_params, distance_pc):
     return ra_model, dec_model, v_model
 
 
+def forward_fill_nans(arr):
+    """
+    Forward-fill NaN values in a JAX-compatible way.
+    Each NaN is replaced with the last non-NaN value before it.
+    Uses lax.scan for JIT compatibility.
+    
+    Parameters:
+    -----------
+    arr : array
+        1D array potentially containing NaN values
+        
+    Returns:
+    --------
+    filled : array
+        Array with NaN values forward-filled
+    """
+    is_nan = jnp.isnan(arr)
+    arr_clean = jnp.nan_to_num(arr, nan=0.0)
+    
+    # Forward-fill using scan
+    def body_fn(last_valid, x_and_is_nan):
+        x, x_is_nan = x_and_is_nan
+        new_val = jnp.where(x_is_nan, last_valid, x)
+        return new_val, new_val
+    
+    init_carry = arr_clean[0]
+    _, filled = jax.lax.scan(body_fn, init_carry, (arr_clean, is_nan))
+    return filled
+
+
 def arc_length_2d(x, z):
     """
     Compute cumulative 2D arc length along curve in the x-z plane (POS).
+    NaN values are forward-filled before computation.
     
     Parameters:
     -----------
@@ -89,8 +120,12 @@ def arc_length_2d(x, z):
     --------
     s : Array, cumulative arc length along the curve
     """
-    dx = jnp.diff(x)
-    dz = jnp.diff(z)
+    # Forward-fill NaN values to handle invalid region points
+    x_filled = forward_fill_nans(x)
+    z_filled = forward_fill_nans(z)
+    
+    dx = jnp.diff(x_filled)
+    dz = jnp.diff(z_filled)
     ds = jnp.sqrt(dx**2 + dz**2)
     s = jnp.concatenate((jnp.array([0.0]), jnp.cumsum(ds)))
     return s
@@ -99,22 +134,27 @@ def arc_length_2d(x, z):
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     """
     Match model output to data, using plane-of-sky curve length parameterisation.
+    NaN values in model arrays are handled by forward-filling.
     """
-    # arc-lengths
+    # arc-lengths (forward-fill handles NaN via arc_length_2d)
     s_model = arc_length_2d(ra_model, dec_model)
     s_data = arc_length_2d(ra_data, dec_data)
 
     # cut off where model ends
     s_max = jnp.max(s_model)
 
-    # instead of boolean indexing, use jnp.where to pad invalid points
     # clamp s_data to valid range [0, s_max]
     s_data_clamped = jnp.clip(s_data, 0.0, s_max)
 
+    # Forward-fill NaN values in model arrays before interpolation
+    ra_model_filled = forward_fill_nans(ra_model)
+    dec_model_filled = forward_fill_nans(dec_model)
+    v_model_filled = forward_fill_nans(v_model)
+    
     # interpolate model quantities to data arc-lengths
-    ra_model_interp = jnp.interp(s_data_clamped, s_model, ra_model)
-    dec_model_interp = jnp.interp(s_data_clamped, s_model, dec_model)
-    v_model_interp = jnp.interp(s_data_clamped, s_model, v_model)
+    ra_model_interp = jnp.interp(s_data_clamped, s_model, ra_model_filled)
+    dec_model_interp = jnp.interp(s_data_clamped, s_model, dec_model_filled)
+    v_model_interp = jnp.interp(s_data_clamped, s_model, v_model_filled)
 
     return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones_like(s_data, dtype=bool)
 
@@ -170,7 +210,8 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
     return chi2_total
 
 
-def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dict=None, 
+              beta1=0.9, beta2=0.999, eps=1e-8, param_bounds=None):
     """
     Perform one Adam optimization step (only for optimizable parameters).
     
@@ -187,13 +228,17 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, beta1=0.9, beta2=
     t : int
         Time step (iteration number)
     learning_rate : float
-        Learning rate (alpha)
+        Default learning rate (alpha) - used if learning_rate_dict doesn't have a learning rate for a specific param.
+    learning_rate_dict : dict or None
+        Optional per-parameter learning rates. If provided, overrides learning_rate for each param in the dict.
     beta1 : float
         Exponential decay rate for first moment
     beta2 : float
         Exponential decay rate for second moment
     eps : float
         Small constant for numerical stability
+    param_bounds : dict or None
+        Optional bounds for each parameter: {param_name: (min, max)}
         
     Returns:
     --------
@@ -215,15 +260,27 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, beta1=0.9, beta2=
         
         # Compute bias-corrected second raw moment estimate
         v_hat = new_v[key] / (1 - beta2**t)
+
+        # Get learning rate for this parameter
+        if learning_rate_dict is not None and key in learning_rate_dict:
+            lr = learning_rate_dict[key]
+        else:
+            lr = learning_rate
         
         # Update parameters
-        new_opt_params[key] = opt_params[key] - learning_rate * m_hat / (jnp.sqrt(v_hat) + eps)
-    
+        new_opt_params[key] = opt_params[key] - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+
+        # Apply bounds if provided
+        if param_bounds is not None and key in param_bounds:
+            min_val, max_val = param_bounds[key]
+            new_opt_params[key] = jnp.clip(new_opt_params[key], min_val, max_val)
+           
+
     return new_opt_params, new_m, new_v
 
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
-                   learning_rate=0.001, num_epochs=1000, 
+                   learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
                    beta1=0.9, beta2=0.999, 
                    info_every=100, early_stopping_patience=50):
     """
@@ -255,8 +312,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     distance_pc : float
         Distance to source in parsecs
     learning_rate : float
-        Learning rate for Adam optimizer
-    num_epochs : int
+        Default learning rate for Adam optimizer. Used if no specific rate provided for a parameter.
+    learning_rate_dict : dict or None
+        Per-parameter learning rates: {'r0': 1e-2, 'omega': 1e-3, ...}
+        If provided, overrides learning_rate for specified parameters.
+    param_bounds : dict or None
+        Parameter bounds: {'omega': (1e-15, 1e-10), ...}
+    n_epochs : int
         Maximum number of optimization iterations
     beta1 : float
         Adam exponential decay rate for first moment
@@ -288,18 +350,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     best_opt_params = opt_params.copy()
     patience_counter = 0
     
-    print(f"Starting optimization with {num_epochs} epochs...")
+    print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     print(f"Initial optimizable values: {opt_params}")
     
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, n_epochs + 1):
+        print(f"\n Starting Epoch {epoch} -------------------------")
         # Compute loss and gradients (only w.r.t. opt_params)
         loss_value, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
         
         # Perform Adam step
         opt_params, m, v = adam_step(opt_params, grads, m, v, epoch, 
                                      learning_rate=learning_rate,
+                                     learning_rate_dict=learning_rate_dict,
+                                     param_bounds=param_bounds,
                                      beta1=beta1, beta2=beta2)
         
         # Track loss
@@ -315,7 +380,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
         # Print progress
         if epoch % info_every == 0:
-            print(f'Epoch {epoch}/{num_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
+            print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
             print(f'  Current optimizable params: {opt_params}')
         
         # Early stopping
