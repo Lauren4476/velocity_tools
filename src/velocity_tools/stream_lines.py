@@ -138,7 +138,6 @@ def stream_line(r, mass=0.5 * u.Msun, r0=1e4 * u.au, theta0=30 * u.deg,
             # print(ind, result.success)
             # print(result.message, result.status, result.nit)
             theta[ind] = theta_i
-    print("theta = {0}".format(theta[:10]))
     return theta * u.rad
 
 
@@ -240,10 +239,13 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     if rc > r0:
         print('Centrifugal radius is larger than start of streamline')
     r = np.arange(r0.to(u.au).value, rc.to(u.au).value*0.5, step=-1*deltar.value) * u.au
+    print("r = {0}".format(r[1:-1]))
     theta = stream_line(r, mass=mass, r0=r0, theta0=theta0,
                         omega=omega, v_r0=v_r0)
+    print("theta = {0}".format(theta[1:-1]))
     d_phi = get_dphi(theta, theta0=theta0)
     phi = phi0 + d_phi
+    print("phi = {0}".format(phi[1:-1].to(u.rad)))
     #
     v_r, v_theta, v_phi = stream_line_vel(r, theta, mass=mass, r0=r0,
                                           theta0=theta0, omega=omega, v_r0=v_r0)

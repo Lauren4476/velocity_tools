@@ -11,6 +11,7 @@ Then it will extract a streamline from this cube.
 
 import numpy as np
 from astropy import units as u
+import jax.numpy as jnp
 
 def reduce_to_1D(streamer_cube, n_elements=10):
     '''
@@ -109,11 +110,11 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
     # get reference theta from close points
     r_percentile_threshold = 100 / n_elements
-    r_thresh = np.percentile(pc_r, r_percentile_threshold)
-    theta_ref = np.median(pc_theta[pc_r < r_thresh])
+    r_thresh = jnp.percentile(pc_r, r_percentile_threshold)
+    theta_ref = jnp.median(pc_theta[pc_r < r_thresh])
     # for the distance metric, use deviation from this theta_ref
-    pc_theta2 = np.pi - np.abs(np.pi - np.abs(pc_theta - theta_ref))
-    distance_metric = pc_r * np.sqrt(1+pc_theta2**2)
+    pc_theta2 = jnp.pi - jnp.abs(jnp.pi - jnp.abs(pc_theta - theta_ref))
+    distance_metric = pc_r * jnp.sqrt(1+pc_theta2**2)
 
     return distance_metric, theta_ref
 
@@ -133,8 +134,8 @@ def cartesian_to_polar(x, y):
     r : array of radial distances
     theta : array of angles in radians
     '''
-    r = np.sqrt(x**2 + y**2)
-    theta = np.arctan2(y, x) # angle wrt x-axis, in radians
+    r = jnp.sqrt(x**2 + y**2)
+    theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 
     return (r, theta)
 

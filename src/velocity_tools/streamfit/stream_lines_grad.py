@@ -66,7 +66,7 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     # jax.debug.print("rc={0} au", r_cent_au)
     return r_cent_au
 
-def safe_arccos(x, eps=1e-7):
+def safe_arccos(x, eps=1e-12):
     """
     Safe arccos function with clipping to valid range [-1, 1].
     Fully differentiable with JAX.
@@ -111,7 +111,7 @@ def get_orb_ang(r_to_rc, theta0, ecc):
 
 def get_dphi(theta, theta0=jnp.radians(30)):
     """
-    Gets the difference in Phi, in radians.
+    Gets the difference in Phi between initial and current, in radians.
 
     :param theta: radians
     :param theta0: radians
@@ -177,8 +177,10 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     theta = jnp.where(mask, theta, jnp.nan)
     phi = jnp.where(mask, phi, jnp.nan)
 
-    # jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang[:10])
-    # jax.debug.print("theta = {theta}", theta=theta[:10])
+    jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang)
+    jax.debug.print("theta = {theta}", theta=theta)
+    jax.debug.print("phi = {phi}", phi=phi)
+    
     return orb_ang, theta, phi #in radians
 
 
@@ -279,7 +281,7 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
 
     # quantities we will need later
     rc = r_cent(mass=mass, omega=omega, r0=r0)
-    jax.debug.print("rc={0} au", rc)
+    #jax.debug.print("rc={0} au", rc)
     mu = (rc / r0)
     nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
@@ -291,6 +293,7 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
     r = jnp.arange(r0 - deltar, r_low, step=-1*deltar)
+    print("r = {0}".format(r))
 
     # calculate positions and velocities inside r0
     orb_ang, theta, phi = stream_line(r, mass=mass, r0=r0, theta0=theta0, phi0=phi0,

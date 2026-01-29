@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from jax import jit, grad, value_and_grad, lax
 import jax
 from . import stream_lines_grad
+from . import extract_streamline
 
 
 def forward_model(opt_params, fixed_params, distance_pc):
@@ -133,32 +134,55 @@ def arc_length_2d(x, z):
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     """
-    Match model output to data, using plane-of-sky curve length parameterisation.
-    NaN values in model arrays are handled by forward-filling.
+    Extract model values corresponding to data positions, using the same distance metric
+    as used for binning the point cloud.
+    Uses get_distance_metric from extract_streamline
     """
-    # arc-lengths (forward-fill handles NaN via arc_length_2d)
-    s_model = arc_length_2d(ra_model, dec_model)
-    s_data = arc_length_2d(ra_data, dec_data)
 
-    # cut off where model ends
-    s_max = jnp.max(s_model)
-
-    # clamp s_data to valid range [0, s_max]
-    s_data_clamped = jnp.clip(s_data, 0.0, s_max)
-
-    # Forward-fill NaN values in model arrays before interpolation
+    # Forward-fill NaNs in model arrays
     ra_model_filled = forward_fill_nans(ra_model)
     dec_model_filled = forward_fill_nans(dec_model)
     v_model_filled = forward_fill_nans(v_model)
+
+    # compute distance metrics for full model and data
+    # (no clipping - interpolation will handle matching)
+    dmetric_model, _ = extract_streamline.get_distance_metric(
+        ra_model_filled, dec_model_filled)
+    dmetric_data, _ = extract_streamline.get_distance_metric(
+        ra_data, dec_data)
     
-    # interpolate model quantities to data arc-lengths
-    ra_model_interp = jnp.interp(s_data_clamped, s_model, ra_model_filled)
-    dec_model_interp = jnp.interp(s_data_clamped, s_model, dec_model_filled)
-    v_model_interp = jnp.interp(s_data_clamped, s_model, v_model_filled)
+    # Sample distance metrics to n_points using percentiles
+    n_points = len(ra_data)
 
-    return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones_like(s_data, dtype=bool)
+    percentiles = jnp.linspace(0, 100, n_points)
+    dmetric_model_sampled = jnp.percentile(dmetric_model, percentiles)
+    dmetric_data_sampled = jnp.percentile(dmetric_data, percentiles)
+    
+    # Sort the full model arrays by distance metric
+    sort_idx_full = jnp.argsort(dmetric_model)
+    dmetric_model_full_sorted = dmetric_model[sort_idx_full]
+    ra_model_full_sorted = ra_model_filled[sort_idx_full]
+    dec_model_full_sorted = dec_model_filled[sort_idx_full]
+    v_model_full_sorted = v_model_filled[sort_idx_full]
+    
+    # Interpolate model to sampled distance metric positions
+    ra_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, ra_model_full_sorted)
+    dec_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, dec_model_full_sorted)
+    v_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, v_model_full_sorted)
+    
+    # Sort sampled model by its distance metric
+    sort_idx = jnp.argsort(dmetric_model_sampled)
+    dmetric_model_sampled_sorted = dmetric_model_sampled[sort_idx]
+    ra_model_sampled_sorted = ra_model_sampled[sort_idx]
+    dec_model_sampled_sorted = dec_model_sampled[sort_idx]
+    v_model_sampled_sorted = v_model_sampled[sort_idx]
+    
+    # Now interpolate the sampled model to data distance metric positions
+    ra_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, ra_model_sampled_sorted)
+    dec_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, dec_model_sampled_sorted)
+    v_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, v_model_sampled_sorted)
 
-
+    return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones(n_points, dtype=bool)
 
 
 def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
@@ -177,6 +201,7 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
         Uncertainties on the data
     distance_pc : float
         Distance to source in parsecs
+
         
     Returns:
     --------
@@ -310,7 +335,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
         Uncertainties on the data
     distance_pc : float
-        Distance to source in parsecs
+            Distance to source in parsecs
     learning_rate : float
         Default learning rate for Adam optimizer. Used if no specific rate provided for a parameter.
     learning_rate_dict : dict or None
@@ -330,7 +355,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Stop if loss doesn't improve for N epochs
         
     Returns:
-    --------
+    --------   
     dict: Optimized parameters (opt_params only)
     list: Loss history
     """
@@ -356,7 +381,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Initial optimizable values: {opt_params}")
     
     for epoch in range(1, n_epochs + 1):
-        print(f"\n Starting Epoch {epoch} -------------------------")
+        if epoch % info_every == 0:
+            print(f"\n Starting Epoch {epoch} -------------------------")
         # Compute loss and gradients (only w.r.t. opt_params)
         loss_value, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
         
