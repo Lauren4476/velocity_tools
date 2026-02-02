@@ -9,13 +9,6 @@ The assumed input units are:
 - Angles (PA, i, theta, phi...): radians
 '''
 
-'''
-TODO:
-- Replace python for loops with vectorisation or lax.scan
-- Remove unused imports
-- Test
-'''
-
 import astropy.units as u
 from scipy import optimize
 from ..helper_functions import *
@@ -152,15 +145,19 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     # jax.debug.print("mu={0}", mu)
     # jax.debug.print("theta0={0}", theta0)
 
-
     # orb_ang is varphi in Mendoza+2009
-    #at initial position r_to_rc = r0/rc = 1/mu
+    # at initial position r_to_rc = r0/rc = 1/mu
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
 
     # Initialise arrays
     orb_ang = jnp.zeros_like(r)
     theta = jnp.zeros_like(r)
     phi = jnp.zeros_like(r)
+
+    # get initial orb_ang at r0
+    # orb_ang is varphi in Mendoza+2009
+    #at initial position r_to_rc = r0/rc = 1/mu
+    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
 
     for ind in range(len(r)):
         r_i = (r[ind] / rc)
@@ -177,9 +174,9 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     theta = jnp.where(mask, theta, jnp.nan)
     phi = jnp.where(mask, phi, jnp.nan)
 
-    jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang)
-    jax.debug.print("theta = {theta}", theta=theta)
-    jax.debug.print("phi = {phi}", phi=phi)
+    # jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang)
+    # jax.debug.print("theta = {theta}", theta=theta)
+    # jax.debug.print("phi = {phi}", phi=phi)
     
     return orb_ang, theta, phi #in radians
 
@@ -287,13 +284,15 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
     ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
     if rc > r0:
+        # early stop if centrifugal radius is larger than r0
+        # TODO: ideally centrifugal radius should be fed in as the minimum of r0
         raise ValueError('Centrifugal radius is larger than start of streamline')
     #if rc > r0:
         #print('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
     r = jnp.arange(r0 - deltar, r_low, step=-1*deltar)
-    print("r = {0}".format(r))
+    # print("r = {0}".format(r))
 
     # calculate positions and velocities inside r0
     orb_ang, theta, phi = stream_line(r, mass=mass, r0=r0, theta0=theta0, phi0=phi0,
@@ -307,34 +306,34 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     phi_full = jnp.concatenate((jnp.array([phi0]), phi))
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
     orb_ang_full = jnp.concatenate((jnp.array([orb_ang0]), orb_ang))
-    v_r0_full = jnp.concatenate((jnp.array([v_r0]), v_r))
-    v_theta0_full = jnp.concatenate((jnp.array([0.0]), v_theta))
+    v_r_full = jnp.concatenate((jnp.array([v_r0]), v_r))
+    v_theta_full = jnp.concatenate((jnp.array([0.0]), v_theta))
     # we need to calculate v_phi0 (multiply by v_k0)
     v_k0 = v_k(rc, mass=mass)
     v_phi0 = v_k0 * jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta0) * (r0/rc))
-    v_phi0_full = jnp.concatenate((jnp.array([v_phi0]), v_phi))
+    v_phi_full = jnp.concatenate((jnp.array([v_phi0]), v_phi))
 
 
-    v_x = v_r * jnp.sin(theta) * jnp.cos(phi) \
-          + v_theta * jnp.cos(theta) * jnp.cos(phi) \
-          - v_phi * jnp.sin(phi)
-    v_y = v_r * jnp.sin(theta) * jnp.sin(phi) \
-          + v_theta * jnp.cos(theta) * jnp.sin(phi) \
-          + v_phi * jnp.cos(phi)
-    v_z = v_r * jnp.cos(theta) \
-          - v_theta * jnp.sin(theta)
+    v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \
+          + v_theta_full * jnp.cos(theta_full) * jnp.cos(phi_full) \
+          - v_phi_full * jnp.sin(phi_full)
+    v_y = v_r_full * jnp.sin(theta_full) * jnp.sin(phi_full) \
+          + v_theta_full * jnp.cos(theta_full) * jnp.sin(phi_full) \
+          + v_phi_full * jnp.cos(phi_full)
+    v_z = v_r_full * jnp.cos(theta_full) \
+          - v_theta_full * jnp.sin(theta_full)
     # Convert from spherical into cartesian coordinates
-    x = r * jnp.sin(theta) * jnp.cos(phi)
-    y = r * jnp.sin(theta) * jnp.sin(phi)
-    z = r * jnp.cos(theta)
+    x = r_full * jnp.sin(theta_full) * jnp.cos(phi_full)
+    y = r_full * jnp.sin(theta_full) * jnp.sin(phi_full)
+    z = r_full * jnp.cos(theta_full)
     # Get mask from smallest radius for calculation
     if rmin is None:
         gd_rmin = jnp.ones_like(r, dtype=bool)
     else:
-        gd_rmin = (r > rmin)
+        gd_rmin = (r_full > rmin)
     gd_rmin = gd_rmin.astype(x.dtype)
     # Apply mask before rotation
-    x = jnp.where(gd_rmin, x, jnp.nan)
+    x = jnp.where(gd_rmin, x, jnp.nan)  
     y = jnp.where(gd_rmin, y, jnp.nan)
     z = jnp.where(gd_rmin, z, jnp.nan)
     v_x = jnp.where(gd_rmin, v_x, jnp.nan)

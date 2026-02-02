@@ -4,7 +4,7 @@ This file contains the loss function and optimization routines for streamfit.
 The optimization uses Adam (adaptive moment estimation) optimizer to fit
 streamline model parameters to observed data by minimizing chi-squared loss.
 
-Last updated: 22-01-26
+Last updated: 02-02-26
 '''
 
 import jax.numpy as jnp
@@ -12,6 +12,7 @@ from jax import jit, grad, value_and_grad, lax
 import jax
 from . import stream_lines_grad
 from . import extract_streamline
+import csv
 
 
 def forward_model(opt_params, fixed_params, distance_pc):
@@ -61,6 +62,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
     
     # Filter out sentinel values (used for points below rmin)
     # Sentinel value is -1e10, which is unphysical for positions
+    # TODO: is this used?
     sentinel = -1e10
     valid_mask = (x > sentinel + 1e8)  # Points where x is NOT the sentinel
     
@@ -92,6 +94,9 @@ def forward_fill_nans(arr):
         Array with NaN values forward-filled
     """
     is_nan = jnp.isnan(arr)
+    num_nans = int(jnp.sum(is_nan))
+    if num_nans > 0:
+        print(f"[forward_fill_nans] Found {num_nans} NaN values in array of size {arr.size}")
     arr_clean = jnp.nan_to_num(arr, nan=0.0)
     
     # Forward-fill using scan
@@ -122,6 +127,7 @@ def arc_length_2d(x, z):
     s : Array, cumulative arc length along the curve
     """
     # Forward-fill NaN values to handle invalid region points
+    # TODO: consider interpolation instead of forward-fill?
     x_filled = forward_fill_nans(x)
     z_filled = forward_fill_nans(z)
     
@@ -150,6 +156,11 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         ra_model_filled, dec_model_filled)
     dmetric_data, _ = extract_streamline.get_distance_metric(
         ra_data, dec_data)
+    
+    # Replace any NaNs in distance metrics with forward fill
+    # TODO: may need to get rid of forward fill here if it causes issues
+    # dmetric_model = forward_fill_nans(dmetric_model)
+    # dmetric_data = forward_fill_nans(dmetric_data)
     
     # Sample distance metrics to n_points using percentiles
     n_points = len(ra_data)
@@ -307,7 +318,7 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dic
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
                    beta1=0.9, beta2=0.999, 
-                   info_every=100, early_stopping_patience=50):
+                   info_every=100, early_stopping_patience=50, log_file=None):
     """
     Fit streamline model parameters to data using Adam optimizer.
     Only optimizes: r0, theta0, phi0, omega, v_r0
@@ -353,6 +364,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Print loss every N epochs
     early_stopping_patience : int
         Stop if loss doesn't improve for N epochs
+    log_file : str or None
+        If provided, log epoch, loss, and parameter values to this CSV file.
+        File will be created/overwritten at start and updated after each epoch.
         
     Returns:
     --------   
@@ -373,49 +387,88 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     loss_history = []
     best_loss = float('inf')
     best_opt_params = opt_params.copy()
+    best_epoch = 0
     patience_counter = 0
+    
+    # Initialize CSV log file if requested
+    csv_file = None
+    csv_writer = None
+    if log_file is not None:
+        csv_file = open(log_file, 'w', newline='')
+        # Create header: epoch, loss, then all optimizable params
+        fieldnames = ['epoch', 'loss'] + list(opt_params.keys())
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+        csv_file.flush()
+        print(f"Logging optimization progress to: {log_file}")
     
     print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     print(f"Initial optimizable values: {opt_params}")
     
-    for epoch in range(1, n_epochs + 1):
-        if epoch % info_every == 0:
-            print(f"\n Starting Epoch {epoch} -------------------------")
-        # Compute loss and gradients (only w.r.t. opt_params)
-        loss_value, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
+    # Log initial parameters (epoch 0) if CSV logging is enabled
+    if csv_writer is not None:
+        initial_loss = chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc)
+        row = {'epoch': 0, 'loss': float(initial_loss)}
+        for key in opt_params.keys():
+            row[key] = float(opt_params[key])
+        csv_writer.writerow(row)
+        csv_file.flush()
+    
+    try:
+        for epoch in range(1, n_epochs + 1):
+            if epoch % info_every == 0:
+                print(f"\n Starting Epoch {epoch} -------------------------")
+            # Compute loss and gradients (only w.r.t. opt_params)
+            loss_value, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
         
-        # Perform Adam step
-        opt_params, m, v = adam_step(opt_params, grads, m, v, epoch, 
+            # Perform Adam step
+            opt_params, m, v = adam_step(opt_params, grads, m, v, epoch, 
                                      learning_rate=learning_rate,
                                      learning_rate_dict=learning_rate_dict,
                                      param_bounds=param_bounds,
                                      beta1=beta1, beta2=beta2)
         
-        # Track loss
-        loss_history.append(float(loss_value))
+            # Track loss
+            loss_history.append(float(loss_value))
         
-        # Early stopping check
-        if loss_value < best_loss:
-            best_loss = loss_value
-            best_opt_params = opt_params.copy()
-            patience_counter = 0
-        else:
-            patience_counter += 1
+            # Log to CSV if requested
+            if csv_writer is not None:
+                row = {'epoch': epoch, 'loss': float(loss_value)}
+                # Add all optimizable parameter values
+                for key in opt_params.keys():
+                    row[key] = float(opt_params[key])
+                csv_writer.writerow(row)
+                csv_file.flush()  # Ensure data is written after each epoch
         
-        # Print progress
-        if epoch % info_every == 0:
-            print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
-            print(f'  Current optimizable params: {opt_params}')
+            # Early stopping check
+            if loss_value < best_loss:
+                best_loss = loss_value
+                best_opt_params = opt_params.copy()
+                best_epoch = epoch
+                patience_counter = 0
+            else:
+                patience_counter += 1
         
-        # Early stopping
-        if patience_counter >= early_stopping_patience:
-            print(f"\nEarly stopping at epoch {epoch} - no improvement for {early_stopping_patience} epochs")
-            break
+            # Print progress
+            if epoch % info_every == 0:
+                print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
+                print(f'  Current optimizable params: {opt_params}')
+            
+            # Early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\nEarly stopping at epoch {epoch} - no improvement for {early_stopping_patience} epochs")
+                break
+    
+    finally:
+        # Always close the CSV file if it was opened
+        if csv_file is not None:
+            csv_file.close()
+            print(f"Optimization log saved to: {log_file}")
     
     print(f"\nOptimization complete!")
     print(f"Final loss: {best_loss:.6f}")
-    print(f"Best optimized parameters: {best_opt_params}")
+    print(f"Best-fit parameters found at epoch: {best_epoch}")
     
     return best_opt_params, loss_history
