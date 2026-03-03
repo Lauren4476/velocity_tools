@@ -37,6 +37,7 @@ cover/
 
 #MacOS folder
 .DS_Store/
+*.DS_Store/
 
 # Sphinx documentation
 docs/_build/
