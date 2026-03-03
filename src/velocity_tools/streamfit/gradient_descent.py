@@ -110,32 +110,32 @@ def forward_fill_nans(arr):
     return filled
 
 
-def arc_length_2d(x, z):
-    """
-    Compute cumulative 2D arc length along curve in the x-z plane (POS).
-    NaN values are forward-filled before computation.
+# def arc_length_2d(x, z):
+#     """
+#     Compute cumulative 2D arc length along curve in the x-z plane (POS).
+#     NaN values are forward-filled before computation.
     
-    Parameters:
-    -----------
-    x : array
-        x positions (i.e. RA offset)
-    z : array
-        z positions (i.e. Dec offset)
+#     Parameters:
+#     -----------
+#     x : array
+#         x positions (i.e. RA offset)
+#     z : array
+#         z positions (i.e. Dec offset)
         
-    Returns:
-    --------
-    s : Array, cumulative arc length along the curve
-    """
-    # Forward-fill NaN values to handle invalid region points
-    # TODO: consider interpolation instead of forward-fill?
-    x_filled = forward_fill_nans(x)
-    z_filled = forward_fill_nans(z)
+#     Returns:
+#     --------
+#     s : Array, cumulative arc length along the curve
+#     """
+#     # Forward-fill NaN values to handle invalid region points
+#     # TODO: consider interpolation instead of forward-fill?
+#     x_filled = forward_fill_nans(x)
+#     z_filled = forward_fill_nans(z)
     
-    dx = jnp.diff(x_filled)
-    dz = jnp.diff(z_filled)
-    ds = jnp.sqrt(dx**2 + dz**2)
-    s = jnp.concatenate((jnp.array([0.0]), jnp.cumsum(ds)))
-    return s
+#     dx = jnp.diff(x_filled)
+#     dz = jnp.diff(z_filled)
+#     ds = jnp.sqrt(dx**2 + dz**2)
+#     s = jnp.concatenate((jnp.array([0.0]), jnp.cumsum(ds)))
+#     return s
 
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
@@ -156,42 +156,22 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         ra_model_filled, dec_model_filled)
     dmetric_data, _ = extract_streamline.get_distance_metric(
         ra_data, dec_data)
-    
-    # Replace any NaNs in distance metrics with forward fill
-    # TODO: may need to get rid of forward fill here if it causes issues
-    # dmetric_model = forward_fill_nans(dmetric_model)
-    # dmetric_data = forward_fill_nans(dmetric_data)
-    
-    # Sample distance metrics to n_points using percentiles
-    n_points = len(ra_data)
+    # print(f"dmetric_model: {dmetric_model}")
+    # print(f"dmetric_data: {dmetric_data}")
 
-    percentiles = jnp.linspace(0, 100, n_points)
-    dmetric_model_sampled = jnp.percentile(dmetric_model, percentiles)
-    dmetric_data_sampled = jnp.percentile(dmetric_data, percentiles)
-    
-    # Sort the full model arrays by distance metric
-    sort_idx_full = jnp.argsort(dmetric_model)
-    dmetric_model_full_sorted = dmetric_model[sort_idx_full]
-    ra_model_full_sorted = ra_model_filled[sort_idx_full]
-    dec_model_full_sorted = dec_model_filled[sort_idx_full]
-    v_model_full_sorted = v_model_filled[sort_idx_full]
-    
-    # Interpolate model to sampled distance metric positions
-    ra_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, ra_model_full_sorted)
-    dec_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, dec_model_full_sorted)
-    v_model_sampled = jnp.interp(dmetric_model_sampled, dmetric_model_full_sorted, v_model_full_sorted)
-    
-    # Sort sampled model by its distance metric
-    sort_idx = jnp.argsort(dmetric_model_sampled)
-    dmetric_model_sampled_sorted = dmetric_model_sampled[sort_idx]
-    ra_model_sampled_sorted = ra_model_sampled[sort_idx]
-    dec_model_sampled_sorted = dec_model_sampled[sort_idx]
-    v_model_sampled_sorted = v_model_sampled[sort_idx]
-    
-    # Now interpolate the sampled model to data distance metric positions
-    ra_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, ra_model_sampled_sorted)
-    dec_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, dec_model_sampled_sorted)
-    v_model_interp = jnp.interp(dmetric_data_sampled, dmetric_model_sampled_sorted, v_model_sampled_sorted)
+    # sort model once
+    sort_idx = jnp.argsort(dmetric_model)
+    d_model_sorted = dmetric_model[sort_idx]
+    ra_sorted = ra_model_filled[sort_idx]
+    dec_sorted = dec_model_filled[sort_idx]
+    v_sorted = v_model_filled[sort_idx]
+
+    # interpolate model to the *actual* data distance metric
+    ra_model_interp = jnp.interp(dmetric_data, d_model_sorted, ra_sorted)
+    dec_model_interp = jnp.interp(dmetric_data, d_model_sorted, dec_sorted)
+    v_model_interp  = jnp.interp(dmetric_data, d_model_sorted, v_sorted)
+        
+    n_points = len(ra_data)
 
     return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones(n_points, dtype=bool)
 

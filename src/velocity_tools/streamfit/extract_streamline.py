@@ -46,7 +46,8 @@ def reduce_to_1D(streamer_cube, n_elements=10):
     dec_coords = (world_coords[1].reshape(ny, nx) - streamer_cube.header['CRVAL2']) * 60 * 60 # in arcsec
 
     # create velocity array in km/s
-    v_coords = streamer_cube.spectral_axis.to(u.km/u.s).value - streamer_cube.header['CRVAL3'] # in km/s
+    #TODO: start here
+    v_coords = streamer_cube.spectral_axis.to(u.km/u.s).value - (streamer_cube.header['CRVAL3']*1e-3)
 
     print('Created coordinate arrays')
 
