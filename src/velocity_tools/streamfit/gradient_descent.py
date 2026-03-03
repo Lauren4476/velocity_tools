@@ -385,7 +385,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     
     # Track loss history
     loss_history = []
-    best_loss = float('inf')
+    initial_loss = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
+    best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_epoch = 0
     patience_counter = 0
@@ -407,10 +408,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     print(f"Initial optimizable values: {opt_params}")
     
-    # Log initial parameters (epoch 0) if CSV logging is enabled
+    # Log initial parameters and initial loss (epoch 0) if CSV logging is enabled
     if csv_writer is not None:
-        initial_loss = chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc)
-        row = {'epoch': 0, 'loss': float(initial_loss)}
+        row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_params.keys():
             row[key] = float(opt_params[key])
         csv_writer.writerow(row)
@@ -420,8 +420,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         for epoch in range(1, n_epochs + 1):
             if epoch % info_every == 0:
                 print(f"\n Starting Epoch {epoch} -------------------------")
-            # Compute loss and gradients (only w.r.t. opt_params)
-            loss_value, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
+            # Compute gradients at current parameters (pre-update)
+            _, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
         
             # Perform Adam step
             opt_params, m, v = adam_step(opt_params, grads, m, v, epoch, 
@@ -429,13 +429,16 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                                      learning_rate_dict=learning_rate_dict,
                                      param_bounds=param_bounds,
                                      beta1=beta1, beta2=beta2)
+
+            # Compute loss at updated parameters (post-update)
+            loss_value = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
         
             # Track loss
-            loss_history.append(float(loss_value))
+            loss_history.append(loss_value)
         
             # Log to CSV if requested
             if csv_writer is not None:
-                row = {'epoch': epoch, 'loss': float(loss_value)}
+                row = {'epoch': epoch, 'loss': loss_value}
                 # Add all optimizable parameter values
                 for key in opt_params.keys():
                     row[key] = float(opt_params[key])
