@@ -13,6 +13,25 @@ import numpy as np
 from astropy import units as u
 import jax.numpy as jnp
 
+
+def _wrap_to_pi(angle):
+    """Wrap angles to [-pi, pi)."""
+    return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+
+
+def _circular_median(theta_vals):
+    """
+    Compute a branch-cut-safe median angle.
+
+    Angles are first unwrapped around a circular-mean anchor, then a linear
+    median is taken in that unwrapped frame, and wrapped back to [-pi, pi).
+    """
+    theta_anchor = jnp.arctan2(jnp.mean(jnp.sin(theta_vals)), jnp.mean(jnp.cos(theta_vals)))
+    theta_delta = _wrap_to_pi(theta_vals - theta_anchor)
+    theta_unwrapped = theta_anchor + theta_delta
+    theta_ref = jnp.median(theta_unwrapped)
+    return _wrap_to_pi(theta_ref)
+
 def reduce_to_1D(streamer_cube, n_elements=10):
     '''
     This function will reduce a cube of emission to a 1D 'streamline', 
@@ -98,7 +117,7 @@ def reduce_to_1D(streamer_cube, n_elements=10):
 
         
 
-def get_distance_metric(ra_coords, dec_coords, n_elements=10):
+def get_distance_metric(ra_coords, dec_coords, n_elements=10, return_trace=False):
     '''
     Compute distance metric - used to bin the point cloud into n_elements
     This combines projected distance from star, and angular deviation from initial angle
@@ -106,16 +125,50 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
 
     The theta used here is the angle in polar coordinates in the plane of the sky, wrt RA axis
 
-    This distance metric is the same as in TIPSY
+    This distance metric is the same as in TIPSY.
+
+    The reference angle theta_ref is computed with a branch-cut-safe circular
+    median of inner points, so values near -pi and +pi are treated as nearby
+    directions rather than opposite sides of the line.
+
+    Parameters
+    ----------
+    ra_coords : array
+        RA offsets.
+    dec_coords : array
+        Dec offsets.
+    n_elements : int
+        Number of elements used in distance partitioning.
+    return_trace : bool
+        If True, return extra diagnostics useful for debugging metric instability.
+
+    Returns
+    -------
+    distance_metric, theta_ref
+        Default return values.
+    distance_metric, theta_ref, trace_dict
+        Returned when return_trace=True.
     '''
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
     # get reference theta from close points
     r_percentile_threshold = 100 / n_elements
     r_thresh = jnp.percentile(pc_r, r_percentile_threshold)
-    theta_ref = jnp.median(pc_theta[pc_r < r_thresh])
+    inner_mask = pc_r < r_thresh
+    theta_ref = _circular_median(pc_theta[inner_mask])
     # for the distance metric, use deviation from this theta_ref
     pc_theta2 = jnp.pi - jnp.abs(jnp.pi - jnp.abs(pc_theta - theta_ref))
     distance_metric = pc_r * jnp.sqrt(1+pc_theta2**2)
+
+    if return_trace:
+        trace = {
+            'r_percentile_threshold': float(r_percentile_threshold),
+            'r_thresh': float(r_thresh),
+            'inner_count': int(jnp.sum(inner_mask)),
+            'n_points': int(pc_r.size),
+            'n_elements': int(n_elements),
+            'theta_ref': float(theta_ref),
+        }
+        return distance_metric, theta_ref, trace
 
     return distance_metric, theta_ref
 

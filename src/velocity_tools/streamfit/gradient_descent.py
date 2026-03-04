@@ -16,6 +16,66 @@ from . import extract_streamline
 import csv
 
 
+TRACE_FIELDNAMES = [
+    'epoch',
+    'loss',
+    'chi2_ra',
+    'chi2_dec',
+    'chi2_v',
+    'chi2_total',
+    'theta_ref_model',
+    'theta_ref_data',
+    'theta_ref_delta',
+    'model_points_total',
+    'model_nan_count',
+    'model_valid_points',
+    'model_metric_span',
+    'model_metric_min_gap',
+    'model_metric_near_tie_count',
+    'model_metric_duplicate_count',
+    'model_metric_non_monotonic_count',
+    'model_r_thresh',
+    'model_inner_count',
+    'data_r_thresh',
+    'data_inner_count',
+]
+
+
+def _build_trace_row(epoch, loss_value, loss_trace):
+    """Flatten nested trace dictionary into a CSV row."""
+    chi2_components = loss_trace.get('chi2_components', {})
+    matching = loss_trace.get('matching', {})
+    model_metric_trace = matching.get('distance_metric_model', {})
+    data_metric_trace = matching.get('distance_metric_data', {})
+
+    theta_ref_model = matching.get('theta_ref_model', float('nan'))
+    theta_ref_data = matching.get('theta_ref_data', float('nan'))
+
+    return {
+        'epoch': epoch,
+        'loss': loss_value,
+        'chi2_ra': chi2_components.get('chi2_ra', float('nan')),
+        'chi2_dec': chi2_components.get('chi2_dec', float('nan')),
+        'chi2_v': chi2_components.get('chi2_v', float('nan')),
+        'chi2_total': chi2_components.get('chi2_total', float('nan')),
+        'theta_ref_model': theta_ref_model,
+        'theta_ref_data': theta_ref_data,
+        'theta_ref_delta': theta_ref_model - theta_ref_data,
+        'model_points_total': matching.get('model_points_total', 0),
+        'model_nan_count': matching.get('model_nan_count', 0),
+        'model_valid_points': matching.get('model_valid_points', 0),
+        'model_metric_span': matching.get('model_metric_span', float('nan')),
+        'model_metric_min_gap': matching.get('model_metric_min_gap', float('nan')),
+        'model_metric_near_tie_count': matching.get('model_metric_near_tie_count', 0),
+        'model_metric_duplicate_count': matching.get('model_metric_duplicate_count', 0),
+        'model_metric_non_monotonic_count': matching.get('model_metric_non_monotonic_count', 0),
+        'model_r_thresh': model_metric_trace.get('r_thresh', float('nan')),
+        'model_inner_count': model_metric_trace.get('inner_count', 0),
+        'data_r_thresh': data_metric_trace.get('r_thresh', float('nan')),
+        'data_inner_count': data_metric_trace.get('inner_count', 0),
+    }
+
+
 def forward_model(opt_params, fixed_params, distance_pc):
     """
     Run the forward model using stream_lines_grad.xyz_stream
@@ -139,11 +199,17 @@ def forward_fill_nans(arr):
 #     return s
 
 
-def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
+def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
     """
     Extract model values corresponding to data positions, using the same distance metric
     as used for binning the point cloud.
     Uses get_distance_metric from extract_streamline
+
+    Parameters
+    ----------
+    return_trace : bool
+        If True, also return a trace dictionary containing diagnostics on
+        distance metric stability and model-point ordering.
     """
 
     # Forward-fill NaNs in model arrays
@@ -153,10 +219,16 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
     # compute distance metrics for full model and data
     # (no clipping - interpolation will handle matching)
-    dmetric_model, _ = extract_streamline.get_distance_metric(
-        ra_model_filled, dec_model_filled)
-    dmetric_data, _ = extract_streamline.get_distance_metric(
-        ra_data, dec_data)
+    if return_trace:
+        dmetric_model, theta_ref_model, dmetric_model_trace = extract_streamline.get_distance_metric(
+            ra_model_filled, dec_model_filled, return_trace=True)
+        dmetric_data, theta_ref_data, dmetric_data_trace = extract_streamline.get_distance_metric(
+            ra_data, dec_data, return_trace=True)
+    else:
+        dmetric_model, _ = extract_streamline.get_distance_metric(
+            ra_model_filled, dec_model_filled)
+        dmetric_data, _ = extract_streamline.get_distance_metric(
+            ra_data, dec_data)
     # print(f"dmetric_model: {dmetric_model}")
     # print(f"dmetric_data: {dmetric_data}")
 
@@ -174,10 +246,49 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         
     n_points = len(ra_data)
 
-    return ra_model_interp, dec_model_interp, v_model_interp, jnp.ones(n_points, dtype=bool)
+    valid = jnp.ones(n_points, dtype=bool)
+
+    if not return_trace:
+        return ra_model_interp, dec_model_interp, v_model_interp, valid
+
+    model_nan_mask = jnp.isnan(ra_model) | jnp.isnan(dec_model) | jnp.isnan(v_model)
+    model_nan_count = int(jnp.sum(model_nan_mask))
+    model_points_total = int(ra_model.size)
+    model_valid_points = model_points_total - model_nan_count
+
+    d_diff = jnp.diff(d_model_sorted)
+    if d_diff.size > 0:
+        model_metric_min_gap = float(jnp.min(d_diff))
+        model_metric_near_tie_count = int(jnp.sum(jnp.abs(d_diff) <= 1e-8))
+        model_metric_duplicate_count = int(jnp.sum(d_diff == 0.0))
+        model_metric_non_monotonic_count = int(jnp.sum(d_diff < 0.0))
+    else:
+        model_metric_min_gap = float('nan')
+        model_metric_near_tie_count = 0
+        model_metric_duplicate_count = 0
+        model_metric_non_monotonic_count = 0
+
+    model_metric_span = float(d_model_sorted[-1] - d_model_sorted[0]) if d_model_sorted.size > 1 else 0.0
+
+    matching_trace = {
+        'theta_ref_model': float(theta_ref_model),
+        'theta_ref_data': float(theta_ref_data),
+        'model_points_total': model_points_total,
+        'model_nan_count': model_nan_count,
+        'model_valid_points': model_valid_points,
+        'model_metric_span': model_metric_span,
+        'model_metric_min_gap': model_metric_min_gap,
+        'model_metric_near_tie_count': model_metric_near_tie_count,
+        'model_metric_duplicate_count': model_metric_duplicate_count,
+        'model_metric_non_monotonic_count': model_metric_non_monotonic_count,
+        'distance_metric_model': dmetric_model_trace,
+        'distance_metric_data': dmetric_data_trace,
+    }
+
+    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace
 
 
-def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
+def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=False):
     """
     Compute chi-squared loss between model and data (RA, Dec, LOS velocity)
     
@@ -213,8 +324,12 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
     
 
     # Match model to data using arc-length parameterisation
-    ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
-        ra_model, dec_model, v_model, ra_data, dec_data)
+    if return_trace:
+        ra_model_interp, dec_model_interp, v_model_interp, _, matching_trace = match_model_to_data_curve(
+            ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
+    else:
+        ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
+            ra_model, dec_model, v_model, ra_data, dec_data)
 
 
     # Compute chi-squared components
@@ -223,7 +338,19 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
     chi2_v = jnp.sum(((v_data - v_model_interp) / v_sigma)**2)
     # Total chi-squared
     chi2_total = chi2_ra + chi2_dec + chi2_v
-    
+
+    if return_trace:
+        loss_trace = {
+            'chi2_components': {
+                'chi2_ra': float(chi2_ra),
+                'chi2_dec': float(chi2_dec),
+                'chi2_v': float(chi2_v),
+                'chi2_total': float(chi2_total),
+            },
+            'matching': matching_trace,
+        }
+        return chi2_total, loss_trace
+
     return chi2_total
 
 ##### DEPRECATED MANUAL ADAM IMPLEMENTATION - WE USE OPTAX INSTEAD #####
@@ -300,7 +427,8 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dic
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
                    beta1=0.9, beta2=0.999, 
-                   info_every=100, early_stopping_patience=50, log_file=None):
+                   info_every=100, early_stopping_patience=50, log_file=None,
+                   trace_file=None, trace_every=1):
     """
     Fit streamline model parameters to data using Adam optimizer.
     Only optimizes: r0, theta0, phi0, omega, v_r0
@@ -349,6 +477,12 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     log_file : str or None
         If provided, log epoch, loss, and parameter values to this CSV file.
         File will be created/overwritten at start and updated after each epoch.
+    trace_file : str or None
+        If provided, log per-epoch matching diagnostics (theta_ref, NaN counts,
+        metric gaps/ties) to this CSV file.
+    trace_every : int
+        Frequency (in epochs) for writing rows to trace_file.
+        Must be >= 1.
         
     Returns:
     --------   
@@ -386,6 +520,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     best_opt_params = opt_params.copy()
     best_epoch = 0
     patience_counter = 0
+
+    if trace_every < 1:
+        raise ValueError('trace_every must be >= 1')
     
     # Initialize CSV log file if requested
     csv_file = None
@@ -398,6 +535,15 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         csv_writer.writeheader()
         csv_file.flush()
         print(f"Logging optimization progress to: {log_file}")
+
+    trace_csv_file = None
+    trace_csv_writer = None
+    if trace_file is not None:
+        trace_csv_file = open(trace_file, 'w', newline='')
+        trace_csv_writer = csv.DictWriter(trace_csv_file, fieldnames=TRACE_FIELDNAMES)
+        trace_csv_writer.writeheader()
+        trace_csv_file.flush()
+        print(f"Logging matching traces to: {trace_file}")
     
     print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
@@ -411,6 +557,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             row[key] = float(opt_params[key])
         csv_writer.writerow(row)
         csv_file.flush()
+
+    if trace_csv_writer is not None:
+        initial_loss_for_trace, initial_trace = chi2_loss(
+            opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
+        initial_trace_row = _build_trace_row(0, float(initial_loss_for_trace), initial_trace)
+        trace_csv_writer.writerow(initial_trace_row)
+        trace_csv_file.flush()
     
     try:
         for epoch in range(1, n_epochs + 1):
@@ -431,7 +584,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                         opt_params[key] = jnp.clip(opt_params[key], min_val, max_val)
 
             # Compute loss at updated parameters (post-update)
-            loss_value = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
+            if trace_csv_writer is not None and epoch % trace_every == 0:
+                loss_eval, loss_trace = chi2_loss(
+                    opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
+                loss_value = float(loss_eval)
+            else:
+                loss_value = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
+                loss_trace = None
         
             # Track loss
             loss_history.append(loss_value)
@@ -444,6 +603,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                     row[key] = float(opt_params[key])
                 csv_writer.writerow(row)
                 csv_file.flush()  # Ensure data is written after each epoch
+
+            if trace_csv_writer is not None and loss_trace is not None:
+                trace_row = _build_trace_row(epoch, loss_value, loss_trace)
+                trace_csv_writer.writerow(trace_row)
+                trace_csv_file.flush()
         
             # Early stopping check
             if loss_value < best_loss:
@@ -469,6 +633,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         if csv_file is not None:
             csv_file.close()
             print(f"Optimization log saved to: {log_file}")
+        if trace_csv_file is not None:
+            trace_csv_file.close()
+            print(f"Matching trace log saved to: {trace_file}")
     
     print(f"\nOptimization complete!")
     print(f"Final loss: {best_loss:.6f}")
