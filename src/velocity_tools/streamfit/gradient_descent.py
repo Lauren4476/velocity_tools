@@ -10,6 +10,7 @@ Last updated: 02-02-26
 import jax.numpy as jnp
 from jax import jit, grad, value_and_grad, lax
 import jax
+import optax
 from . import stream_lines_grad
 from . import extract_streamline
 import csv
@@ -225,7 +226,8 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc):
     
     return chi2_total
 
-
+##### DEPRECATED MANUAL ADAM IMPLEMENTATION - WE USE OPTAX INSTEAD #####
+'''
 def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dict=None, 
               beta1=0.9, beta2=0.999, eps=1e-8, param_bounds=None):
     """
@@ -293,7 +295,7 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dic
            
 
     return new_opt_params, new_m, new_v
-
+'''
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
@@ -355,10 +357,24 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     """
     # Initialize parameters
     opt_params = initial_opt_params.copy()
-    
-    # Initialize Adam moments (only for optimizable parameters)
-    m = {key: 0.0 for key in opt_params.keys()}
-    v = {key: 0.0 for key in opt_params.keys()}
+
+    # Build optimizer (supports optional per-parameter learning rates)
+    if learning_rate_dict is not None:
+        param_labels = {
+            key: key if key in learning_rate_dict else 'default'
+            for key in opt_params.keys()
+        }
+        transforms = {
+            'default': optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
+        }
+        for key, lr in learning_rate_dict.items():
+            if key in opt_params:
+                transforms[key] = optax.adam(learning_rate=lr, b1=beta1, b2=beta2)
+        solver = optax.multi_transform(transforms, param_labels)
+    else:
+        solver = optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
+
+    opt_state = solver.init(opt_params)
     
     # Create gradient function (only w.r.t. opt_params)
     loss_and_grad_fn = value_and_grad(chi2_loss, argnums=0)
@@ -402,13 +418,17 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 print(f"\n Starting Epoch {epoch} -------------------------")
             # Compute gradients at current parameters (pre-update)
             _, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
-        
-            # Perform Adam step
-            opt_params, m, v = adam_step(opt_params, grads, m, v, epoch, 
-                                     learning_rate=learning_rate,
-                                     learning_rate_dict=learning_rate_dict,
-                                     param_bounds=param_bounds,
-                                     beta1=beta1, beta2=beta2)
+
+            # Perform Optax Adam step
+            updates, opt_state = solver.update(grads, opt_state, params=opt_params)
+            opt_params = optax.apply_updates(opt_params, updates)
+
+            # Apply bounds if provided
+            if param_bounds is not None:
+                for key in opt_params.keys():
+                    if key in param_bounds:
+                        min_val, max_val = param_bounds[key]
+                        opt_params[key] = jnp.clip(opt_params[key], min_val, max_val)
 
             # Compute loss at updated parameters (post-update)
             loss_value = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
