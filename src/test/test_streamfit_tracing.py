@@ -85,7 +85,7 @@ def test_chi2_loss_returns_trace(monkeypatch) -> None:
         'r0': 540.0,
         'theta0': 0.7,
         'phi0': 1.2,
-        'omega': 4e-12,
+        'log_omega': np.log(4e-12),
         'v_r0': -0.2,
     }
     fixed_params = {
@@ -126,7 +126,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         'r0': 540.0,
         'theta0': 0.7,
         'phi0': 1.2,
-        'omega': 4e-12,
+        'log_omega': np.log(4e-12),
         'v_r0': -0.2,
     }
     fixed_params = {
@@ -149,8 +149,9 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     )
 
     trace_file = tmp_path / 'streamfit_trace.csv'
+    log_file = tmp_path / 'streamfit_log.csv'
 
-    _, loss_history = gradient_descent.fit_streamline(
+    best_opt_params, loss_history = gradient_descent.fit_streamline(
         initial_opt_params,
         fixed_params,
         data,
@@ -159,11 +160,17 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         n_epochs=3,
         info_every=100,
         early_stopping_patience=10,
+        log_file=str(log_file),
         trace_file=str(trace_file),
         trace_every=1,
     )
 
     assert len(loss_history) == 3
+    assert 'log_omega' in best_opt_params
+    assert 'omega' in best_opt_params
+    assert float(best_opt_params['omega']) == pytest.approx(
+        float(np.exp(float(best_opt_params['log_omega']))), rel=1e-6
+    )
 
     with open(trace_file, newline='') as fh:
         rows = list(csv.DictReader(fh))
@@ -179,3 +186,24 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         'chi2_total',
     }
     assert expected_columns.issubset(set(rows[0].keys()))
+
+    with open(log_file, newline='') as fh:
+        log_rows = list(csv.DictReader(fh))
+
+    assert len(log_rows) == 4  # epoch 0 + 3 optimization epochs
+    expected_log_columns = {
+        'epoch',
+        'loss',
+        'r0',
+        'theta0',
+        'phi0',
+        'log_omega',
+        'omega',
+        'v_r0',
+    }
+    assert expected_log_columns.issubset(set(log_rows[0].keys()))
+
+    for row in log_rows:
+        log_omega = float(row['log_omega'])
+        omega = float(row['omega'])
+        assert omega == pytest.approx(float(np.exp(log_omega)), rel=1e-6)

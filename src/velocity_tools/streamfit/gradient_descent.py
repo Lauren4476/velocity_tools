@@ -41,6 +41,52 @@ TRACE_FIELDNAMES = [
 ]
 
 
+REQUIRED_OPT_PARAM_KEYS = (
+    'r0',
+    'theta0',
+    'phi0',
+    'log_omega',
+    'v_r0',
+)
+
+
+def _omega_from_log_omega(log_omega):
+    """Convert optimization-space log_omega to physical omega (1/s)."""
+    return jnp.exp(log_omega)
+
+
+def _with_derived_omega(opt_params):
+    """Return a shallow copy including derived physical omega when available."""
+    params_with_omega = opt_params.copy()
+    if 'log_omega' in params_with_omega and 'omega' not in params_with_omega:
+        params_with_omega['omega'] = _omega_from_log_omega(params_with_omega['log_omega'])
+    return params_with_omega
+
+
+def _sanitize_opt_params(initial_opt_params):
+    """Normalize optimization params to the log_omega API and validate required keys."""
+    opt_params = initial_opt_params.copy()
+
+    if 'omega' in opt_params and 'log_omega' in opt_params:
+        # If caller passes both (e.g. reusing fit output), prefer optimization-space key.
+        del opt_params['omega']
+
+    if 'omega' in opt_params and 'log_omega' not in opt_params:
+        raise KeyError(
+            "Optimization parameters now require 'log_omega' (natural log of omega). "
+            "Convert input using log_omega = log(omega)."
+        )
+
+    missing = [key for key in REQUIRED_OPT_PARAM_KEYS if key not in opt_params]
+    if missing:
+        raise KeyError(
+            f"Missing required optimizable parameters: {missing}. "
+            f"Required keys are: {list(REQUIRED_OPT_PARAM_KEYS)}"
+        )
+
+    return opt_params
+
+
 def _build_trace_row(epoch, loss_value, loss_trace):
     """Flatten nested trace dictionary into a CSV row."""
     chi2_components = loss_trace.get('chi2_components', {})
@@ -87,7 +133,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - 'r0': initial radius (au)
         - 'theta0': initial polar angle (radians)
         - 'phi0': initial azimuthal angle (radians)
-        - 'omega': angular rotation (1/s)
+        - 'log_omega': natural log of angular rotation (log(1/s))
         - 'v_r0': initial radial velocity (km/s)
     fixed_params : dict
         Dictionary containing fixed streamline parameters:
@@ -107,13 +153,21 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - Dec offsets in arcsec
         - Line-of-sight velocities in km/s
     """
+    if 'log_omega' not in opt_params:
+        raise KeyError(
+            "forward_model expects 'log_omega' in opt_params. "
+            "Use log_omega = log(omega)."
+        )
+
+    omega = _omega_from_log_omega(opt_params['log_omega'])
+
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = stream_lines_grad.xyz_stream(
         mass=fixed_params['mass'],
         r0=opt_params['r0'],
         theta0=opt_params['theta0'],
         phi0=opt_params['phi0'],
-        omega=opt_params['omega'],
+        omega=omega,
         v_r0=opt_params['v_r0'],
         inc=fixed_params['inc'],
         pa=fixed_params['pa'],
@@ -431,7 +485,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    trace_file=None, trace_every=1):
     """
     Fit streamline model parameters to data using Adam optimizer.
-    Only optimizes: r0, theta0, phi0, omega, v_r0
+    Only optimizes: r0, theta0, phi0, log_omega, v_r0
     Keeps fixed: mass, inc, pa, rmin, deltar, v_lsr
     
     Parameters:
@@ -441,7 +495,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         - 'r0': initial radius (au)
         - 'theta0': initial polar angle (radians)
         - 'phi0': initial azimuthal angle (radians)
-        - 'omega': angular rotation (1/s)
+        - 'log_omega': natural log of angular rotation (log(1/s))
         - 'v_r0': initial radial velocity (km/s)
     fixed_params : dict
         Fixed parameters (not optimized):
@@ -460,10 +514,10 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     learning_rate : float
         Default learning rate for Adam optimizer. Used if no specific rate provided for a parameter.
     learning_rate_dict : dict or None
-        Per-parameter learning rates: {'r0': 1e-2, 'omega': 1e-3, ...}
+        Per-parameter learning rates: {'r0': 1e-2, 'log_omega': 1e-2, ...}
         If provided, overrides learning_rate for specified parameters.
     param_bounds : dict or None
-        Parameter bounds: {'omega': (1e-15, 1e-10), ...}
+        Parameter bounds in optimization space: {'log_omega': (log(1e-15), log(1e-10)), ...}
     n_epochs : int
         Maximum number of optimization iterations
     beta1 : float
@@ -486,11 +540,23 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
     Returns:
     --------   
-    dict: Optimized parameters (opt_params only)
+    dict: Optimized parameters including both 'log_omega' and derived 'omega'
     list: Loss history
     """
     # Initialize parameters
-    opt_params = initial_opt_params.copy()
+    opt_params = _sanitize_opt_params(initial_opt_params)
+
+    if learning_rate_dict is not None and 'omega' in learning_rate_dict and 'log_omega' not in learning_rate_dict:
+        raise KeyError(
+            "learning_rate_dict now expects 'log_omega' instead of 'omega'. "
+            "Use log-space learning rates keyed by 'log_omega'."
+        )
+
+    if param_bounds is not None and 'omega' in param_bounds and 'log_omega' not in param_bounds:
+        raise KeyError(
+            "param_bounds now expects 'log_omega' bounds instead of 'omega'. "
+            "Use natural-log bounds, e.g. (log(min_omega), log(max_omega))."
+        )
 
     # Build optimizer (supports optional per-parameter learning rates)
     if learning_rate_dict is not None:
@@ -531,6 +597,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         csv_file = open(log_file, 'w', newline='')
         # Create header: epoch, loss, then all optimizable params
         fieldnames = ['epoch', 'loss'] + list(opt_params.keys())
+        if 'log_omega' in opt_params and 'omega' not in fieldnames:
+            fieldnames.append('omega')
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
         csv_file.flush()
@@ -548,13 +616,16 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
-    print(f"Initial optimizable values: {opt_params}")
+    print("Omega is optimized in log space: omega = exp(log_omega)")
+    print(f"Initial optimizable values: {_with_derived_omega(opt_params)}")
     
     # Log initial parameters and initial loss (epoch 0) if CSV logging is enabled
     if csv_writer is not None:
         row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_params.keys():
             row[key] = float(opt_params[key])
+        if 'log_omega' in opt_params:
+            row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
         csv_writer.writerow(row)
         csv_file.flush()
 
@@ -601,6 +672,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 # Add all optimizable parameter values
                 for key in opt_params.keys():
                     row[key] = float(opt_params[key])
+                if 'log_omega' in opt_params:
+                    row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
                 csv_writer.writerow(row)
                 csv_file.flush()  # Ensure data is written after each epoch
 
@@ -621,7 +694,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Print progress
             if epoch % info_every == 0:
                 print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
-                print(f'  Current optimizable params: {opt_params}')
+                print(f'  Current optimizable params: {_with_derived_omega(opt_params)}')
             
             # Early stopping
             if patience_counter >= early_stopping_patience:
@@ -640,5 +713,5 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"\nOptimization complete!")
     print(f"Final loss: {best_loss:.6f}")
     print(f"Best-fit parameters found at epoch: {best_epoch}")
-    
-    return best_opt_params, loss_history
+
+    return _with_derived_omega(best_opt_params), loss_history
