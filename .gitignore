@@ -41,3 +41,7 @@ cover/
 
 # Sphinx documentation
 docs/_build/
+
+
+# Test outputs
+streamfit_test_output/
