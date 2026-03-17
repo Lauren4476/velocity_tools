@@ -15,6 +15,7 @@ from skimage import data
 from . import stream_lines_grad
 from . import extract_streamline
 import csv
+import math
 
 
 TRACE_FIELDNAMES = [
@@ -72,6 +73,76 @@ def _with_derived_omega(opt_params):
     if 'log_omega' in params_with_omega and 'omega' not in params_with_omega:
         params_with_omega['omega'] = _omega_from_log_omega(params_with_omega['log_omega'])
     return params_with_omega
+
+
+def _as_float_or_value(value):
+    """Convert scalar-like values to Python floats for readable diagnostics."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _dict_nonfinite_keys(values_dict):
+    """Return dict keys whose values contain NaN/Inf."""
+    bad_keys = []
+    for key, value in values_dict.items():
+        if not bool(jnp.all(jnp.isfinite(value))):
+            bad_keys.append(key)
+    return bad_keys
+
+
+def _tree_has_nonfinite_values(tree):
+    """Check whether any numeric leaf in a pytree contains NaN/Inf."""
+    leaves = jax.tree_util.tree_leaves(tree)
+    for leaf in leaves:
+        if leaf is None:
+            continue
+        try:
+            if not bool(jnp.all(jnp.isfinite(leaf))):
+                return True
+        except TypeError:
+            # Non-numeric leaf (e.g., metadata), ignore.
+            continue
+    return False
+
+
+def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=None, grads=None, updates=None):
+    """Print a detailed optimization snapshot to trace NaN/Inf origins."""
+    print(f"\n[debug-trace] epoch={epoch}, stage={stage}")
+
+    params_printable = {key: _as_float_or_value(value) for key, value in opt_params.items()}
+    omega = _omega_from_log_omega(opt_params['log_omega']) if 'log_omega' in opt_params else jnp.nan
+    params_printable['omega'] = _as_float_or_value(omega)
+    print(f"  opt_params={params_printable}")
+
+    mass = fixed_params.get('mass', jnp.nan)
+    rmin = fixed_params.get('rmin', jnp.nan)
+    deltar = fixed_params.get('deltar', jnp.nan)
+    r0 = opt_params.get('r0', jnp.nan)
+    rc = stream_lines_grad.r_cent(mass=mass, omega=omega, r0=r0)
+    r_low = jnp.maximum(rmin, rc * 0.5) if rmin is not None else rc * 0.5
+    r_start = r0 - deltar
+    arange_ok = bool(jnp.isfinite(r_start) & jnp.isfinite(r_low) & (r_start > r_low))
+
+    print(
+        "  derived="
+        f"r0_minus_deltar={_as_float_or_value(r_start)}, "
+        f"rc={_as_float_or_value(rc)}, "
+        f"r_low={_as_float_or_value(r_low)}, "
+        f"arange_ok={arange_ok}"
+    )
+
+    if loss_probe is not None:
+        print(f"  loss_probe={_as_float_or_value(loss_probe)}")
+
+    if grads is not None:
+        grads_printable = {key: _as_float_or_value(value) for key, value in grads.items()}
+        print(f"  grads={grads_printable}")
+
+    if updates is not None:
+        updates_printable = {key: _as_float_or_value(value) for key, value in updates.items()}
+        print(f"  updates={updates_printable}")
 
 
 def _sanitize_opt_params(initial_opt_params):

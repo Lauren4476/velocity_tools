@@ -59,7 +59,7 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     # jax.debug.print("rc={0} au", r_cent_au)
     return r_cent_au
 
-def safe_arccos(x, eps=1e-12):
+def safe_arccos(x, eps=1e-8):
     """
     Safe arccos function with clipping to valid range [-1, 1].
     Fully differentiable with JAX.
@@ -68,11 +68,18 @@ def safe_arccos(x, eps=1e-12):
     :param eps: small offset from boundaries to avoid numerical issues
     :return: arccos of clipped input
     """
-    x_safe = jnp.clip(x, -1.0 + eps, 1.0 - eps)
-    # jax.debug.print("safe_arccos: x={x}, x_safe={x_safe}", x=x, x_safe=x_safe)
-    result = jnp.arccos(x_safe)
-    # jax.debug.print("safe_arccos result={result}", result=result)
-    return result
+    x = jnp.asarray(x)
+    if not jnp.issubdtype(x.dtype, jnp.floating):
+        x = x.astype(jnp.float32)
+
+    # Keep away from +/-1 by at least a few ULPs of the active dtype.
+    # This stabilizes gradients without changing equations away from boundary.
+    eps_user = jnp.asarray(eps, dtype=x.dtype)
+    eps_floor = jnp.asarray(32.0 * jnp.finfo(x.dtype).eps, dtype=x.dtype)
+    eps_eff = jnp.maximum(eps_user, eps_floor)
+
+    x_safe = jnp.clip(x, -1.0 + eps_eff, 1.0 - eps_eff)
+    return jnp.arccos(x_safe)
 
 
 def get_theta(theta0, orb_ang, orb_ang0):
