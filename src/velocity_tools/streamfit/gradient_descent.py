@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from jax import jit, grad, value_and_grad, lax
 import jax
 import optax
+from skimage import data
 from . import stream_lines_grad
 from . import extract_streamline
 import csv
@@ -49,6 +50,16 @@ REQUIRED_OPT_PARAM_KEYS = (
     'v_r0',
 )
 
+def _params_dict_to_vector(opt_params):
+    """Convert parameter dict to ordered vector."""
+    keys = list(opt_params.keys())
+    vec = jnp.array([opt_params[k] for k in keys])
+    return vec, keys
+
+
+def _vector_to_params_dict(vec, keys):
+    """Convert parameter vector back to dict."""
+    return {k: vec[i] for i, k in enumerate(keys)}
 
 def _omega_from_log_omega(log_omega):
     """Convert optimization-space log_omega to physical omega (1/s)."""
@@ -274,15 +285,15 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     # compute distance metrics for full model and data
     # (no clipping - interpolation will handle matching)
     if return_trace:
-        dmetric_model, theta_ref_model, dmetric_model_trace = extract_streamline.get_distance_metric(
+        dmetric_model, dmetric_model_trace = extract_streamline.get_distance_metric(
             ra_model_filled, dec_model_filled, return_trace=True)
-        dmetric_data, theta_ref_data, dmetric_data_trace = extract_streamline.get_distance_metric(
+        dmetric_data, dmetric_data_trace = extract_streamline.get_distance_metric(
             ra_data, dec_data, return_trace=True)
     else:
-        dmetric_model, _ = extract_streamline.get_distance_metric(
+        dmetric_model = extract_streamline.get_distance_metric(
             ra_model_filled, dec_model_filled)
-        dmetric_data, _ = extract_streamline.get_distance_metric(
-            ra_data, dec_data)
+        dmetric_data = extract_streamline.get_distance_metric(
+            ra_data, dec_data) 
     # print(f"dmetric_model: {dmetric_model}")
     # print(f"dmetric_data: {dmetric_data}")
 
@@ -325,8 +336,6 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     model_metric_span = float(d_model_sorted[-1] - d_model_sorted[0]) if d_model_sorted.size > 1 else 0.0
 
     matching_trace = {
-        'theta_ref_model': float(theta_ref_model),
-        'theta_ref_data': float(theta_ref_data),
         'model_points_total': model_points_total,
         'model_nan_count': model_nan_count,
         'model_valid_points': model_valid_points,
@@ -478,11 +487,46 @@ def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dic
     return new_opt_params, new_m, new_v
 '''
 
+def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties, distance_pc):
+    """
+    Estimate parameter uncertainties using Hessian of chi2 loss.
+
+    Returns
+    -------
+    dict
+        1-sigma uncertainties for each optimizable parameter
+    array
+        covariance matrix
+    """
+
+    # convert dict -> vector
+    theta0, keys = _params_dict_to_vector(best_opt_params)
+
+    def loss_vec(theta_vec):
+        params = _vector_to_params_dict(theta_vec, keys)
+        return chi2_loss(params, fixed_params, data, uncertainties, distance_pc)
+
+    # compute Hessian
+    H = jax.hessian(loss_vec)(theta0)
+
+    # invert to get covariance
+    cov = jnp.linalg.inv(H)
+
+    print(f"Hessian matrix:\n{H}"
+          f"\nCovariance matrix:\n{cov}")
+
+    # parameter errors
+    errors = jnp.sqrt(jnp.diag(cov))
+
+    error_dict = {k: float(errors[i]) for i, k in enumerate(keys)}
+
+    return error_dict, cov
+
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
                    beta1=0.9, beta2=0.999, 
                    info_every=100, early_stopping_patience=50, log_file=None,
-                   trace_file=None, trace_every=1):
+                   trace_file=None, trace_every=1, output_uncertainties=False):
     """
     Fit streamline model parameters to data using Adam optimizer.
     Only optimizes: r0, theta0, phi0, log_omega, v_r0
@@ -709,9 +753,26 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         if trace_csv_file is not None:
             trace_csv_file.close()
             print(f"Matching trace log saved to: {trace_file}")
+
+    # compute errors on best-fit parameters
+    # Estimate parameter uncertainties
+    if output_uncertainties:
+        print("\nEstimating parameter uncertainties from Hessian...")
+        param_errors, cov_matrix = estimate_parameter_errors(
+            best_opt_params,
+            fixed_params,
+            data,
+            uncertainties,
+            distance_pc
+        )
+        print("\nParameter uncertainties (1-sigma):")
+        for k, v in param_errors.items():
+            print(f"  {k}: {v}")
+    else:
+        param_errors = None
     
     print(f"\nOptimization complete!")
     print(f"Final loss: {best_loss:.6f}")
     print(f"Best-fit parameters found at epoch: {best_epoch}")
 
-    return _with_derived_omega(best_opt_params), loss_history
+    return _with_derived_omega(best_opt_params), loss_history, param_errors
