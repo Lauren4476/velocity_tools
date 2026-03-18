@@ -29,9 +29,6 @@ TRACE_FIELDNAMES = [
     'chi2_dec',
     'chi2_v',
     'chi2_total',
-    'theta_ref_model',
-    'theta_ref_data',
-    'theta_ref_delta',
     'model_points_total',
     'model_nan_count',
     'model_valid_points',
@@ -40,9 +37,7 @@ TRACE_FIELDNAMES = [
     'model_metric_near_tie_count',
     'model_metric_duplicate_count',
     'model_metric_non_monotonic_count',
-    'model_r_thresh',
     'model_inner_count',
-    'data_r_thresh',
     'data_inner_count',
 ]
 
@@ -363,8 +358,6 @@ def _build_trace_row(epoch, loss_value, loss_trace):
     model_metric_trace = matching.get('distance_metric_model', {})
     data_metric_trace = matching.get('distance_metric_data', {})
 
-    theta_ref_model = matching.get('theta_ref_model', float('nan'))
-    theta_ref_data = matching.get('theta_ref_data', float('nan'))
 
     return {
         'epoch': epoch,
@@ -373,9 +366,6 @@ def _build_trace_row(epoch, loss_value, loss_trace):
         'chi2_dec': chi2_components.get('chi2_dec', float('nan')),
         'chi2_v': chi2_components.get('chi2_v', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
-        'theta_ref_model': theta_ref_model,
-        'theta_ref_data': theta_ref_data,
-        'theta_ref_delta': theta_ref_model - theta_ref_data,
         'model_points_total': matching.get('model_points_total', 0),
         'model_nan_count': matching.get('model_nan_count', 0),
         'model_valid_points': matching.get('model_valid_points', 0),
@@ -384,9 +374,7 @@ def _build_trace_row(epoch, loss_value, loss_trace):
         'model_metric_near_tie_count': matching.get('model_metric_near_tie_count', 0),
         'model_metric_duplicate_count': matching.get('model_metric_duplicate_count', 0),
         'model_metric_non_monotonic_count': matching.get('model_metric_non_monotonic_count', 0),
-        'model_r_thresh': model_metric_trace.get('r_thresh', float('nan')),
         'model_inner_count': model_metric_trace.get('inner_count', 0),
-        'data_r_thresh': data_metric_trace.get('r_thresh', float('nan')),
         'data_inner_count': data_metric_trace.get('inner_count', 0),
     }
 
