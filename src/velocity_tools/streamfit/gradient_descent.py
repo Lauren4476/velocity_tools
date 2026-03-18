@@ -17,6 +17,10 @@ from . import extract_streamline
 import csv
 import math
 
+jax.config.update("jax_enable_x64", True)
+
+FLOAT_DTYPE = jnp.float64
+
 
 TRACE_FIELDNAMES = [
     'epoch',
@@ -51,10 +55,55 @@ REQUIRED_OPT_PARAM_KEYS = (
     'v_r0',
 )
 
+
+def _is_numeric_value(value):
+    """Return True for scalar/array-like numeric values, excluding booleans."""
+    try:
+        arr = jnp.asarray(value)
+    except Exception:
+        return False
+    if arr.dtype == jnp.bool_:
+        return False
+    return bool(jnp.issubdtype(arr.dtype, jnp.number))
+
+
+def _to_float64(value):
+    """Convert a numeric value or array-like input to float64."""
+    return jnp.asarray(value, dtype=FLOAT_DTYPE)
+
+
+def _coerce_opt_params_float64(opt_params):
+    """Return optimization parameters coerced to float64."""
+    coerced = {}
+    for key, value in opt_params.items():
+        if _is_numeric_value(value):
+            coerced[key] = _to_float64(value)
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _coerce_fixed_params_float64(fixed_params):
+    """Return fixed-parameter dictionary with numeric values coerced to float64."""
+    coerced = {}
+    for key, value in fixed_params.items():
+        if value is None or isinstance(value, bool):
+            coerced[key] = value
+        elif _is_numeric_value(value):
+            coerced[key] = _to_float64(value)
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _coerce_data_tuple_float64(values):
+    """Coerce tuple/list of arrays to float64 arrays."""
+    return tuple(_to_float64(value) for value in values)
+
 def _params_dict_to_vector(opt_params):
     """Convert parameter dict to ordered vector."""
     keys = list(opt_params.keys())
-    vec = jnp.array([opt_params[k] for k in keys])
+    vec = jnp.array([opt_params[k] for k in keys], dtype=FLOAT_DTYPE)
     return vec, keys
 
 
@@ -147,7 +196,7 @@ def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=Non
 
 def _sanitize_opt_params(initial_opt_params):
     """Normalize optimization params to the log_omega API and validate required keys."""
-    opt_params = initial_opt_params.copy()
+    opt_params = _coerce_opt_params_float64(initial_opt_params.copy())
 
     if 'omega' in opt_params and 'log_omega' in opt_params:
         # If caller passes both (e.g. reusing fit output), prefer optimization-space key.
@@ -241,6 +290,10 @@ def forward_model(opt_params, fixed_params, distance_pc):
             "Use log_omega = log(omega)."
         )
 
+    opt_params = _coerce_opt_params_float64(opt_params)
+    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    distance_pc = _to_float64(distance_pc)
+
     omega = _omega_from_log_omega(opt_params['log_omega'])
 
     # Run the forward model - returns positions in au, velocities in km/s
@@ -290,6 +343,7 @@ def forward_fill_nans(arr):
     filled : array
         Array with NaN values forward-filled
     """
+    arr = _to_float64(arr)
     is_nan = jnp.isnan(arr)
     num_nans = int(jnp.sum(is_nan))
     if num_nans > 0:
@@ -347,6 +401,12 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         If True, also return a trace dictionary containing diagnostics on
         distance metric stability and model-point ordering.
     """
+
+    ra_model = _to_float64(ra_model)
+    dec_model = _to_float64(dec_model)
+    v_model = _to_float64(v_model)
+    ra_data = _to_float64(ra_data)
+    dec_data = _to_float64(dec_data)
 
     # Forward-fill NaNs in model arrays
     ra_model_filled = forward_fill_nans(ra_model)
@@ -445,10 +505,14 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     float: Chi-squared loss value
     """
 
-    ra_data, dec_data, v_data = data
-    ra_sigma, dec_sigma, v_sigma = uncertainties
+    opt_params = _coerce_opt_params_float64(opt_params)
+    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    distance_pc = _to_float64(distance_pc)
+
+    ra_data, dec_data, v_data = _coerce_data_tuple_float64(data)
+    ra_sigma, dec_sigma, v_sigma = _coerce_data_tuple_float64(uncertainties)
     # small values to avoid division by zero
-    eps = 1e-8
+    eps = _to_float64(1e-8)
     ra_sigma = jnp.maximum(ra_sigma, eps)
     dec_sigma = jnp.maximum(dec_sigma, eps)
     v_sigma = jnp.maximum(v_sigma, eps)
@@ -660,6 +724,10 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     """
     # Initialize parameters
     opt_params = _sanitize_opt_params(initial_opt_params)
+    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    data = _coerce_data_tuple_float64(data)
+    uncertainties = _coerce_data_tuple_float64(uncertainties)
+    distance_pc = _to_float64(distance_pc)
 
     if learning_rate_dict is not None and 'omega' in learning_rate_dict and 'log_omega' not in learning_rate_dict:
         raise KeyError(

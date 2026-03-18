@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax import debug
+jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", True)
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
 from jaxopt import LBFGSB # may not be needed if using custom Newton method
@@ -28,6 +29,7 @@ from jaxopt import LBFGSB # may not be needed if using custom Newton method
 
 # Constants 
 eps = 1e-8 # small value to avoid division by zero
+FLOAT_DTYPE = jnp.float64
 
 
 # JAX functions (no Astropy units allowed here)
@@ -70,7 +72,8 @@ def safe_arccos(x, eps=1e-8):
     """
     x = jnp.asarray(x)
     if not jnp.issubdtype(x.dtype, jnp.floating):
-        x = x.astype(jnp.float32)
+        x = x.astype(FLOAT_DTYPE)
+    x = x.astype(FLOAT_DTYPE)
 
     # Keep away from +/-1 by at least a few ULPs of the active dtype.
     # This stabilizes gradients without changing equations away from boundary.
@@ -243,14 +246,20 @@ def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
     same units as the input ones.
 
     """
+    x = jnp.asarray(x, dtype=FLOAT_DTYPE)
+    y = jnp.asarray(y, dtype=FLOAT_DTYPE)
+    z = jnp.asarray(z, dtype=FLOAT_DTYPE)
+    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
+    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
+
     xyz = jnp.stack([x, y, z], axis=0)
 
     rot_inc = jnp.array([[1, 0, 0],
                         [0, jnp.cos(inc), jnp.sin(inc)],
-                        [0, -jnp.sin(inc), jnp.cos(inc)]])
+                        [0, -jnp.sin(inc), jnp.cos(inc)]], dtype=FLOAT_DTYPE)
     rot_pa = jnp.array([[jnp.cos(pa), 0, -jnp.sin(pa)],
                        [0, 1, 0],
-                       [jnp.sin(pa), 0, jnp.cos(pa)]])
+                       [jnp.sin(pa), 0, jnp.cos(pa)]], dtype=FLOAT_DTYPE)
     
     xyz_new = rot_pa @ rot_inc @ xyz
     x_new, y_new, z_new = jnp.unstack(xyz_new, axis=0)
@@ -283,6 +292,18 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     :return: x, y, z in au, v_x, v_y, v_z in km/s
     """
 
+    mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
+    r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
+    theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
+    phi0 = jnp.asarray(phi0, dtype=FLOAT_DTYPE)
+    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
+    v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
+    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
+    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
+    deltar = jnp.asarray(deltar, dtype=FLOAT_DTYPE)
+    if rmin is not None:
+        rmin = jnp.asarray(rmin, dtype=FLOAT_DTYPE)
+
     # quantities we will need later
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     #jax.debug.print("rc={0} au", rc)
@@ -298,7 +319,7 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
         #print('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
-    r = jnp.arange(r0 - deltar, r_low, step=-1*deltar)
+    r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)
     # print("r = {0}".format(r))
 
     # calculate positions and velocities inside r0
@@ -308,17 +329,17 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, mass=mass, r0=r0,
                                           theta0=theta0, omega=omega, v_r0=v_r0)
     # prepend initial positions and velocities at r0
-    r_full = jnp.concatenate((jnp.array([r0]), r))
-    theta_full = jnp.concatenate((jnp.array([theta0]), theta))
-    phi_full = jnp.concatenate((jnp.array([phi0]), phi))
+    r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
+    theta_full = jnp.concatenate((jnp.asarray([theta0], dtype=FLOAT_DTYPE), theta))
+    phi_full = jnp.concatenate((jnp.asarray([phi0], dtype=FLOAT_DTYPE), phi))
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-    orb_ang_full = jnp.concatenate((jnp.array([orb_ang0]), orb_ang))
-    v_r_full = jnp.concatenate((jnp.array([v_r0]), v_r))
-    v_theta_full = jnp.concatenate((jnp.array([0.0]), v_theta))
+    orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
+    v_r_full = jnp.concatenate((jnp.asarray([v_r0], dtype=FLOAT_DTYPE), v_r))
+    v_theta_full = jnp.concatenate((jnp.asarray([0.0], dtype=FLOAT_DTYPE), v_theta))
     # we need to calculate v_phi0 (multiply by v_k0)
     v_k0 = v_k(rc, mass=mass)
     v_phi0 = v_k0 * jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta0) * (r0/rc))
-    v_phi_full = jnp.concatenate((jnp.array([v_phi0]), v_phi))
+    v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
 
 
     v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \

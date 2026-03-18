@@ -11,11 +11,22 @@ Then it will extract a streamline from this cube.
 
 import numpy as np
 from astropy import units as u
+import jax
 import jax.numpy as jnp
+
+jax.config.update("jax_enable_x64", True)
+
+FLOAT_DTYPE = jnp.float64
+
+
+def _to_float64(value):
+    """Convert numeric input to float64 JAX array."""
+    return jnp.asarray(value, dtype=FLOAT_DTYPE)
 
 
 def _wrap_to_pi(angle):
     """Wrap angles to [-pi, pi)."""
+    angle = _to_float64(angle)
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
@@ -26,6 +37,7 @@ def _circular_median(theta_vals):
     Angles are first unwrapped around a circular-mean anchor, then a linear
     median is taken in that unwrapped frame, and wrapped back to [-pi, pi).
     """
+    theta_vals = _to_float64(theta_vals)
     theta_anchor = jnp.arctan2(jnp.mean(jnp.sin(theta_vals)), jnp.mean(jnp.cos(theta_vals)))
     theta_delta = _wrap_to_pi(theta_vals - theta_anchor)
     theta_unwrapped = theta_anchor + theta_delta
@@ -142,6 +154,8 @@ def get_distance_metric(ra_coords, dec_coords, return_trace=False):
     distance_metric, theta_ref, trace_dict
         Returned when return_trace=True.
     '''
+    ra_coords = _to_float64(ra_coords)
+    dec_coords = _to_float64(dec_coords)
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
     distance_metric = pc_r
 
@@ -169,6 +183,8 @@ def cartesian_to_polar(x, y):
     r : array of radial distances
     theta : array of angles in radians
     '''
+    x = _to_float64(x)
+    y = _to_float64(y)
     r = jnp.sqrt(x**2 + y**2)
     theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 

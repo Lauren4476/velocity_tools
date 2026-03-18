@@ -1,4 +1,8 @@
 #
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
 from . import coordinate_offsets
 from . import keplerian_field
 from . import stream_lines
