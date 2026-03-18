@@ -11,12 +11,23 @@ from velocity_tools import gradient_descent
 jax.config.update("jax_enable_x64", True)
 
 
+def _get_param(name, opt_params, fixed_params):
+    """Resolve a model parameter from optimizable or fixed dictionaries."""
+    if name in opt_params:
+        return opt_params[name]
+    return fixed_params[name]
+
+
 def _fake_forward_model(opt_params, fixed_params, distance_pc):
     """Small synthetic model with duplicate points to exercise tie tracing."""
-    shift = 1e-3 * opt_params['r0']
+    r0 = _get_param('r0', opt_params, fixed_params)
+    mass = _get_param('mass', opt_params, fixed_params)
+    v_lsr = _get_param('v_lsr', opt_params, fixed_params)
+
+    shift = (1e-3 * r0) + (5e-4 * mass)
     ra_model = jnp.array([2.0, 1.5, 1.5, 1.0, 0.5], dtype=jnp.float64) + shift
     dec_model = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=jnp.float64)
-    v_model = jnp.array([7.20, 7.00, 7.00, 6.80, 6.60], dtype=jnp.float64)
+    v_model = jnp.array([7.20, 7.00, 7.00, 6.80, 6.60], dtype=jnp.float64) + (v_lsr - 7.0)
     return ra_model, dec_model, v_model
 
 
@@ -207,3 +218,49 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         log_omega = float(row['log_omega'])
         omega = float(row['omega'])
         assert omega == pytest.approx(float(np.exp(log_omega)), rel=1e-6)
+
+
+def test_fit_streamline_allows_custom_opt_partition(monkeypatch) -> None:
+    monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
+
+    initial_opt_params = {
+        'mass': 3.2,
+        'v_lsr': 7.0,
+    }
+    fixed_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+    }
+    data = (
+        jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+    )
+
+    best_opt_params, loss_history, _ = gradient_descent.fit_streamline(
+        initial_opt_params,
+        fixed_params,
+        data,
+        uncertainties,
+        147.0,
+        n_epochs=3,
+        info_every=100,
+        early_stopping_patience=10,
+    )
+
+    assert len(loss_history) == 3
+    assert set(best_opt_params.keys()) == {'mass', 'v_lsr'}
+    assert jnp.asarray(best_opt_params['mass']).dtype == jnp.float64
+    assert jnp.asarray(best_opt_params['v_lsr']).dtype == jnp.float64

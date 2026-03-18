@@ -47,7 +47,22 @@ TRACE_FIELDNAMES = [
 ]
 
 
-REQUIRED_OPT_PARAM_KEYS = (
+STREAMLINE_MODEL_PARAM_KEYS = (
+    'r0',
+    'theta0',
+    'phi0',
+    'log_omega',
+    'v_r0',
+    'mass',
+    'inc',
+    'pa',
+    'rmin',
+    'deltar',
+    'v_lsr',
+)
+
+
+DEFAULT_OPTIMIZABLE_PARAM_KEYS = (
     'r0',
     'theta0',
     'phi0',
@@ -99,6 +114,150 @@ def _coerce_fixed_params_float64(fixed_params):
 def _coerce_data_tuple_float64(values):
     """Coerce tuple/list of arrays to float64 arrays."""
     return tuple(_to_float64(value) for value in values)
+
+
+def _sanitize_model_param_dict(params, dict_name):
+    """Coerce a parameter dictionary to float64 and normalize aliases."""
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise TypeError(f"{dict_name} must be a dictionary, got {type(params).__name__}.")
+
+    if dict_name == 'initial_opt_params':
+        sanitized = _coerce_opt_params_float64(params.copy())
+    else:
+        sanitized = _coerce_fixed_params_float64(params.copy())
+
+    if 'omega' in sanitized and 'log_omega' not in sanitized:
+        sanitized['log_omega'] = jnp.log(_to_float64(sanitized['omega']))
+    if 'omega' in sanitized:
+        del sanitized['omega']
+
+    unknown = sorted(key for key in sanitized if key not in STREAMLINE_MODEL_PARAM_KEYS)
+    if unknown:
+        raise KeyError(
+            f"Unknown parameter keys in {dict_name}: {unknown}. "
+            f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+        )
+
+    return sanitized
+
+
+def _validate_param_value_types(opt_params, fixed_params):
+    """Validate numeric/None value types for model parameters."""
+    for key, value in opt_params.items():
+        if key == 'rmin' and value is None:
+            raise ValueError("Optimizable parameter 'rmin' cannot be None.")
+        if isinstance(value, bool) or not _is_numeric_value(value):
+            raise TypeError(
+                f"Optimizable parameter '{key}' must be numeric. "
+                f"Got value of type {type(value).__name__}."
+            )
+
+    for key, value in fixed_params.items():
+        if key == 'rmin' and value is None:
+            continue
+        if isinstance(value, bool) or not _is_numeric_value(value):
+            raise TypeError(
+                f"Fixed parameter '{key}' must be numeric"
+                " (or None only for 'rmin'). "
+                f"Got value of type {type(value).__name__}."
+            )
+
+
+def _sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
+    """Sanitize and validate opt/fixed parameter partition for streamline modeling."""
+    opt_params = _sanitize_model_param_dict(initial_opt_params, 'initial_opt_params')
+    fixed_params = _sanitize_model_param_dict(fixed_params, 'fixed_params')
+
+    overlap = sorted(set(opt_params) & set(fixed_params))
+    if overlap:
+        raise KeyError(
+            f"Parameters cannot be present in both initial_opt_params and fixed_params: {overlap}"
+        )
+
+    missing = [
+        key for key in STREAMLINE_MODEL_PARAM_KEYS
+        if key not in opt_params and key not in fixed_params
+    ]
+    if missing:
+        raise KeyError(
+            "Missing required streamline parameters across initial_opt_params and fixed_params: "
+            f"{missing}. Supported model keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+        )
+
+    if require_nonempty_opt and len(opt_params) == 0:
+        raise ValueError(
+            "initial_opt_params must contain at least one optimizable parameter. "
+            f"You can choose any subset of: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+        )
+
+    _validate_param_value_types(opt_params, fixed_params)
+
+    return opt_params, fixed_params
+
+
+def _resolve_model_params(opt_params, fixed_params):
+    """Return merged model parameters and sanitized opt/fixed dictionaries."""
+    opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
+    model_params = fixed_params.copy()
+    model_params.update(opt_params)
+    return model_params, opt_params, fixed_params
+
+
+def _normalize_learning_rate_dict(learning_rate_dict):
+    """Normalize per-parameter learning-rate keys to canonical model keys."""
+    if learning_rate_dict is None:
+        return None
+
+    normalized = dict(learning_rate_dict)
+    if 'omega' in normalized:
+        if 'log_omega' in normalized:
+            raise KeyError(
+                "learning_rate_dict contains both 'omega' and 'log_omega'. "
+                "Please provide only one key."
+            )
+        normalized['log_omega'] = normalized.pop('omega')
+
+    unknown = sorted(key for key in normalized if key not in STREAMLINE_MODEL_PARAM_KEYS)
+    if unknown:
+        raise KeyError(
+            f"Unknown keys in learning_rate_dict: {unknown}. "
+            f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+        )
+
+    return normalized
+
+
+def _normalize_param_bounds(param_bounds):
+    """Normalize parameter-bound keys and convert omega bounds to log-space."""
+    if param_bounds is None:
+        return None
+
+    normalized = dict(param_bounds)
+    if 'omega' in normalized:
+        if 'log_omega' in normalized:
+            raise KeyError(
+                "param_bounds contains both 'omega' and 'log_omega'. "
+                "Please provide only one key."
+            )
+        omega_min, omega_max = normalized.pop('omega')
+        omega_min = float(omega_min)
+        omega_max = float(omega_max)
+        if omega_min <= 0 or omega_max <= 0:
+            raise ValueError("Omega bounds must be strictly positive when using 'omega' bounds.")
+        if omega_min >= omega_max:
+            raise ValueError("Omega bounds must satisfy omega_min < omega_max.")
+        normalized['log_omega'] = (math.log(omega_min), math.log(omega_max))
+
+    unknown = sorted(key for key in normalized if key not in STREAMLINE_MODEL_PARAM_KEYS)
+    if unknown:
+        raise KeyError(
+            f"Unknown keys in param_bounds: {unknown}. "
+            f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+        )
+
+    return normalized
 
 def _params_dict_to_vector(opt_params):
     """Convert parameter dict to ordered vector."""
@@ -156,19 +315,22 @@ def _tree_has_nonfinite_values(tree):
     return False
 
 
+#not used anymore
 def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=None, grads=None, updates=None):
     """Print a detailed optimization snapshot to trace NaN/Inf origins."""
     print(f"\n[debug-trace] epoch={epoch}, stage={stage}")
 
-    params_printable = {key: _as_float_or_value(value) for key, value in opt_params.items()}
-    omega = _omega_from_log_omega(opt_params['log_omega']) if 'log_omega' in opt_params else jnp.nan
+    model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
+
+    params_printable = {key: _as_float_or_value(value) for key, value in model_params.items()}
+    omega = _omega_from_log_omega(model_params['log_omega'])
     params_printable['omega'] = _as_float_or_value(omega)
     print(f"  opt_params={params_printable}")
 
-    mass = fixed_params.get('mass', jnp.nan)
-    rmin = fixed_params.get('rmin', jnp.nan)
-    deltar = fixed_params.get('deltar', jnp.nan)
-    r0 = opt_params.get('r0', jnp.nan)
+    mass = model_params.get('mass', jnp.nan)
+    rmin = model_params.get('rmin', jnp.nan)
+    deltar = model_params.get('deltar', jnp.nan)
+    r0 = model_params.get('r0', jnp.nan)
     rc = stream_lines_grad.r_cent(mass=mass, omega=omega, r0=r0)
     r_low = jnp.maximum(rmin, rc * 0.5) if rmin is not None else rc * 0.5
     r_start = r0 - deltar
@@ -192,30 +354,6 @@ def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=Non
     if updates is not None:
         updates_printable = {key: _as_float_or_value(value) for key, value in updates.items()}
         print(f"  updates={updates_printable}")
-
-
-def _sanitize_opt_params(initial_opt_params):
-    """Normalize optimization params to the log_omega API and validate required keys."""
-    opt_params = _coerce_opt_params_float64(initial_opt_params.copy())
-
-    if 'omega' in opt_params and 'log_omega' in opt_params:
-        # If caller passes both (e.g. reusing fit output), prefer optimization-space key.
-        del opt_params['omega']
-
-    if 'omega' in opt_params and 'log_omega' not in opt_params:
-        raise KeyError(
-            "Optimization parameters now require 'log_omega' (natural log of omega). "
-            "Convert input using log_omega = log(omega)."
-        )
-
-    missing = [key for key in REQUIRED_OPT_PARAM_KEYS if key not in opt_params]
-    if missing:
-        raise KeyError(
-            f"Missing required optimizable parameters: {missing}. "
-            f"Required keys are: {list(REQUIRED_OPT_PARAM_KEYS)}"
-        )
-
-    return opt_params
 
 
 def _build_trace_row(epoch, loss_value, loss_trace):
@@ -260,20 +398,12 @@ def forward_model(opt_params, fixed_params, distance_pc):
     Parameters:
     -----------
     opt_params : dict
-        Dictionary containing optimizable streamline parameters:
-        - 'r0': initial radius (au)
-        - 'theta0': initial polar angle (radians)
-        - 'phi0': initial azimuthal angle (radians)
-        - 'log_omega': natural log of angular rotation (log(1/s))
-        - 'v_r0': initial radial velocity (km/s)
+        Dictionary containing optimizable parameters (any subset of
+        STREAMLINE_MODEL_PARAM_KEYS).
     fixed_params : dict
-        Dictionary containing fixed streamline parameters:
-        - 'mass': stellar mass (Msun)
-        - 'inc': inclination (radians)
-        - 'pa': position angle (radians)
-        - 'rmin': minimum radius (au)
-        - 'deltar': radial spacing (au)
-        - 'v_lsr': systemic velocity (km/s)
+        Dictionary containing fixed parameters (the complementary subset).
+        Together with opt_params, this must define all keys in
+        STREAMLINE_MODEL_PARAM_KEYS exactly once.
     distance_pc : float
         Distance to source in parsecs
         
@@ -284,30 +414,23 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - Dec offsets in arcsec
         - Line-of-sight velocities in km/s
     """
-    if 'log_omega' not in opt_params:
-        raise KeyError(
-            "forward_model expects 'log_omega' in opt_params. "
-            "Use log_omega = log(omega)."
-        )
-
-    opt_params = _coerce_opt_params_float64(opt_params)
-    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
     distance_pc = _to_float64(distance_pc)
 
-    omega = _omega_from_log_omega(opt_params['log_omega'])
+    omega = _omega_from_log_omega(model_params['log_omega'])
 
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = stream_lines_grad.xyz_stream(
-        mass=fixed_params['mass'],
-        r0=opt_params['r0'],
-        theta0=opt_params['theta0'],
-        phi0=opt_params['phi0'],
+        mass=model_params['mass'],
+        r0=model_params['r0'],
+        theta0=model_params['theta0'],
+        phi0=model_params['phi0'],
         omega=omega,
-        v_r0=opt_params['v_r0'],
-        inc=fixed_params['inc'],
-        pa=fixed_params['pa'],
-        rmin=fixed_params['rmin'],
-        deltar=fixed_params['deltar']
+        v_r0=model_params['v_r0'],
+        inc=model_params['inc'],
+        pa=model_params['pa'],
+        rmin=model_params['rmin'],
+        deltar=model_params['deltar']
     )
     
     # Filter out sentinel values (used for points below rmin)
@@ -322,7 +445,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
     # y = line-of-sight velocity
     ra_model = jnp.where(valid_mask, -x / distance_pc, jnp.nan)  # arcsec
     dec_model = jnp.where(valid_mask, z / distance_pc, jnp.nan)  # arcsec
-    v_model = jnp.where(valid_mask, vy + fixed_params['v_lsr'], jnp.nan)  # km/s (add systemic velocity)
+    v_model = jnp.where(valid_mask, vy + model_params['v_lsr'], jnp.nan)  # km/s (add systemic velocity)
 
     return ra_model, dec_model, v_model
 
@@ -361,32 +484,6 @@ def forward_fill_nans(arr):
     return filled
 
 
-# def arc_length_2d(x, z):
-#     """
-#     Compute cumulative 2D arc length along curve in the x-z plane (POS).
-#     NaN values are forward-filled before computation.
-    
-#     Parameters:
-#     -----------
-#     x : array
-#         x positions (i.e. RA offset)
-#     z : array
-#         z positions (i.e. Dec offset)
-        
-#     Returns:
-#     --------
-#     s : Array, cumulative arc length along the curve
-#     """
-#     # Forward-fill NaN values to handle invalid region points
-#     # TODO: consider interpolation instead of forward-fill?
-#     x_filled = forward_fill_nans(x)
-#     z_filled = forward_fill_nans(z)
-    
-#     dx = jnp.diff(x_filled)
-#     dz = jnp.diff(z_filled)
-#     ds = jnp.sqrt(dx**2 + dz**2)
-#     s = jnp.concatenate((jnp.array([0.0]), jnp.cumsum(ds)))
-#     return s
 
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
@@ -408,7 +505,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     ra_data = _to_float64(ra_data)
     dec_data = _to_float64(dec_data)
 
-    # Forward-fill NaNs in model arrays
+    # Forward-fill NaNs in model arrays - TODO does this make sense? should we be masking these instead?
     ra_model_filled = forward_fill_nans(ra_model)
     dec_model_filled = forward_fill_nans(dec_model)
     v_model_filled = forward_fill_nans(v_model)
@@ -425,8 +522,6 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
             ra_model_filled, dec_model_filled)
         dmetric_data = extract_streamline.get_distance_metric(
             ra_data, dec_data) 
-    # print(f"dmetric_model: {dmetric_model}")
-    # print(f"dmetric_data: {dmetric_data}")
 
     # sort model once
     sort_idx = jnp.argsort(dmetric_model)
@@ -489,9 +584,10 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     Parameters:
     -----------
     opt_params : dict
-        Optimizable streamline model parameters
+        Optimizable streamline model parameters (any subset of
+        STREAMLINE_MODEL_PARAM_KEYS).
     fixed_params : dict
-        Fixed streamline model parameters
+        Fixed streamline model parameters (complementary subset).
     data : tuple of arrays (ra_data, dec_data, v_data)
         Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
     uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
@@ -505,8 +601,7 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     float: Chi-squared loss value
     """
 
-    opt_params = _coerce_opt_params_float64(opt_params)
-    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
     distance_pc = _to_float64(distance_pc)
 
     ra_data, dec_data, v_data = _coerce_data_tuple_float64(data)
@@ -664,26 +759,23 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    trace_file=None, trace_every=1, output_uncertainties=False):
     """
     Fit streamline model parameters to data using Adam optimizer.
-    Only optimizes: r0, theta0, phi0, log_omega, v_r0
-    Keeps fixed: mass, inc, pa, rmin, deltar, v_lsr
+    Any supported streamline parameter can be optimized or fixed.
+    Parameters are split by dictionary membership:
+    - keys in initial_opt_params are optimized
+    - keys in fixed_params are held fixed
+    The union must contain each key in STREAMLINE_MODEL_PARAM_KEYS exactly once.
     
     Parameters:
     -----------
     initial_opt_params : dict
-        Initial guess for optimizable parameters:
-        - 'r0': initial radius (au)
-        - 'theta0': initial polar angle (radians)
-        - 'phi0': initial azimuthal angle (radians)
-        - 'log_omega': natural log of angular rotation (log(1/s))
-        - 'v_r0': initial radial velocity (km/s)
+        Initial guesses for the parameters to optimize.
+        Allowed keys are STREAMLINE_MODEL_PARAM_KEYS.
+        Historically, the default optimized subset is:
+        DEFAULT_OPTIMIZABLE_PARAM_KEYS.
     fixed_params : dict
-        Fixed parameters (not optimized):
-        - 'mass': stellar mass (Msun)
-        - 'inc': inclination (radians)
-        - 'pa': position angle (radians)
-        - 'rmin': minimum radius (au)
-        - 'deltar': radial spacing (au)
-        - 'v_lsr': systemic velocity (km/s)
+        Fixed (non-optimized) parameters using the same key space.
+        Together with initial_opt_params, this must provide a full,
+        non-overlapping partition of STREAMLINE_MODEL_PARAM_KEYS.
     data : tuple of arrays (ra_data, dec_data, v_data)
         Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
     uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
@@ -693,10 +785,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     learning_rate : float
         Default learning rate for Adam optimizer. Used if no specific rate provided for a parameter.
     learning_rate_dict : dict or None
-        Per-parameter learning rates: {'r0': 1e-2, 'log_omega': 1e-2, ...}
-        If provided, overrides learning_rate for specified parameters.
+        Per-parameter learning rates keyed by model parameter names.
+        If provided, overrides learning_rate for specified optimized keys.
     param_bounds : dict or None
-        Parameter bounds in optimization space: {'log_omega': (log(1e-15), log(1e-10)), ...}
+        Parameter bounds in optimization space.
+        Bounds are applied only to optimized keys that have entries here.
+        You may provide 'omega' bounds as linear bounds; these are converted
+        to 'log_omega' bounds internally.
     n_epochs : int
         Maximum number of optimization iterations
     beta1 : float
@@ -719,27 +814,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
     Returns:
     --------   
-    dict: Optimized parameters including both 'log_omega' and derived 'omega'
+    dict: Optimized parameters (same keys as initial_opt_params), including
+        derived 'omega' when 'log_omega' is optimized.
     list: Loss history
     """
     # Initialize parameters
-    opt_params = _sanitize_opt_params(initial_opt_params)
-    fixed_params = _coerce_fixed_params_float64(fixed_params)
+    opt_params, fixed_params = _sanitize_param_partition(
+        initial_opt_params,
+        fixed_params,
+        require_nonempty_opt=True,
+    )
     data = _coerce_data_tuple_float64(data)
     uncertainties = _coerce_data_tuple_float64(uncertainties)
     distance_pc = _to_float64(distance_pc)
-
-    if learning_rate_dict is not None and 'omega' in learning_rate_dict and 'log_omega' not in learning_rate_dict:
-        raise KeyError(
-            "learning_rate_dict now expects 'log_omega' instead of 'omega'. "
-            "Use log-space learning rates keyed by 'log_omega'."
-        )
-
-    if param_bounds is not None and 'omega' in param_bounds and 'log_omega' not in param_bounds:
-        raise KeyError(
-            "param_bounds now expects 'log_omega' bounds instead of 'omega'. "
-            "Use natural-log bounds, e.g. (log(min_omega), log(max_omega))."
-        )
+    learning_rate_dict = _normalize_learning_rate_dict(learning_rate_dict)
+    param_bounds = _normalize_param_bounds(param_bounds)
 
     # Build optimizer (supports optional per-parameter learning rates)
     if learning_rate_dict is not None:
@@ -785,7 +874,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
         csv_file.flush()
-        print(f"Logging optimization progress to: {log_file}")
 
     trace_csv_file = None
     trace_csv_writer = None
@@ -794,13 +882,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         trace_csv_writer = csv.DictWriter(trace_csv_file, fieldnames=TRACE_FIELDNAMES)
         trace_csv_writer.writeheader()
         trace_csv_file.flush()
-        print(f"Logging matching traces to: {trace_file}")
     
     print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
-    print("Omega is optimized in log space: omega = exp(log_omega)")
-    print(f"Initial optimizable values: {_with_derived_omega(opt_params)}")
+    print(f"Initial optimizable values:")
+    for key in opt_params.keys():
+        print(f"  {key}: {opt_params[key]:.3e}")
     
     # Log initial parameters and initial loss (epoch 0) if CSV logging is enabled
     if csv_writer is not None:
@@ -877,7 +965,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Print progress
             if epoch % info_every == 0:
                 print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
-                print(f'  Current optimizable params: {_with_derived_omega(opt_params)}')
             
             # Early stopping
             if patience_counter >= early_stopping_patience:
@@ -893,8 +980,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             trace_csv_file.close()
             print(f"Matching trace log saved to: {trace_file}")
 
+    print(f"\nOptimization complete!")
+    print(f"Final loss: {best_loss:.6f}")
+    print(f"Best-fit parameters found at epoch: {best_epoch}")
+    for key in best_opt_params.keys():
+        print(f"  {key}: {best_opt_params[key]:.3e}")
+
     # compute errors on best-fit parameters
-    # Estimate parameter uncertainties
     if output_uncertainties:
         print("\nEstimating parameter uncertainties from Hessian...")
         param_errors, cov_matrix = estimate_parameter_errors(
@@ -909,9 +1001,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             print(f"  {k}: {v}")
     else:
         param_errors = None
-    
-    print(f"\nOptimization complete!")
-    print(f"Final loss: {best_loss:.6f}")
-    print(f"Best-fit parameters found at epoch: {best_epoch}")
+
 
     return _with_derived_omega(best_opt_params), loss_history, param_errors
