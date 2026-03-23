@@ -80,8 +80,12 @@ def safe_arccos(x, eps=1e-8):
     eps_user = jnp.asarray(eps, dtype=x.dtype)
     eps_floor = jnp.asarray(32.0 * jnp.finfo(x.dtype).eps, dtype=x.dtype)
     eps_eff = jnp.maximum(eps_user, eps_floor)
+    #jax.debug.print("eps used = {eps_eff}", eps_eff=eps_eff)
 
     x_safe = jnp.clip(x, -1.0 + eps_eff, 1.0 - eps_eff)
+    # print if clipping is happening
+    # if jnp.any(x < -1.0 + eps_eff) or jnp.any(x > 1.0 - eps_eff):
+    #     jax.debug.print("Warning: input to arccos was clipped. Original x={x}, clipped x={x_safe}", x=x, x_safe=x_safe)
     return jnp.arccos(x_safe)
 
 
@@ -314,9 +318,8 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     if rc > r0:
         # early stop if centrifugal radius is larger than r0
         # TODO: ideally centrifugal radius should be fed in as the minimum of r0
+        jax.debug.print("Centrifugal radius (rc={0} au) > initial radius (r0={1} au).", rc, r0)
         raise ValueError('Centrifugal radius is larger than start of streamline')
-    #if rc > r0:
-        #print('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
     r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)

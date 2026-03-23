@@ -457,8 +457,10 @@ def forward_fill_nans(arr):
     arr = _to_float64(arr)
     is_nan = jnp.isnan(arr)
     num_nans = int(jnp.sum(is_nan))
-    if num_nans > 0:
-        print(f"[forward_fill_nans] Found {num_nans} NaN values in array of size {arr.size}")
+    # if num_nans > 0:
+    #     jax.debug.print(f"[forward_fill_nans] Found {num_nans} NaN values in array of size {arr.size}")
+    # else:
+    #     jax.debug.print("[forward_fill_nans] No forward filling needed")
     arr_clean = jnp.nan_to_num(arr, nan=0.0)
     
     # Forward-fill using scan
@@ -634,78 +636,7 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
 
     return chi2_total
 
-##### DEPRECATED MANUAL ADAM IMPLEMENTATION - WE USE OPTAX INSTEAD #####
-'''
-def adam_step(opt_params, grads, m, v, t, learning_rate=0.001, learning_rate_dict=None, 
-              beta1=0.9, beta2=0.999, eps=1e-8, param_bounds=None):
-    """
-    Perform one Adam optimization step (only for optimizable parameters).
-    
-    Parameters:
-    -----------
-    opt_params : dict
-        Current optimizable parameter values
-    grads : dict
-        Gradients of loss w.r.t. optimizable parameters
-    m : dict
-        First moment estimates (momentum)
-    v : dict
-        Second moment estimates (adaptive learning rate)
-    t : int
-        Time step (iteration number)
-    learning_rate : float
-        Default learning rate (alpha) - used if learning_rate_dict doesn't have a learning rate for a specific param.
-    learning_rate_dict : dict or None
-        Optional per-parameter learning rates. If provided, overrides learning_rate for each param in the dict.
-    beta1 : float
-        Exponential decay rate for first moment
-    beta2 : float
-        Exponential decay rate for second moment
-    eps : float
-        Small constant for numerical stability
-    param_bounds : dict or None
-        Optional bounds for each parameter: {param_name: (min, max)}
-        
-    Returns:
-    --------
-    tuple: (new_opt_params, new_m, new_v)
-    """
-    new_opt_params = {}
-    new_m = {}
-    new_v = {}
-    
-    for key in opt_params.keys():
-        # Update biased first moment estimate
-        new_m[key] = beta1 * m[key] + (1 - beta1) * grads[key]
-        
-        # Update biased second raw moment estimate
-        new_v[key] = beta2 * v[key] + (1 - beta2) * grads[key]**2
-        
-        # Compute bias-corrected first moment estimate
-        m_hat = new_m[key] / (1 - beta1**t)
-        
-        # Compute bias-corrected second raw moment estimate
-        v_hat = new_v[key] / (1 - beta2**t)
-
-        # Get learning rate for this parameter
-        if learning_rate_dict is not None and key in learning_rate_dict:
-            lr = learning_rate_dict[key]
-        else:
-            lr = learning_rate
-        
-        # Update parameters
-        new_opt_params[key] = opt_params[key] - lr * m_hat / (jnp.sqrt(v_hat) + eps)
-
-        # Apply bounds if provided
-        if param_bounds is not None and key in param_bounds:
-            min_val, max_val = param_bounds[key]
-            new_opt_params[key] = jnp.clip(new_opt_params[key], min_val, max_val)
-           
-
-    return new_opt_params, new_m, new_v
-'''
-
-def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties, distance_pc):
+def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties, distance_pc, gradient_tol=1e-1):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
 
@@ -715,23 +646,35 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
         1-sigma uncertainties for each optimizable parameter
     array
         covariance matrix
+    gradient_tol : float
+        Tolerance on gradient norm. If gradient norm > gradient_tol at best params,
+        a warning is issued as the quadratic approximation may not be valid.
     """
 
     # convert dict -> vector
-    theta0, keys = _params_dict_to_vector(best_opt_params)
+    params_vec, keys = _params_dict_to_vector(best_opt_params)
 
     def loss_vec(theta_vec):
         params = _vector_to_params_dict(theta_vec, keys)
         return chi2_loss(params, fixed_params, data, uncertainties, distance_pc)
 
+    # Check gradient magnitude at best-fit parameters
+    grad_vec = jax.grad(loss_vec)(params_vec)
+    grad_norm = float(jnp.linalg.norm(grad_vec))
+    
+    if grad_norm > gradient_tol:
+        print(f"WARNING: Gradient norm at best fit = {grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}")
+        print("Optimization may not have reached a minimum yet.")
+        print("Parameter uncertainties may be unreliable or incalculable. Consider:")
+        print(f"    - Increasing n_epochs")
+        print(f"    - Reducing learning rate for finer convergence")
+        print(f"    - Reducing loss_threshold if used")
+
     # compute Hessian
-    H = jax.hessian(loss_vec)(theta0)
+    H = jax.hessian(loss_vec)(params_vec)
 
     # invert to get covariance
     cov = jnp.linalg.inv(H)
-
-    print(f"Hessian matrix:\n{H}"
-          f"\nCovariance matrix:\n{cov}")
 
     # parameter errors
     errors = jnp.sqrt(jnp.diag(cov))
@@ -741,10 +684,13 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
     return error_dict, cov
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
-                   learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000, 
-                   beta1=0.9, beta2=0.999, 
-                   info_every=100, early_stopping_patience=50, log_file=None,
-                   trace_file=None, trace_every=1, output_uncertainties=False):
+                   learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000,
+                   beta1=0.9, beta2=0.999,
+                   info_every=100, loss_threshold=None, loss_threshold_epochs=1,
+                   early_stopping_patience=50,
+                   log_file=None, trace_file=None, trace_every=1,
+                   output_uncertainties=False,
+                   ):
     """
     Fit streamline model parameters to data using Adam optimizer.
     Any supported streamline parameter can be optimized or fixed.
@@ -799,6 +745,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     trace_every : int
         Frequency (in epochs) for writing rows to trace_file.
         Must be >= 1.
+    loss_threshold : float or None
+        Optional absolute loss threshold for threshold-based stopping.
+        If provided, optimization stops after loss is <= loss_threshold for
+        loss_threshold_epochs consecutive epochs.
+    loss_threshold_epochs : int
+        Number of consecutive epochs with loss <= loss_threshold required to
+        trigger threshold-based early stopping. Must be >= 1.
         
     Returns:
     --------   
@@ -846,9 +799,16 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     best_opt_params = opt_params.copy()
     best_epoch = 0
     patience_counter = 0
+    loss_threshold_counter = 0
 
     if trace_every < 1:
         raise ValueError('trace_every must be >= 1')
+    if loss_threshold is not None:
+        loss_threshold = float(loss_threshold)
+        if not math.isfinite(loss_threshold):
+            raise ValueError('loss_threshold must be finite when provided.')
+        if loss_threshold_epochs < 1:
+            raise ValueError('loss_threshold_epochs must be >= 1 when loss_threshold is provided.')
     
     # Initialize CSV log file if requested
     csv_file = None
@@ -874,6 +834,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Starting optimization with {n_epochs} epochs...")
     print(f"Optimizing parameters: {list(opt_params.keys())}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
+    if loss_threshold is not None:
+        print(
+            f"Threshold-based stopping enabled: loss <= {loss_threshold:.6g} "
+            f"for {loss_threshold_epochs} consecutive epochs."
+        )
     print(f"Initial optimizable values:")
     for key in opt_params.keys():
         print(f"  {key}: {opt_params[key]:.3e}")
@@ -941,7 +906,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 trace_csv_writer.writerow(trace_row)
                 trace_csv_file.flush()
         
-            # Early stopping check
+            # Early stopping checks
             if loss_value < best_loss:
                 best_loss = loss_value
                 best_opt_params = opt_params.copy()
@@ -949,16 +914,32 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 patience_counter = 0
             else:
                 patience_counter += 1
+
+            if loss_threshold is not None:
+                if loss_value <= loss_threshold:
+                    loss_threshold_counter += 1
+                else:
+                    loss_threshold_counter = 0
         
             # Print progress
             if epoch % info_every == 0:
                 print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
-            
+
             # Early stopping
+            # if loss_threshold is not None and loss_threshold_counter >= loss_threshold_epochs:
+            #     print(
+            #         f"\nEarly stopping at epoch {epoch}: loss <= {loss_threshold:.6g} "
+            #         f"for {loss_threshold_epochs} consecutive epochs"
+            #     )
+            #     break
+            
             if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping at epoch {epoch} - no improvement for {early_stopping_patience} epochs")
+                print(f"\nEarly stopping at epoch {epoch}: no improvement for {early_stopping_patience} epochs")
                 break
     
+        # restore canonical parameter order before returning
+        ordered_best_opt_params = {k: best_opt_params[k] for k in initial_opt_params.keys()}
+
     finally:
         # Always close the CSV file if it was opened
         if csv_file is not None:
@@ -968,17 +949,17 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             trace_csv_file.close()
             print(f"Matching trace log saved to: {trace_file}")
 
-    print(f"\nOptimization complete!")
-    print(f"Final loss: {best_loss:.6f}")
+    print(f"Optimization complete!")
+    print(f"\nFinal loss: {best_loss:.6f}")
     print(f"Best-fit parameters found at epoch: {best_epoch}")
-    for key in best_opt_params.keys():
-        print(f"  {key}: {best_opt_params[key]:.3e}")
+    for key in ordered_best_opt_params.keys():
+        print(f"  {key}: {ordered_best_opt_params[key]:.3e}")
 
     # compute errors on best-fit parameters
     if output_uncertainties:
         print("\nEstimating parameter uncertainties from Hessian...")
         param_errors, cov_matrix = estimate_parameter_errors(
-            best_opt_params,
+            ordered_best_opt_params,
             fixed_params,
             data,
             uncertainties,
@@ -991,4 +972,4 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         param_errors = None
 
 
-    return _with_derived_omega(best_opt_params), loss_history, param_errors
+    return _with_derived_omega(ordered_best_opt_params), loss_history, param_errors

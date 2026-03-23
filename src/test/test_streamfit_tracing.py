@@ -264,3 +264,52 @@ def test_fit_streamline_allows_custom_opt_partition(monkeypatch) -> None:
     assert set(best_opt_params.keys()) == {'mass', 'v_lsr'}
     assert jnp.asarray(best_opt_params['mass']).dtype == jnp.float64
     assert jnp.asarray(best_opt_params['v_lsr']).dtype == jnp.float64
+
+
+def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
+    monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
+
+    initial_opt_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+    }
+    fixed_params = {
+        'mass': 3.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+        'v_lsr': 7.0,
+    }
+    data = (
+        jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+    )
+
+    # The synthetic setup has loss ~1.1, so threshold 2.0 is met immediately.
+    # With a 2-epoch streak requirement, training should stop after epoch 2.
+    best_opt_params, loss_history, _ = gradient_descent.fit_streamline(
+        initial_opt_params,
+        fixed_params,
+        data,
+        uncertainties,
+        147.0,
+        n_epochs=10,
+        info_every=100,
+        early_stopping_patience=10,
+        loss_threshold=2.0,
+        loss_threshold_epochs=2,
+    )
+
+    assert len(loss_history) == 2
+    assert all(loss <= 2.0 for loss in loss_history)
+    assert 'omega' in best_opt_params
