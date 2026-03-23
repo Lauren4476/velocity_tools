@@ -29,6 +29,9 @@ TRACE_FIELDNAMES = [
     'chi2_dec',
     'chi2_v',
     'chi2_total',
+    'grad_norm',
+    'theta_ref_model',
+    'theta_ref_data',
     'model_points_total',
     'model_nan_count',
     'model_valid_points',
@@ -310,6 +313,15 @@ def _tree_has_nonfinite_values(tree):
     return False
 
 
+def _gradient_l2_norm(grad_tree):
+    """Compute L2 norm of gradients across all leaves in a pytree."""
+    grad_leaves = jax.tree_util.tree_leaves(grad_tree)
+    grad_sum_sq = jnp.asarray(0.0, dtype=FLOAT_DTYPE)
+    for grad_leaf in grad_leaves:
+        grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
+    return jnp.sqrt(grad_sum_sq)
+
+
 #not used anymore
 def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=None, grads=None, updates=None):
     """Print a detailed optimization snapshot to trace NaN/Inf origins."""
@@ -351,7 +363,7 @@ def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=Non
         print(f"  updates={updates_printable}")
 
 
-def _build_trace_row(epoch, loss_value, loss_trace):
+def _build_trace_row(epoch, loss_value, loss_trace, grad_norm):
     """Flatten nested trace dictionary into a CSV row."""
     chi2_components = loss_trace.get('chi2_components', {})
     matching = loss_trace.get('matching', {})
@@ -366,6 +378,9 @@ def _build_trace_row(epoch, loss_value, loss_trace):
         'chi2_dec': chi2_components.get('chi2_dec', float('nan')),
         'chi2_v': chi2_components.get('chi2_v', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
+        'grad_norm': grad_norm,
+        'theta_ref_model': model_metric_trace.get('theta_ref', float('nan')),
+        'theta_ref_data': data_metric_trace.get('theta_ref', float('nan')),
         'model_points_total': matching.get('model_points_total', 0),
         'model_nan_count': matching.get('model_nan_count', 0),
         'model_valid_points': matching.get('model_valid_points', 0),
@@ -640,16 +655,27 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
 
+    Parameters
+    ----------
+    gradient_tol : float or None
+        Tolerance on gradient norm. If provided and gradient norm > gradient_tol
+        at best params, a warning is issued because the quadratic approximation
+        may not be valid.
+
     Returns
     -------
     dict
         1-sigma uncertainties for each optimizable parameter
     array
         covariance matrix
-    gradient_tol : float
-        Tolerance on gradient norm. If gradient norm > gradient_tol at best params,
-        a warning is issued as the quadratic approximation may not be valid.
     """
+
+    if gradient_tol is not None:
+        gradient_tol = float(gradient_tol)
+        if not math.isfinite(gradient_tol):
+            raise ValueError('gradient_tol must be finite when provided.')
+        if gradient_tol <= 0:
+            raise ValueError('gradient_tol must be positive when provided.')
 
     # convert dict -> vector
     params_vec, keys = _params_dict_to_vector(best_opt_params)
@@ -660,9 +686,9 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
 
     # Check gradient magnitude at best-fit parameters
     grad_vec = jax.grad(loss_vec)(params_vec)
-    grad_norm = float(jnp.linalg.norm(grad_vec))
+    grad_norm = float(_gradient_l2_norm(grad_vec))
     
-    if grad_norm > gradient_tol:
+    if gradient_tol is not None and grad_norm > gradient_tol:
         print(f"WARNING: Gradient norm at best fit = {grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}")
         print("Optimization may not have reached a minimum yet.")
         print("Parameter uncertainties may be unreliable or incalculable. Consider:")
@@ -687,6 +713,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000,
                    beta1=0.9, beta2=0.999,
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
+                   gradient_tol=None, gradient_tol_epochs=1,
                    early_stopping_patience=50,
                    log_file=None, trace_file=None, trace_every=1,
                    output_uncertainties=False,
@@ -752,6 +779,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     loss_threshold_epochs : int
         Number of consecutive epochs with loss <= loss_threshold required to
         trigger threshold-based early stopping. Must be >= 1.
+    gradient_tol : float or None
+        Optional gradient norm tolerance for stopping.
+        If provided, optimization stops when the L2 norm of gradients
+        is less than this threshold for gradient_tol_epochs consecutive epochs,
+        indicating convergence.
+    gradient_tol_epochs : int
+        Number of consecutive epochs with ||grad|| < gradient_tol required to
+        trigger gradient norm-based early stopping. Must be >= 1.
         
     Returns:
     --------   
@@ -800,6 +835,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     best_epoch = 0
     patience_counter = 0
     loss_threshold_counter = 0
+    gradient_tol_counter = 0
 
     if trace_every < 1:
         raise ValueError('trace_every must be >= 1')
@@ -809,6 +845,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             raise ValueError('loss_threshold must be finite when provided.')
         if loss_threshold_epochs < 1:
             raise ValueError('loss_threshold_epochs must be >= 1 when loss_threshold is provided.')
+    if gradient_tol is not None:
+        gradient_tol = float(gradient_tol)
+        if not math.isfinite(gradient_tol):
+            raise ValueError('gradient_tol must be finite when provided.')
+        if gradient_tol <= 0:
+            raise ValueError('gradient_tol must be positive when provided.')
+        if gradient_tol_epochs < 1:
+            raise ValueError('gradient_tol_epochs must be >= 1 when gradient_tol is provided.')
     
     # Initialize CSV log file if requested
     csv_file = None
@@ -839,6 +883,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             f"Threshold-based stopping enabled: loss <= {loss_threshold:.6g} "
             f"for {loss_threshold_epochs} consecutive epochs."
         )
+    if gradient_tol is not None:
+        print(
+            f"Gradient norm stopping enabled: ||grad|| < {gradient_tol:.6g} "
+            f"for {gradient_tol_epochs} consecutive epochs."
+        )
     print(f"Initial optimizable values:")
     for key in opt_params.keys():
         print(f"  {key}: {opt_params[key]:.3e}")
@@ -856,7 +905,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if trace_csv_writer is not None:
         initial_loss_for_trace, initial_trace = chi2_loss(
             opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
-        initial_trace_row = _build_trace_row(0, float(initial_loss_for_trace), initial_trace)
+        initial_grad_norm = float(_gradient_l2_norm(loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)[1]))
+        initial_trace_row = _build_trace_row(0, float(initial_loss_for_trace), initial_trace, initial_grad_norm)
         trace_csv_writer.writerow(initial_trace_row)
         trace_csv_file.flush()
     
@@ -866,6 +916,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 print(f"\n Starting Epoch {epoch} -------------------------")
             # Compute gradients at current parameters (pre-update)
             _, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
+
+            # Compute gradient norm once and reuse for tracing/progress/stopping.
+            grad_norm = float(_gradient_l2_norm(grads))
 
             # Perform Optax Adam step
             updates, opt_state = solver.update(grads, opt_state, params=opt_params)
@@ -902,7 +955,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 csv_file.flush()  # Ensure data is written after each epoch
 
             if trace_csv_writer is not None and loss_trace is not None:
-                trace_row = _build_trace_row(epoch, loss_value, loss_trace)
+                trace_row = _build_trace_row(epoch, loss_value, loss_trace, grad_norm)
                 trace_csv_writer.writerow(trace_row)
                 trace_csv_file.flush()
         
@@ -920,18 +973,34 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                     loss_threshold_counter += 1
                 else:
                     loss_threshold_counter = 0
+            
+            if gradient_tol is not None:
+                if grad_norm < gradient_tol:
+                    gradient_tol_counter += 1
+                else:
+                    gradient_tol_counter = 0
         
             # Print progress
             if epoch % info_every == 0:
-                print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
+                if gradient_tol is not None:
+                    print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}, ||grad||: {grad_norm:.6e}')
+                else:
+                    print(f'Epoch {epoch}/{n_epochs}, Loss: {loss_value:.6f}, Best Loss: {best_loss:.6f}')
 
-            # Early stopping
-            # if loss_threshold is not None and loss_threshold_counter >= loss_threshold_epochs:
-            #     print(
-            #         f"\nEarly stopping at epoch {epoch}: loss <= {loss_threshold:.6g} "
-            #         f"for {loss_threshold_epochs} consecutive epochs"
-            #     )
-            #     break
+            # Early stopping conditions (any one is sufficient to stop)
+            if loss_threshold is not None and loss_threshold_counter >= loss_threshold_epochs:
+                print(
+                    f"\nEarly stopping at epoch {epoch}: loss <= {loss_threshold:.6g} "
+                    f"for {loss_threshold_epochs} consecutive epochs"
+                )
+                break
+
+            if gradient_tol is not None and gradient_tol_counter >= gradient_tol_epochs:
+                print(
+                    f"\nEarly stopping at epoch {epoch}: gradient norm {grad_norm:.6e} < {gradient_tol:.6e} "
+                    f"for {gradient_tol_epochs} consecutive epochs"
+                )
+                break
             
             if patience_counter >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch}: no improvement for {early_stopping_patience} epochs")
@@ -963,7 +1032,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             fixed_params,
             data,
             uncertainties,
-            distance_pc
+            distance_pc,
+            gradient_tol=gradient_tol,
         )
         print("\nParameter uncertainties (1-sigma):")
         for k, v in param_errors.items():
