@@ -203,30 +203,6 @@ def _resolve_model_params(opt_params, fixed_params):
     return model_params, opt_params, fixed_params
 
 
-def _normalize_learning_rate_dict(learning_rate_dict):
-    """Normalize per-parameter learning-rate keys to canonical model keys."""
-    if learning_rate_dict is None:
-        return None
-
-    normalized = dict(learning_rate_dict)
-    if 'omega' in normalized:
-        if 'log_omega' in normalized:
-            raise KeyError(
-                "learning_rate_dict contains both 'omega' and 'log_omega'. "
-                "Please provide only one key."
-            )
-        normalized['log_omega'] = normalized.pop('omega')
-
-    unknown = sorted(key for key in normalized if key not in STREAMLINE_MODEL_PARAM_KEYS)
-    if unknown:
-        raise KeyError(
-            f"Unknown keys in learning_rate_dict: {unknown}. "
-            f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
-        )
-
-    return normalized
-
-
 def _normalize_param_bounds(param_bounds):
     """Normalize parameter-bound keys and convert omega bounds to log-space."""
     if param_bounds is None:
@@ -256,6 +232,78 @@ def _normalize_param_bounds(param_bounds):
         )
 
     return normalized
+
+
+def _build_normalization_spec(opt_params, param_bounds):
+    """Build bounds-derived shift/scale metadata for optimized parameters."""
+    if param_bounds is None:
+        raise ValueError(
+            "param_bounds is required because optimization is performed in normalized space. "
+            "Provide bounds for every optimized parameter."
+        )
+
+    missing = sorted(key for key in opt_params if key not in param_bounds)
+    if missing:
+        raise ValueError(
+            "Missing bounds for optimized parameters: "
+            f"{missing}. Please add (min, max) entries for all optimized keys."
+        )
+
+    normalization_spec = {}
+    for key, value in opt_params.items():
+        bounds = param_bounds[key]
+        if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+            raise ValueError(
+                f"Bounds for '{key}' must be a 2-element (min, max) tuple/list. "
+                f"Got: {bounds!r}"
+            )
+
+        lower = _to_float64(bounds[0])
+        upper = _to_float64(bounds[1])
+        if not bool(jnp.isfinite(lower)) or not bool(jnp.isfinite(upper)):
+            raise ValueError(f"Bounds for '{key}' must be finite. Got ({bounds[0]}, {bounds[1]}).")
+        if not bool(upper > lower):
+            raise ValueError(
+                f"Bounds for '{key}' must satisfy min < max. Got ({float(lower)}, {float(upper)})."
+            )
+
+        value = _to_float64(value)
+        if not bool(jnp.isfinite(value)):
+            raise ValueError(f"Initial value for '{key}' must be finite. Got {value}.")
+        if not bool((value >= lower) & (value <= upper)):
+            raise ValueError(
+                f"Initial value for '{key}' ({float(value)}) is outside bounds "
+                f"({float(lower)}, {float(upper)})."
+            )
+
+        scale = upper - lower
+        normalization_spec[key] = {
+            'offset': lower,
+            'scale': scale,
+        }
+
+    return normalization_spec
+
+
+def _normalize_opt_params(opt_params, normalization_spec):
+    """Normalize optimized parameters to [0, 1] using x_norm=(x-min)/(max-min)."""
+    normalized = {}
+    for key, value in opt_params.items():
+        offset = normalization_spec[key]['offset']
+        scale = normalization_spec[key]['scale']
+        normalized[key] = (_to_float64(value) - offset) / scale
+    return normalized
+
+
+def _denormalize_opt_params(norm_opt_params, normalization_spec):
+    """Convert normalized optimized parameters back to physical/log parameter values."""
+    denormalized = {}
+    for key, value in norm_opt_params.items():
+        offset = normalization_spec[key]['offset']
+        scale = normalization_spec[key]['scale']
+        denormalized[key] = _to_float64(value) * scale + offset
+    return denormalized
+
 
 def _params_dict_to_vector(opt_params):
     """Convert parameter dict to ordered vector."""
@@ -651,16 +699,27 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
 
     return chi2_total
 
-def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties, distance_pc, gradient_tol=1e-1):
+def estimate_parameter_errors(
+    best_opt_params,
+    fixed_params,
+    data,
+    uncertainties,
+    distance_pc,
+    gradient_tol=1e-1,
+    normalization_spec=None,
+):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
 
     Parameters
     ----------
     gradient_tol : float or None
-        Tolerance on gradient norm. If provided and gradient norm > gradient_tol
-        at best params, a warning is issued because the quadratic approximation
-        may not be valid.
+        Tolerance on gradient norm in normalized space. If provided and
+        normalized-space gradient norm > gradient_tol at best params, a
+        warning is issued because the quadratic approximation may not be valid.
+    normalization_spec : dict or None
+        Bounds-derived normalization metadata for optimized parameters.
+        Required to evaluate gradient_tol in normalized space.
 
     Returns
     -------
@@ -684,17 +743,43 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
         params = _vector_to_params_dict(theta_vec, keys)
         return chi2_loss(params, fixed_params, data, uncertainties, distance_pc)
 
-    # Check gradient magnitude at best-fit parameters
-    grad_vec = jax.grad(loss_vec)(params_vec)
-    grad_norm = float(_gradient_l2_norm(grad_vec))
-    
-    if gradient_tol is not None and grad_norm > gradient_tol:
-        print(f"WARNING: Gradient norm at best fit = {grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}")
-        print("Optimization may not have reached a minimum yet.")
-        print("Parameter uncertainties may be unreliable or incalculable. Consider:")
-        print(f"    - Increasing n_epochs")
-        print(f"    - Reducing learning rate for finer convergence")
-        print(f"    - Reducing loss_threshold if used")
+    # Check gradient magnitude at best-fit parameters in normalized space.
+    if gradient_tol is not None:
+        if normalization_spec is None:
+            print(
+                "WARNING: gradient_tol is interpreted in normalized space, but "
+                "normalization_spec was not provided. Skipping gradient_tol check "
+                "for uncertainty estimation."
+            )
+        else:
+            missing_norm_keys = [key for key in keys if key not in normalization_spec]
+            if missing_norm_keys:
+                raise ValueError(
+                    "normalization_spec is missing optimized parameter keys required "
+                    f"for gradient_tol check: {missing_norm_keys}"
+                )
+
+            norm_opt_params = _normalize_opt_params(best_opt_params, normalization_spec)
+            norm_params_vec, _ = _params_dict_to_vector(norm_opt_params)
+
+            def norm_loss_vec(theta_norm_vec):
+                norm_params = _vector_to_params_dict(theta_norm_vec, keys)
+                physical_params = _denormalize_opt_params(norm_params, normalization_spec)
+                return chi2_loss(physical_params, fixed_params, data, uncertainties, distance_pc)
+
+            norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
+            norm_grad_norm = float(_gradient_l2_norm(norm_grad_vec))
+
+            if norm_grad_norm > gradient_tol:
+                print(
+                    "WARNING: Normalized-space gradient norm at best fit = "
+                    f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
+                )
+                print("Optimization may not have reached a minimum yet.")
+                print("Parameter uncertainties may be unreliable or incalculable. Consider:")
+                print("    - Increasing n_epochs")
+                print("    - Reducing learning rate for finer convergence")
+                print("    - Reducing loss_threshold if used")
 
     # compute Hessian
     H = jax.hessian(loss_vec)(params_vec)
@@ -710,7 +795,7 @@ def estimate_parameter_errors(best_opt_params, fixed_params, data, uncertainties
     return error_dict, cov
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
-                   learning_rate=0.001, learning_rate_dict=None, param_bounds=None, n_epochs=1000,
+                   learning_rate=0.001, param_bounds=None, n_epochs=1000,
                    beta1=0.9, beta2=0.999,
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
                    gradient_tol=None, gradient_tol_epochs=1,
@@ -744,13 +829,12 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     distance_pc : float
             Distance to source in parsecs
     learning_rate : float
-        Default learning rate for Adam optimizer. Used if no specific rate provided for a parameter.
-    learning_rate_dict : dict or None
-        Per-parameter learning rates keyed by model parameter names.
-        If provided, overrides learning_rate for specified optimized keys.
+        Adam learning rate applied uniformly to all normalized parameters.
     param_bounds : dict or None
-        Parameter bounds in optimization space.
-        Bounds are applied only to optimized keys that have entries here.
+        Parameter bounds in physical/log parameter units.
+        Optimization is performed in normalized space using
+        x_norm = (x - min) / (max - min), so bounds are required for all
+        optimized keys and are used as normalization anchors.
         You may provide 'omega' bounds as linear bounds; these are converted
         to 'log_omega' bounds internally.
     n_epochs : int
@@ -780,13 +864,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Number of consecutive epochs with loss <= loss_threshold required to
         trigger threshold-based early stopping. Must be >= 1.
     gradient_tol : float or None
-        Optional gradient norm tolerance for stopping.
-        If provided, optimization stops when the L2 norm of gradients
+        Optional gradient norm tolerance for stopping in normalized space.
+        If provided, optimization stops when the L2 norm of gradients with
+        respect to normalized parameters
         is less than this threshold for gradient_tol_epochs consecutive epochs,
         indicating convergence.
     gradient_tol_epochs : int
         Number of consecutive epochs with ||grad|| < gradient_tol required to
-        trigger gradient norm-based early stopping. Must be >= 1.
+        trigger normalized-space gradient norm-based early stopping. Must be >= 1.
         
     Returns:
     --------   
@@ -800,42 +885,44 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         fixed_params,
         require_nonempty_opt=True,
     )
+    opt_param_keys = list(opt_params.keys())
     data = _coerce_data_tuple_float64(data)
     uncertainties = _coerce_data_tuple_float64(uncertainties)
     distance_pc = _to_float64(distance_pc)
-    learning_rate_dict = _normalize_learning_rate_dict(learning_rate_dict)
+    learning_rate = _to_float64(learning_rate)
+    if not bool(jnp.isfinite(learning_rate)):
+        raise ValueError(f'learning_rate must be finite. Got {learning_rate}.')
+    if not bool(learning_rate > 0):
+        raise ValueError(f'learning_rate must be > 0. Got {float(learning_rate)}.')
     param_bounds = _normalize_param_bounds(param_bounds)
+    normalization_spec = _build_normalization_spec(opt_params, param_bounds)
 
-    # Build optimizer (supports optional per-parameter learning rates)
-    if learning_rate_dict is not None:
-        param_labels = {
-            key: key if key in learning_rate_dict else 'default'
-            for key in opt_params.keys()
-        }
-        transforms = {
-            'default': optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
-        }
-        for key, lr in learning_rate_dict.items():
-            if key in opt_params:
-                transforms[key] = optax.adam(learning_rate=lr, b1=beta1, b2=beta2)
-        solver = optax.multi_transform(transforms, param_labels)
-    else:
-        solver = optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
+    # Keep optimization variables in normalized coordinates; convert back to
+    # physical/log units only when evaluating the forward model and diagnostics.
+    opt_params_norm = _normalize_opt_params(opt_params, normalization_spec)
 
-    opt_state = solver.init(opt_params)
-    
-    # Create gradient function (only w.r.t. opt_params)
-    loss_and_grad_fn = value_and_grad(chi2_loss, argnums=0)
+    # Use one global learning rate on normalized parameters.
+    solver = optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
+
+    opt_state = solver.init(opt_params_norm)
+
+    def loss_from_normalized(norm_opt_params):
+        physical_opt_params = _denormalize_opt_params(norm_opt_params, normalization_spec)
+        return chi2_loss(physical_opt_params, fixed_params, data, uncertainties, distance_pc)
+
+    # Create gradient function in normalized space.
+    loss_and_grad_fn = value_and_grad(loss_from_normalized)
     
     # Track loss history
     loss_history = []
-    initial_loss = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
+    initial_loss = float(loss_from_normalized(opt_params_norm))
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_epoch = 0
     patience_counter = 0
     loss_threshold_counter = 0
     gradient_tol_counter = 0
+    ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
 
     if trace_every < 1:
         raise ValueError('trace_every must be >= 1')
@@ -860,7 +947,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if log_file is not None:
         csv_file = open(log_file, 'w', newline='')
         # Create header: epoch, loss, then all optimizable params
-        fieldnames = ['epoch', 'loss'] + list(opt_params.keys())
+        fieldnames = ['epoch', 'loss'] + opt_param_keys
         if 'log_omega' in opt_params and 'omega' not in fieldnames:
             fieldnames.append('omega')
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -876,7 +963,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         trace_csv_file.flush()
     
     print(f"Starting optimization with {n_epochs} epochs...")
-    print(f"Optimizing parameters: {list(opt_params.keys())}")
+    print(f"Optimizing parameters: {opt_param_keys}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     if loss_threshold is not None:
         print(
@@ -885,17 +972,17 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         )
     if gradient_tol is not None:
         print(
-            f"Gradient norm stopping enabled: ||grad|| < {gradient_tol:.6g} "
+            f"Gradient norm stopping enabled (normalized space): ||grad|| < {gradient_tol:.6g} "
             f"for {gradient_tol_epochs} consecutive epochs."
         )
     print(f"Initial optimizable values:")
-    for key in opt_params.keys():
+    for key in opt_param_keys:
         print(f"  {key}: {opt_params[key]:.3e}")
     
     # Log initial parameters and initial loss (epoch 0) if CSV logging is enabled
     if csv_writer is not None:
         row = {'epoch': 0, 'loss': initial_loss}
-        for key in opt_params.keys():
+        for key in opt_param_keys:
             row[key] = float(opt_params[key])
         if 'log_omega' in opt_params:
             row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
@@ -905,7 +992,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if trace_csv_writer is not None:
         initial_loss_for_trace, initial_trace = chi2_loss(
             opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
-        initial_grad_norm = float(_gradient_l2_norm(loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)[1]))
+        initial_norm_grads = loss_and_grad_fn(opt_params_norm)[1]
+        initial_grad_norm = float(_gradient_l2_norm(initial_norm_grads))
         initial_trace_row = _build_trace_row(0, float(initial_loss_for_trace), initial_trace, initial_grad_norm)
         trace_csv_writer.writerow(initial_trace_row)
         trace_csv_file.flush()
@@ -914,22 +1002,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         for epoch in range(1, n_epochs + 1):
             if epoch % info_every == 0:
                 print(f"\n Starting Epoch {epoch} -------------------------")
-            # Compute gradients at current parameters (pre-update)
-            _, grads = loss_and_grad_fn(opt_params, fixed_params, data, uncertainties, distance_pc)
+            # Compute gradients at current normalized parameters (pre-update)
+            _, norm_grads = loss_and_grad_fn(opt_params_norm)
 
-            # Compute gradient norm once and reuse for tracing/progress/stopping.
-            grad_norm = float(_gradient_l2_norm(grads))
+            # Compute gradient norm in normalized space and reuse for
+            # tracing/progress/stopping.
+            grad_norm = float(_gradient_l2_norm(norm_grads))
 
-            # Perform Optax Adam step
-            updates, opt_state = solver.update(grads, opt_state, params=opt_params)
-            opt_params = optax.apply_updates(opt_params, updates)
+            # Perform Optax Adam step in normalized space.
+            updates, opt_state = solver.update(norm_grads, opt_state, params=opt_params_norm)
+            opt_params_norm = optax.apply_updates(opt_params_norm, updates)
 
-            # Apply bounds if provided
-            if param_bounds is not None:
-                for key in opt_params.keys():
-                    if key in param_bounds:
-                        min_val, max_val = param_bounds[key]
-                        opt_params[key] = jnp.clip(opt_params[key], min_val, max_val)
+            # Enforce normalized bounds and map back to physical/log values.
+            for key in opt_param_keys:
+                opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
+            opt_params = _denormalize_opt_params(opt_params_norm, normalization_spec)
 
             # Compute loss at updated parameters (post-update)
             if trace_csv_writer is not None and epoch % trace_every == 0:
@@ -947,7 +1034,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             if csv_writer is not None:
                 row = {'epoch': epoch, 'loss': loss_value}
                 # Add all optimizable parameter values
-                for key in opt_params.keys():
+                for key in opt_param_keys:
                     row[key] = float(opt_params[key])
                 if 'log_omega' in opt_params:
                     row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
@@ -997,7 +1084,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             if gradient_tol is not None and gradient_tol_counter >= gradient_tol_epochs:
                 print(
-                    f"\nEarly stopping at epoch {epoch}: gradient norm {grad_norm:.6e} < {gradient_tol:.6e} "
+                    f"\nEarly stopping at epoch {epoch}: normalized gradient norm {grad_norm:.6e} < {gradient_tol:.6e} "
                     f"for {gradient_tol_epochs} consecutive epochs"
                 )
                 break
@@ -1007,7 +1094,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 break
     
         # restore canonical parameter order before returning
-        ordered_best_opt_params = {k: best_opt_params[k] for k in initial_opt_params.keys()}
+        ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
 
     finally:
         # Always close the CSV file if it was opened
@@ -1034,6 +1121,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             uncertainties,
             distance_pc,
             gradient_tol=gradient_tol,
+            normalization_spec=normalization_spec,
         )
         print("\nParameter uncertainties (1-sigma):")
         for k, v in param_errors.items():

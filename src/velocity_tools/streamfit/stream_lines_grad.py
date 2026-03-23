@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax import debug
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_nans", False)
 from jax.scipy.optimize import minimize # may not be needed if using jaxopt
 from jaxopt import LBFGSB # may not be needed if using custom Newton method
 

@@ -31,6 +31,24 @@ def _fake_forward_model(opt_params, fixed_params, distance_pc):
     return ra_model, dec_model, v_model
 
 
+def _bounds_for_keys(keys):
+    """Return deterministic bounds for optimized-key subsets used in tests."""
+    template = {
+        'r0': (200.0, 2000.0),
+        'theta0': (0.0, float(jnp.pi)),
+        'phi0': (0.0, float(2.0 * jnp.pi)),
+        'log_omega': (float(np.log(1e-14)), float(np.log(1e-10))),
+        'v_r0': (-5.0, 5.0),
+        'mass': (0.1, 10.0),
+        'inc': (-float(jnp.pi), float(jnp.pi)),
+        'pa': (0.0, float(2.0 * jnp.pi)),
+        'rmin': (1.0, 500.0),
+        'deltar': (1.0, 200.0),
+        'v_lsr': (0.0, 20.0),
+    }
+    return {key: template[key] for key in keys}
+
+
 def test_get_distance_metric_trace_metadata() -> None:
     ra = jnp.array([3.0, 2.0, 1.0, 0.5, 0.25], dtype=jnp.float64)
     dec = jnp.zeros_like(ra)
@@ -166,6 +184,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         data,
         uncertainties,
         147.0,
+        param_bounds=_bounds_for_keys(initial_opt_params.keys()),
         n_epochs=3,
         info_every=100,
         early_stopping_patience=10,
@@ -255,6 +274,7 @@ def test_fit_streamline_allows_custom_opt_partition(monkeypatch) -> None:
         data,
         uncertainties,
         147.0,
+        param_bounds=_bounds_for_keys(initial_opt_params.keys()),
         n_epochs=3,
         info_every=100,
         early_stopping_patience=10,
@@ -303,6 +323,7 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
         data,
         uncertainties,
         147.0,
+        param_bounds=_bounds_for_keys(initial_opt_params.keys()),
         n_epochs=10,
         info_every=100,
         early_stopping_patience=10,
@@ -313,3 +334,145 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
     assert len(loss_history) == 2
     assert all(loss <= 2.0 for loss in loss_history)
     assert 'omega' in best_opt_params
+
+
+def test_fit_streamline_requires_bounds_for_all_optimized_params(monkeypatch) -> None:
+    monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
+
+    initial_opt_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+    }
+    fixed_params = {
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+        'mass': 3.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+        'v_lsr': 7.0,
+    }
+    data = (
+        jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+    )
+
+    with pytest.raises(ValueError, match='Missing bounds for optimized parameters'):
+        gradient_descent.fit_streamline(
+            initial_opt_params,
+            fixed_params,
+            data,
+            uncertainties,
+            147.0,
+            param_bounds={'r0': (200.0, 2000.0)},
+            n_epochs=1,
+            info_every=100,
+            early_stopping_patience=10,
+        )
+
+
+def test_fit_streamline_accepts_omega_alias_bounds(monkeypatch) -> None:
+    monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
+
+    initial_opt_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+    }
+    fixed_params = {
+        'mass': 3.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+        'v_lsr': 7.0,
+    }
+    data = (
+        jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+    )
+
+    param_bounds = {
+        'r0': (200.0, 2000.0),
+        'theta0': (0.0, float(jnp.pi)),
+        'phi0': (0.0, float(2.0 * jnp.pi)),
+        'omega': (1e-14, 1e-10),
+        'v_r0': (-5.0, 5.0),
+    }
+
+    best_opt_params, _, _ = gradient_descent.fit_streamline(
+        initial_opt_params,
+        fixed_params,
+        data,
+        uncertainties,
+        147.0,
+        param_bounds=param_bounds,
+        n_epochs=1,
+        info_every=100,
+        early_stopping_patience=10,
+    )
+
+    assert 'log_omega' in best_opt_params
+    assert 'omega' in best_opt_params
+    assert jnp.asarray(best_opt_params['log_omega']).dtype == jnp.float64
+    assert jnp.asarray(best_opt_params['omega']).dtype == jnp.float64
+
+
+def test_fit_streamline_rejects_nonpositive_learning_rate(monkeypatch) -> None:
+    monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
+
+    initial_opt_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+    }
+    fixed_params = {
+        'mass': 3.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+        'v_lsr': 7.0,
+    }
+    data = (
+        jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+        jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
+    )
+
+    with pytest.raises(ValueError, match='learning_rate must be > 0'):
+        gradient_descent.fit_streamline(
+            initial_opt_params,
+            fixed_params,
+            data,
+            uncertainties,
+            147.0,
+            learning_rate=0.0,
+            param_bounds=_bounds_for_keys(initial_opt_params.keys()),
+            n_epochs=1,
+            info_every=100,
+            early_stopping_patience=10,
+        )
