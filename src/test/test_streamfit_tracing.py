@@ -125,7 +125,7 @@ def test_chi2_loss_returns_trace(monkeypatch) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -167,7 +167,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -260,7 +260,7 @@ def test_fit_streamline_allows_custom_opt_partition(monkeypatch) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -307,7 +307,7 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -357,7 +357,7 @@ def test_fit_streamline_requires_bounds_for_all_optimized_params(monkeypatch) ->
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -400,7 +400,7 @@ def test_fit_streamline_accepts_omega_alias_bounds(monkeypatch) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
@@ -455,7 +455,7 @@ def test_fit_streamline_rejects_nonpositive_learning_rate(monkeypatch) -> None:
     data = (
         jnp.array([2.2, 1.7, 0.9], dtype=jnp.float64),
         jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
-        jnp.array([7.15, 6.95, 6.70], dtype=jnp.float64),
+        jnp.array([0.15, -0.05, -0.30], dtype=jnp.float64),
     )
     uncertainties = (
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),

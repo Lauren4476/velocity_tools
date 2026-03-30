@@ -4,7 +4,7 @@ This file contains the loss function and optimization routines for streamfit.
 The optimization uses Adam (adaptive moment estimation) optimizer to fit
 streamline model parameters to observed data by minimizing chi-squared loss.
 
-Last updated: 30-03-26
+Last updated: 02-02-26
 '''
 
 import jax.numpy as jnp
@@ -463,7 +463,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
     tuple: (ra_offsets, dec_offsets, velocities) each in appropriate units
         - RA offsets in arcsec (negative for standard convention)
         - Dec offsets in arcsec
-        - Line-of-sight velocities in km/s, relative to v_lsr
+        - Line-of-sight velocities in km/s
     """
     model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
     distance_pc = _to_float64(distance_pc)
@@ -496,8 +496,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
     # y = line-of-sight velocity
     ra_model = jnp.where(valid_mask, -x / distance_pc, jnp.nan)  # arcsec
     dec_model = jnp.where(valid_mask, z / distance_pc, jnp.nan)  # arcsec
-    # make velocity absolute by adding back v_lsr 
-    v_model = jnp.where(valid_mask, vy + model_params['v_lsr'], jnp.nan)  # km/s  (absolute)
+    v_model = jnp.where(valid_mask, vy + model_params['v_lsr'], jnp.nan)  # km/s (add systemic velocity)
 
     return ra_model, dec_model, v_model
 
@@ -665,13 +664,10 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     ra_sigma = jnp.maximum(ra_sigma, eps)
     dec_sigma = jnp.maximum(dec_sigma, eps)
     v_sigma = jnp.maximum(v_sigma, eps)
-
-    print(f"DEBUG: ra_data = {ra_data}")
     
     # Run forward model
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
     
-    print(f"DEBUG: ra_model = {ra_model}")
 
     # Match model to data using arc-length parameterisation
     if return_trace:
@@ -681,15 +677,10 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
         ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
             ra_model, dec_model, v_model, ra_data, dec_data)
         
-    print(f"DEBUG: ra_model_interp = {ra_model_interp}")
-
-    ### polar plane of sky / velocity loss
-
+    #### polar plane of sky / velocity loss
+    
     r_data, theta_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
     _, theta_model = extract_streamline.cartesian_to_polar(ra_model_interp, dec_model_interp)
-
-    print(f"DEBUG: theta_data = {theta_data}")
-    print(f"DEBUG: theta_model = {theta_model}")
     # angular difference -> arc length distance
     dtheta = extract_streamline._wrap_to_pi(theta_data - theta_model)
     dsky = r_data * dtheta # gives distance in au, with dtheta in rad and r_data in au
@@ -698,8 +689,6 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     chi2_dsky = jnp.sum((dsky / sigma_dsky)**2)
     chi2_v = jnp.sum(((v_data - v_model_interp) / v_sigma)**2)
     chi2_total = chi2_dsky + chi2_v
-    # TODO: divide by number of points
-
 
     if return_trace:
         loss_trace = {
@@ -713,11 +702,10 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
         return chi2_total, loss_trace
 
     return chi2_total
-
     '''
 
-    ### Original RA/Dec/velocity loss
-
+    #### original RA/Dec/velocity loss
+    
     # Compute chi-squared components
     chi2_ra = jnp.sum(((ra_data - ra_model_interp) / ra_sigma)**2)
     chi2_dec = jnp.sum(((dec_data - dec_model_interp) / dec_sigma)**2)
