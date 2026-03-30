@@ -42,6 +42,12 @@ TRACE_FIELDNAMES = [
     'model_metric_non_monotonic_count',
     'model_inner_count',
     'data_inner_count',
+    'data_points_total',
+    'data_valid_points',
+    'data_retained_count',
+    'model_retained_count',
+    'overlap_r_min',
+    'overlap_r_max',
 ]
 
 
@@ -439,6 +445,12 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm):
         'model_metric_non_monotonic_count': matching.get('model_metric_non_monotonic_count', 0),
         'model_inner_count': model_metric_trace.get('inner_count', 0),
         'data_inner_count': data_metric_trace.get('inner_count', 0),
+        'data_points_total': matching.get('data_points_total', 0),
+        'data_valid_points': matching.get('data_valid_points', 0),
+        'data_retained_count': matching.get('data_retained_count', 0),
+        'model_retained_count': matching.get('model_retained_count', 0),
+        'overlap_r_min': matching.get('overlap_r_min', float('nan')),
+        'overlap_r_max': matching.get('overlap_r_max', float('nan')),
     }
 
 
@@ -542,15 +554,32 @@ def forward_fill_nans(arr):
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
     """
-    Extract model values corresponding to data positions, using the same distance metric
-    as used for binning the point cloud.
-    Uses get_distance_metric from extract_streamline
+    Extract model values corresponding to data positions using the projected
+    radial distance metric from extract_streamline.get_distance_metric.
+
+    Matching is restricted to the physically overlapping radial domain:
+    1. Data is restricted to the model-supported radial range.
+    2. Model is restricted to the data-supported radial range.
+    3. Interpolation is performed only on the overlap support.
 
     Parameters
     ----------
     return_trace : bool
         If True, also return a trace dictionary containing diagnostics on
         distance metric stability and model-point ordering.
+
+    Returns
+    -------
+    tuple
+        (ra_model_interp, dec_model_interp, v_model_interp, valid)
+        where valid is a boolean mask with shape len(original data), marking
+        retained data points inside the overlap domain.
+
+    Raises
+    ------
+    ValueError
+        If no valid model/data points exist, there is no radial overlap, or
+        fewer than two model points remain in the overlap domain.
     """
 
     ra_model = _to_float64(ra_model)
@@ -559,44 +588,114 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     ra_data = _to_float64(ra_data)
     dec_data = _to_float64(dec_data)
 
-    # Forward-fill NaNs in model arrays - TODO does this make sense? should we be masking these instead?
-    ra_model_filled = forward_fill_nans(ra_model)
-    dec_model_filled = forward_fill_nans(dec_model)
-    v_model_filled = forward_fill_nans(v_model)
-
-    # compute distance metrics for full model and data
-    # (no clipping - interpolation will handle matching)
+    # Compute projected radial metric for model/data in float64.
     if return_trace:
         dmetric_model, dmetric_model_trace = extract_streamline.get_distance_metric(
-            ra_model_filled, dec_model_filled, return_trace=True)
+            ra_model, dec_model, return_trace=True)
         dmetric_data, dmetric_data_trace = extract_streamline.get_distance_metric(
             ra_data, dec_data, return_trace=True)
     else:
         dmetric_model = extract_streamline.get_distance_metric(
-            ra_model_filled, dec_model_filled)
+            ra_model, dec_model)
         dmetric_data = extract_streamline.get_distance_metric(
             ra_data, dec_data) 
 
-    # sort model once
+    model_finite_mask = (
+        jnp.isfinite(ra_model)
+        & jnp.isfinite(dec_model)
+        & jnp.isfinite(v_model)
+        & jnp.isfinite(dmetric_model)
+    )
+    data_finite_mask = (
+        jnp.isfinite(ra_data)
+        & jnp.isfinite(dec_data)
+        & jnp.isfinite(dmetric_data)
+    )
+
+    if not bool(jnp.any(model_finite_mask)):
+        raise ValueError('No finite model points are available for model-data matching.')
+    if not bool(jnp.any(data_finite_mask)):
+        raise ValueError('No finite data points are available for model-data matching.')
+
+    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
+    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
+    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
+    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, -jnp.inf)
+
+    model_min = jnp.min(model_metric_for_min)
+    model_max = jnp.max(model_metric_for_max)
+    data_min = jnp.min(data_metric_for_min)
+    data_max = jnp.max(data_metric_for_max)
+
+    overlap_min = jnp.maximum(model_min, data_min)
+    overlap_max = jnp.minimum(model_max, data_max)
+
+    if not bool(overlap_max >= overlap_min):
+        raise ValueError(
+            'No physically valid radial overlap between model and data. '
+            f'Model range [{float(model_min):.6g}, {float(model_max):.6g}], '
+            f'data range [{float(data_min):.6g}, {float(data_max):.6g}]'
+        )
+
+    data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
+    model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
+
+    if not bool(jnp.any(data_keep)):
+        raise ValueError(
+            'No retained data points after overlap filtering. '
+            f'Overlap range [{float(overlap_min):.6g}, {float(overlap_max):.6g}]'
+        )
+
+    model_retained_count = int(jnp.sum(model_keep))
+    if model_retained_count < 2:
+        raise ValueError(
+            'Insufficient retained model support for interpolation after overlap filtering: '
+            f'{model_retained_count} point(s) available; need at least 2.'
+        )
+
+    # Sort model once by metric.
     sort_idx = jnp.argsort(dmetric_model)
     d_model_sorted = dmetric_model[sort_idx]
-    ra_sorted = ra_model_filled[sort_idx]
-    dec_sorted = dec_model_filled[sort_idx]
-    v_sorted = v_model_filled[sort_idx]
+    ra_sorted = ra_model[sort_idx]
+    dec_sorted = dec_model[sort_idx]
+    v_sorted = v_model[sort_idx]
+    model_keep_sorted = model_keep[sort_idx]
 
-    # interpolate model to the *actual* data distance metric
-    ra_model_interp = jnp.interp(dmetric_data, d_model_sorted, ra_sorted)
-    dec_model_interp = jnp.interp(dmetric_data, d_model_sorted, dec_sorted)
-    v_model_interp  = jnp.interp(dmetric_data, d_model_sorted, v_sorted)
-        
-    n_points = len(ra_data)
+    # Build edge anchors on retained support so clipped interpolation uses only
+    # overlap-domain endpoints.
+    first_keep_idx = jnp.argmax(model_keep_sorted)
+    last_keep_idx = model_keep_sorted.size - 1 - jnp.argmax(jnp.flip(model_keep_sorted))
 
-    valid = jnp.ones(n_points, dtype=bool)
+    ra_first = ra_sorted[first_keep_idx]
+    dec_first = dec_sorted[first_keep_idx]
+    v_first = v_sorted[first_keep_idx]
+    ra_last = ra_sorted[last_keep_idx]
+    dec_last = dec_sorted[last_keep_idx]
+    v_last = v_sorted[last_keep_idx]
+
+    is_below_overlap = d_model_sorted < overlap_min
+    ra_support = jnp.where(model_keep_sorted, ra_sorted, jnp.where(is_below_overlap, ra_first, ra_last))
+    dec_support = jnp.where(model_keep_sorted, dec_sorted, jnp.where(is_below_overlap, dec_first, dec_last))
+    v_support = jnp.where(model_keep_sorted, v_sorted, jnp.where(is_below_overlap, v_first, v_last))
+    d_support = jnp.clip(d_model_sorted, overlap_min, overlap_max)
+
+    # Interpolate only on overlap support. For dropped data points, query at
+    # overlap_min and then overwrite with finite placeholders.
+    d_query = jnp.where(data_keep, dmetric_data, overlap_min)
+    ra_interp_all = jnp.interp(d_query, d_support, ra_support)
+    dec_interp_all = jnp.interp(d_query, d_support, dec_support)
+    v_interp_all = jnp.interp(d_query, d_support, v_support)
+
+    ra_model_interp = jnp.where(data_keep, ra_interp_all, ra_data)
+    dec_model_interp = jnp.where(data_keep, dec_interp_all, dec_data)
+    v_model_interp = jnp.where(data_keep, v_interp_all, _to_float64(0.0))
+
+    valid = data_keep
 
     if not return_trace:
         return ra_model_interp, dec_model_interp, v_model_interp, valid
 
-    model_nan_mask = jnp.isnan(ra_model) | jnp.isnan(dec_model) | jnp.isnan(v_model)
+    model_nan_mask = ~model_finite_mask
     model_nan_count = int(jnp.sum(model_nan_mask))
     model_points_total = int(ra_model.size)
     model_valid_points = model_points_total - model_nan_count
@@ -619,6 +718,12 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         'model_points_total': model_points_total,
         'model_nan_count': model_nan_count,
         'model_valid_points': model_valid_points,
+        'model_retained_count': model_retained_count,
+        'data_points_total': int(ra_data.size),
+        'data_valid_points': int(jnp.sum(data_finite_mask)),
+        'data_retained_count': int(jnp.sum(data_keep)),
+        'overlap_r_min': float(overlap_min),
+        'overlap_r_max': float(overlap_max),
         'model_metric_span': model_metric_span,
         'model_metric_min_gap': model_metric_min_gap,
         'model_metric_near_tie_count': model_metric_near_tie_count,
@@ -666,37 +771,32 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     dec_sigma = jnp.maximum(dec_sigma, eps)
     v_sigma = jnp.maximum(v_sigma, eps)
 
-    print(f"DEBUG: ra_data = {ra_data}")
-    
     # Run forward model
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
     
-    print(f"DEBUG: ra_model = {ra_model}")
 
     # Match model to data using arc-length parameterisation
     if return_trace:
-        ra_model_interp, dec_model_interp, v_model_interp, _, matching_trace = match_model_to_data_curve(
+        ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace = match_model_to_data_curve(
             ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
     else:
-        ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
+        ra_model_interp, dec_model_interp, v_model_interp, valid = match_model_to_data_curve(
             ra_model, dec_model, v_model, ra_data, dec_data)
         
-    print(f"DEBUG: ra_model_interp = {ra_model_interp}")
 
     ### polar plane of sky / velocity loss
 
     r_data, theta_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
     _, theta_model = extract_streamline.cartesian_to_polar(ra_model_interp, dec_model_interp)
 
-    print(f"DEBUG: theta_data = {theta_data}")
-    print(f"DEBUG: theta_model = {theta_model}")
     # angular difference -> arc length distance
     dtheta = extract_streamline._wrap_to_pi(theta_data - theta_model)
     dsky = r_data * dtheta # gives distance in au, with dtheta in rad and r_data in au
     sigma_dsky = jnp.sqrt(ra_sigma**2 + dec_sigma**2) # approximate uncertainty on dsky
+    valid_float = valid.astype(FLOAT_DTYPE)
     # chi2
-    chi2_dsky = jnp.sum((dsky / sigma_dsky)**2)
-    chi2_v = jnp.sum(((v_data - v_model_interp) / v_sigma)**2)
+    chi2_dsky = jnp.sum(valid_float * ((dsky / sigma_dsky)**2))
+    chi2_v = jnp.sum(valid_float * (((v_data - v_model_interp) / v_sigma)**2))
     chi2_total = chi2_dsky + chi2_v
     # TODO: divide by number of points
 

@@ -104,6 +104,103 @@ def test_match_model_to_data_curve_trace_detects_duplicate_metric() -> None:
     assert 'distance_metric_data' in trace
 
 
+def test_match_model_to_data_curve_returns_overlap_mask_and_counts() -> None:
+    ra_model = jnp.array([0.2, 0.6, 1.0, 1.4, 1.8], dtype=jnp.float64)
+    dec_model = jnp.zeros_like(ra_model)
+    v_model = jnp.array([1.0, 1.2, 1.4, 1.6, 1.8], dtype=jnp.float64)
+
+    ra_data = jnp.array([0.1, 0.7, 1.1, 1.5], dtype=jnp.float64)
+    dec_data = jnp.zeros_like(ra_data)
+
+    _, _, _, valid, trace = gradient_descent.match_model_to_data_curve(
+        ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True
+    )
+
+    assert valid.dtype == jnp.bool_
+    assert valid.shape == ra_data.shape
+    assert np.array_equal(np.asarray(valid), np.array([False, True, True, True]))
+    assert trace['data_retained_count'] == 3
+    assert trace['model_retained_count'] == 4
+    assert trace['overlap_r_min'] == pytest.approx(0.2)
+    assert trace['overlap_r_max'] == pytest.approx(1.5)
+
+
+def test_match_model_to_data_curve_raises_when_no_overlap() -> None:
+    ra_model = jnp.array([0.2, 0.4, 0.6], dtype=jnp.float64)
+    dec_model = jnp.zeros_like(ra_model)
+    v_model = jnp.array([1.0, 1.1, 1.2], dtype=jnp.float64)
+
+    ra_data = jnp.array([1.5, 1.8], dtype=jnp.float64)
+    dec_data = jnp.zeros_like(ra_data)
+
+    with pytest.raises(ValueError, match='No physically valid radial overlap'):
+        gradient_descent.match_model_to_data_curve(
+            ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False
+        )
+
+
+def test_chi2_loss_uses_retained_mask_only(monkeypatch) -> None:
+    def _masked_forward_model(opt_params, fixed_params, distance_pc):
+        ra_model = jnp.array([0.5, 1.0, 1.5], dtype=jnp.float64)
+        dec_model = jnp.zeros_like(ra_model)
+        v_model = jnp.array([10.0, 20.0, 30.0], dtype=jnp.float64)
+        return ra_model, dec_model, v_model
+
+    monkeypatch.setattr(gradient_descent, 'forward_model', _masked_forward_model)
+
+    opt_params = {
+        'r0': 540.0,
+        'theta0': 0.7,
+        'phi0': 1.2,
+        'log_omega': np.log(4e-12),
+        'v_r0': -0.2,
+    }
+    fixed_params = {
+        'mass': 3.2,
+        'inc': -0.8,
+        'pa': 2.4,
+        'rmin': 50.0,
+        'deltar': 40.0,
+        'v_lsr': 7.0,
+    }
+    data = (
+        jnp.array([0.2, 0.8, 1.3], dtype=jnp.float64),
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+        jnp.array([999.0, 21.0, 29.0], dtype=jnp.float64),
+    )
+    uncertainties = (
+        jnp.array([1.0, 1.0, 1.0], dtype=jnp.float64),
+        jnp.array([1.0, 1.0, 1.0], dtype=jnp.float64),
+        jnp.array([1.0, 1.0, 1.0], dtype=jnp.float64),
+    )
+
+    loss, trace = gradient_descent.chi2_loss(
+        opt_params, fixed_params, data, uncertainties, 147.0, return_trace=True
+    )
+
+    # First data point is out of overlap and should be masked out.
+    # Model support is also restricted to data range, so r=1.5 is excluded.
+    # For retained points: interpolated v at r=0.8 is 16, and r=1.3 clips to
+    # the retained upper endpoint value 20.
+    expected = (21.0 - 16.0) ** 2 + (29.0 - 20.0) ** 2
+    assert float(loss) == pytest.approx(expected)
+    assert trace['matching']['data_retained_count'] == 2
+
+
+def test_match_model_to_data_curve_requires_two_model_points_in_overlap() -> None:
+    ra_model = jnp.array([0.5, 1.5, 2.5], dtype=jnp.float64)
+    dec_model = jnp.zeros_like(ra_model)
+    v_model = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+
+    ra_data = jnp.array([0.55], dtype=jnp.float64)
+    dec_data = jnp.array([0.0], dtype=jnp.float64)
+
+    with pytest.raises(ValueError, match='Insufficient retained model support'):
+        gradient_descent.match_model_to_data_curve(
+            ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False
+        )
+
+
 def test_chi2_loss_returns_trace(monkeypatch) -> None:
     monkeypatch.setattr(gradient_descent, 'forward_model', _fake_forward_model)
 
@@ -315,8 +412,13 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
     )
 
-    # The synthetic setup has loss ~1.1, so threshold 2.0 is met immediately.
-    # With a 2-epoch streak requirement, training should stop after epoch 2.
+    baseline_loss = float(
+        gradient_descent.chi2_loss(initial_opt_params, fixed_params, data, uncertainties, 147.0)
+    )
+    threshold = baseline_loss + 1.0
+
+    # With a 2-epoch streak requirement and a threshold above baseline, stop
+    # should occur after epoch 2.
     best_opt_params, loss_history, _ = gradient_descent.fit_streamline(
         initial_opt_params,
         fixed_params,
@@ -327,12 +429,12 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
         n_epochs=10,
         info_every=100,
         early_stopping_patience=10,
-        loss_threshold=2.0,
+        loss_threshold=threshold,
         loss_threshold_epochs=2,
     )
 
     assert len(loss_history) == 2
-    assert all(loss <= 2.0 for loss in loss_history)
+    assert all(loss <= threshold for loss in loss_history)
     assert 'omega' in best_opt_params
 
 
