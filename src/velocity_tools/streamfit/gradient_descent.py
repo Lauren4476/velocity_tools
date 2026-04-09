@@ -784,7 +784,36 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
             ra_model, dec_model, v_model, ra_data, dec_data)
         
 
-    ### polar plane of sky / velocity loss
+    ### smooth overlap and weighting - penalty for being outside overlap
+    dmetric_data = extract_streamline.get_distance_metric(ra_data, dec_data)
+    dmetric_model = extract_streamline.get_distance_metric(ra_model, dec_model)
+
+    model_finite = jnp.isfinite(dmetric_model)
+    data_finite = jnp.isfinite(dmetric_data)
+
+    model_min = jnp.min(jnp.where(model_finite, dmetric_model, jnp.inf))
+    model_max = jnp.max(jnp.where(model_finite, dmetric_model, -jnp.inf))
+    data_min = jnp.min(jnp.where(data_finite, dmetric_data, jnp.inf))
+    data_max = jnp.max(jnp.where(data_finite, dmetric_data, -jnp.inf))
+
+    overlap_min = jnp.maximum(model_min, data_min)
+    overlap_max = jnp.minimum(model_max, data_max)
+
+    margin = _to_float64(0.05)  # tune this
+
+    dist_to_overlap = jnp.minimum(
+        jnp.abs(dmetric_data - overlap_min),
+        jnp.abs(dmetric_data - overlap_max)
+    )
+
+    weights = jnp.exp(- (dist_to_overlap / margin) ** 2)
+
+    penalty = jnp.maximum(0.0, overlap_min - dmetric_data) + \
+              jnp.maximum(0.0, dmetric_data - overlap_max)
+
+    chi2_penalty = jnp.sum((penalty / margin) ** 2)
+
+    ### main polar plane of sky / velocity loss
 
     r_data, theta_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
     _, theta_model = extract_streamline.cartesian_to_polar(ra_model_interp, dec_model_interp)
@@ -793,12 +822,10 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     dtheta = extract_streamline._wrap_to_pi(theta_data - theta_model)
     dsky = r_data * dtheta # gives distance in au, with dtheta in rad and r_data in au
     sigma_dsky = jnp.sqrt(ra_sigma**2 + dec_sigma**2) # approximate uncertainty on dsky
-    valid_float = valid.astype(FLOAT_DTYPE)
-    # chi2
-    chi2_dsky = jnp.sum(valid_float * ((dsky / sigma_dsky)**2))
-    chi2_v = jnp.sum(valid_float * (((v_data - v_model_interp) / v_sigma)**2))
-    chi2_total = chi2_dsky + chi2_v
-    # TODO: divide by number of points
+
+    chi2_dsky = jnp.sum(weights * ((dsky / sigma_dsky)**2))
+    chi2_v = jnp.sum(weights * (((v_data - v_model_interp) / v_sigma)**2))
+    chi2_total = chi2_dsky + chi2_v + chi2_penalty
 
 
     if return_trace:
@@ -806,6 +833,8 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
             'chi2_components': {
                 'chi2_dsky': float(chi2_dsky),
                 'chi2_v': float(chi2_v),
+                'chi2_penalty': float(chi2_penalty),
+                'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
             },
             'matching': matching_trace,
