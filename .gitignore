@@ -49,3 +49,6 @@ streamfit_test_output/
 
 # demos
 grad_descent_demo.ipynb
+
+
+.python-version

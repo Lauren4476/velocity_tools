@@ -44,11 +44,16 @@ def theta_abs(theta, r_to_rc=0.1, theta0=np.radians(30), ecc=1.,
     :return: returns the difference between the radius and the predicted one,
            a value of 0 corresponds to a proper streamline
     """
-    cos_ratio = np.cos(theta) / np.cos(theta0)
+    theta_scalar = float(np.ravel(np.asarray(theta))[0])
+    cos_ratio = np.cos(theta_scalar) / np.cos(theta0)
     if cos_ratio > 1.:
-        print('theta0={0}, theta_try={1} --> bad arccos calculation'.format(theta0, theta))
+        print('theta0={0}, theta_try={1} --> bad arccos calculation'.format(theta0, theta_scalar))
         return np.nan
-    xi = np.arccos(cos_ratio) + orb_ang.to(u.rad).value
+    if hasattr(orb_ang, 'to'):
+        orb_ang_rad = orb_ang.to(u.rad).value
+    else:
+        orb_ang_rad = float(np.ravel(np.asarray(orb_ang))[0])
+    xi = np.arccos(cos_ratio) + orb_ang_rad
     geom = np.sin(theta0)**2 / (1 - ecc * np.cos(xi))
     return np.abs(r_to_rc - geom)
 
@@ -133,7 +138,7 @@ def stream_line(r, mass=0.5 * u.Msun, r0=1e4 * u.au, theta0=30 * u.deg,
                                        bounds=theta_bracket,
                                        args=(r_i, rad_theta0, ecc, orb_ang),
                                        options=options_dict)
-            theta_i = result.x
+            theta_i = float(np.ravel(result.x)[0])
             # These prints are to diagnose if the minimization is converging
             # print(ind, result.success)
             # print(result.message, result.status, result.nit)

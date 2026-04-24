@@ -175,15 +175,36 @@ def test_chi2_loss_uses_retained_mask_only(monkeypatch) -> None:
     )
 
     loss, trace = gradient_descent.chi2_loss(
-        opt_params, fixed_params, data, uncertainties, 147.0, return_trace=True
+        opt_params,
+        fixed_params,
+        data,
+        uncertainties,
+        147.0,
+        return_trace=True,
+        loss_method='rthetavel',
     )
 
     # First data point is out of overlap and should be masked out.
     # Model support is also restricted to data range, so r=1.5 is excluded.
     # For retained points: interpolated v at r=0.8 is 16, and r=1.3 clips to
     # the retained upper endpoint value 20.
-    expected = (21.0 - 16.0) ** 2 + (29.0 - 20.0) ** 2
-    assert float(loss) == pytest.approx(expected)
+    overlap_min = trace['matching']['overlap_r_min']
+    overlap_max = trace['matching']['overlap_r_max']
+    margin = 0.05
+    dmetric_data = np.array([0.2, 0.8, 1.3], dtype=np.float64)
+    dist_to_overlap = np.minimum(
+        np.abs(dmetric_data - overlap_min),
+        np.abs(dmetric_data - overlap_max),
+    )
+    weights = np.exp(-((dist_to_overlap / margin) ** 2))
+
+    expected_chi2_v = (
+        weights[0] * (999.0 - 0.0) ** 2
+        + weights[1] * (21.0 - 16.0) ** 2
+        + weights[2] * (29.0 - 20.0) ** 2
+    )
+    assert trace['chi2_components']['chi2_v'] == pytest.approx(expected_chi2_v)
+    assert trace['chi2_components']['chi2_total'] == pytest.approx(float(loss))
     assert trace['matching']['data_retained_count'] == 2
 
 
@@ -240,6 +261,8 @@ def test_chi2_loss_returns_trace(monkeypatch) -> None:
     assert 'matching' in trace
     assert trace['matching']['model_nan_count'] == 0
     assert trace['matching']['model_metric_duplicate_count'] >= 1
+    assert {'chi2_ra', 'chi2_dec', 'chi2_v'}.issubset(trace['chi2_components'].keys())
+    assert 'chi2_r' not in trace['chi2_components']
     assert trace['chi2_components']['chi2_total'] == pytest.approx(float(loss))
 
 
@@ -306,6 +329,9 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     expected_columns = {
         'epoch',
         'loss',
+        'chi2_ra',
+        'chi2_dec',
+        'chi2_v',
         'theta_ref_model',
         'theta_ref_data',
         'model_nan_count',
@@ -313,6 +339,8 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
         'chi2_total',
     }
     assert expected_columns.issubset(set(rows[0].keys()))
+    assert 'chi2_r' not in rows[0].keys()
+    assert 'chi2_theta' not in rows[0].keys()
 
     with open(log_file, newline='') as fh:
         log_rows = list(csv.DictReader(fh))

@@ -22,12 +22,17 @@ jax.config.update("jax_enable_x64", True)
 FLOAT_DTYPE = jnp.float64
 
 
-TRACE_FIELDNAMES = [
+LOSS_METHOD_CHOICES = ('radecvel', 'rthetavel')
+
+LOSS_METHOD_COMPONENT_KEYS = {
+    'radecvel': ('chi2_ra', 'chi2_dec', 'chi2_v'),
+    'rthetavel': ('chi2_r', 'chi2_theta', 'chi2_v'),
+}
+
+TRACE_COMMON_FIELDNAMES = [
     'epoch',
     'loss',
-    'chi2_ra',
-    'chi2_dec',
-    'chi2_v',
+    'chi2_penalty',
     'chi2_total',
     'grad_norm',
     'theta_ref_model',
@@ -49,6 +54,22 @@ TRACE_FIELDNAMES = [
     'overlap_r_min',
     'overlap_r_max',
 ]
+
+
+def _validate_loss_method(loss_method):
+    """Validate and normalize the selected loss method."""
+    if loss_method not in LOSS_METHOD_CHOICES:
+        raise ValueError(
+            f"Unknown loss_method '{loss_method}'. "
+            f"Supported options are: {list(LOSS_METHOD_CHOICES)}"
+        )
+    return loss_method
+
+
+def _trace_fieldnames_for_loss_method(loss_method):
+    """Return trace CSV headers for a given loss method."""
+    loss_method = _validate_loss_method(loss_method)
+    return ['epoch', 'loss', *LOSS_METHOD_COMPONENT_KEYS[loss_method], *TRACE_COMMON_FIELDNAMES[2:]]
 
 
 STREAMLINE_MODEL_PARAM_KEYS = (
@@ -417,20 +438,23 @@ def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=Non
         print(f"  updates={updates_printable}")
 
 
-def _build_trace_row(epoch, loss_value, loss_trace, grad_norm):
+def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
     """Flatten nested trace dictionary into a CSV row."""
+    loss_method = _validate_loss_method(loss_method)
     chi2_components = loss_trace.get('chi2_components', {})
     matching = loss_trace.get('matching', {})
     model_metric_trace = matching.get('distance_metric_model', {})
     data_metric_trace = matching.get('distance_metric_data', {})
 
-
-    return {
+    row = {
         'epoch': epoch,
         'loss': loss_value,
-        'chi2_ra': chi2_components.get('chi2_ra', float('nan')),
-        'chi2_dec': chi2_components.get('chi2_dec', float('nan')),
-        'chi2_v': chi2_components.get('chi2_v', float('nan')),
+    }
+    for component_key in LOSS_METHOD_COMPONENT_KEYS[loss_method]:
+        row[component_key] = chi2_components.get(component_key, float('nan'))
+
+    row.update({
+        'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
         'theta_ref_model': model_metric_trace.get('theta_ref', float('nan')),
@@ -451,7 +475,9 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm):
         'model_retained_count': matching.get('model_retained_count', 0),
         'overlap_r_min': matching.get('overlap_r_min', float('nan')),
         'overlap_r_max': matching.get('overlap_r_max', float('nan')),
-    }
+    })
+
+    return row
 
 
 def forward_model(opt_params, fixed_params, distance_pc):
@@ -736,9 +762,19 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace
 
 
-def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=False):
+def chi2_loss(
+    opt_params,
+    fixed_params,
+    data,
+    uncertainties,
+    distance_pc,
+    return_trace=False,
+    loss_method='radecvel',
+):
     """
-    Compute chi-squared loss between model and data (RA, Dec, LOS velocity)
+    Compute chi-squared loss between model and data using one of two modes:
+    - 'radecvel': RA, Dec, and LOS velocity residuals
+    - 'rthetavel': projected radial distance, polar angle, and LOS velocity residuals
     
     Parameters:
     -----------
@@ -759,6 +795,8 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
     --------
     float: Chi-squared loss value
     """
+
+    loss_method = _validate_loss_method(loss_method)
 
     opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
     distance_pc = _to_float64(distance_pc)
@@ -813,31 +851,57 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
 
     chi2_penalty = jnp.sum((penalty / margin) ** 2)
 
-    ### main polar plane of sky / velocity loss
-
-    r_data, theta_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
-    _, theta_model = extract_streamline.cartesian_to_polar(ra_model_interp, dec_model_interp)
-
-    # angular difference -> arc length distance
-    dtheta = extract_streamline._wrap_to_pi(theta_data - theta_model)
-    dsky = r_data * dtheta # gives distance in au, with dtheta in rad and r_data in au
-    sigma_dsky = jnp.sqrt(ra_sigma**2 + dec_sigma**2) # approximate uncertainty on dsky
-
-    chi2_dsky = jnp.sum(weights * ((dsky / sigma_dsky)**2))
     chi2_v = jnp.sum(weights * (((v_data - v_model_interp) / v_sigma)**2))
-    chi2_total = chi2_dsky + chi2_v + chi2_penalty
+
+    if loss_method == 'radecvel':
+        chi2_ra = jnp.sum(weights * (((ra_data - ra_model_interp) / ra_sigma)**2))
+        chi2_dec = jnp.sum(weights * (((dec_data - dec_model_interp) / dec_sigma)**2))
+        chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
+    else:
+        # r/theta are defined on the projected plane of the sky from (RA, Dec).
+        r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
+            ra_model_interp,
+            dec_model_interp,
+        )
+
+        dtheta = extract_streamline._wrap_to_pi(theta_proj_data - theta_proj_model)
+
+        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+        r_eps = _to_float64(1e-8)
+        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.maximum(sigma_theta, r_eps)
+
+        chi2_r = jnp.sum(weights * (((r_proj_data - r_proj_model) / sigma_r)**2))
+        chi2_theta = jnp.sum(weights * ((dtheta / sigma_theta)**2))
+        chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
 
 
     if return_trace:
-        loss_trace = {
-            'chi2_components': {
-                'chi2_dsky': float(chi2_dsky),
+        if loss_method == 'radecvel':
+            chi2_components = {
+                'chi2_ra': float(chi2_ra),
+                'chi2_dec': float(chi2_dec),
                 'chi2_v': float(chi2_v),
                 'chi2_penalty': float(chi2_penalty),
                 'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
-            },
+            }
+        else:
+            chi2_components = {
+                'chi2_r': float(chi2_r),
+                'chi2_theta': float(chi2_theta),
+                'chi2_v': float(chi2_v),
+                'chi2_penalty': float(chi2_penalty),
+                'overlap_width': float(overlap_max - overlap_min),
+                'chi2_total': float(chi2_total),
+            }
+
+        loss_trace = {
+            'chi2_components': chi2_components,
             'matching': matching_trace,
+            'loss_method': loss_method,
         }
         return chi2_total, loss_trace
 
@@ -875,6 +939,7 @@ def estimate_parameter_errors(
     data,
     uncertainties,
     distance_pc,
+    loss_method='radecvel',
     gradient_tol=1e-1,
     normalization_spec=None,
 ):
@@ -908,10 +973,18 @@ def estimate_parameter_errors(
 
     # convert dict -> vector
     params_vec, keys = _params_dict_to_vector(best_opt_params)
+    loss_method = _validate_loss_method(loss_method)
 
     def loss_vec(theta_vec):
         params = _vector_to_params_dict(theta_vec, keys)
-        return chi2_loss(params, fixed_params, data, uncertainties, distance_pc)
+        return chi2_loss(
+            params,
+            fixed_params,
+            data,
+            uncertainties,
+            distance_pc,
+            loss_method=loss_method,
+        )
 
     # Check gradient magnitude at best-fit parameters in normalized space.
     if gradient_tol is not None:
@@ -935,7 +1008,14 @@ def estimate_parameter_errors(
             def norm_loss_vec(theta_norm_vec):
                 norm_params = _vector_to_params_dict(theta_norm_vec, keys)
                 physical_params = _denormalize_opt_params(norm_params, normalization_spec)
-                return chi2_loss(physical_params, fixed_params, data, uncertainties, distance_pc)
+                return chi2_loss(
+                    physical_params,
+                    fixed_params,
+                    data,
+                    uncertainties,
+                    distance_pc,
+                    loss_method=loss_method,
+                )
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
             norm_grad_norm = float(_gradient_l2_norm(norm_grad_vec))
@@ -971,6 +1051,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    gradient_tol=None, gradient_tol_epochs=1,
                    early_stopping_patience=50,
                    log_file=None, trace_file=None, trace_every=1,
+                   loss_method='radecvel',
                    output_uncertainties=False,
                    ):
     """
@@ -1026,6 +1107,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     trace_every : int
         Frequency (in epochs) for writing rows to trace_file.
         Must be >= 1.
+    loss_method : str
+        Loss definition to use. Options:
+        - 'radecvel': optimize RA, Dec, and velocity residuals.
+        - 'rthetavel': optimize radial distance, polar angle, and velocity residuals.
+        Both options use the same model-data matching and overlap penalty.
     loss_threshold : float or None
         Optional absolute loss threshold for threshold-based stopping.
         If provided, optimization stops after loss is <= loss_threshold for
@@ -1050,6 +1136,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     list: Loss history
     """
     # Initialize parameters
+    loss_method = _validate_loss_method(loss_method)
     opt_params, fixed_params = _sanitize_param_partition(
         initial_opt_params,
         fixed_params,
@@ -1078,7 +1165,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
     def loss_from_normalized(norm_opt_params):
         physical_opt_params = _denormalize_opt_params(norm_opt_params, normalization_spec)
-        return chi2_loss(physical_opt_params, fixed_params, data, uncertainties, distance_pc)
+        return chi2_loss(
+            physical_opt_params,
+            fixed_params,
+            data,
+            uncertainties,
+            distance_pc,
+            loss_method=loss_method,
+        )
 
     # Create gradient function in normalized space.
     loss_and_grad_fn = value_and_grad(loss_from_normalized)
@@ -1128,11 +1222,15 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     trace_csv_writer = None
     if trace_file is not None:
         trace_csv_file = open(trace_file, 'w', newline='')
-        trace_csv_writer = csv.DictWriter(trace_csv_file, fieldnames=TRACE_FIELDNAMES)
+        trace_csv_writer = csv.DictWriter(
+            trace_csv_file,
+            fieldnames=_trace_fieldnames_for_loss_method(loss_method),
+        )
         trace_csv_writer.writeheader()
         trace_csv_file.flush()
     
     print(f"Starting optimization with {n_epochs} epochs...")
+    print(f"Loss method: {loss_method}")
     print(f"Optimizing parameters: {opt_param_keys}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     if loss_threshold is not None:
@@ -1161,10 +1259,23 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
     if trace_csv_writer is not None:
         initial_loss_for_trace, initial_trace = chi2_loss(
-            opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
+            opt_params,
+            fixed_params,
+            data,
+            uncertainties,
+            distance_pc,
+            return_trace=True,
+            loss_method=loss_method,
+        )
         initial_norm_grads = loss_and_grad_fn(opt_params_norm)[1]
         initial_grad_norm = float(_gradient_l2_norm(initial_norm_grads))
-        initial_trace_row = _build_trace_row(0, float(initial_loss_for_trace), initial_trace, initial_grad_norm)
+        initial_trace_row = _build_trace_row(
+            0,
+            float(initial_loss_for_trace),
+            initial_trace,
+            initial_grad_norm,
+            loss_method,
+        )
         trace_csv_writer.writerow(initial_trace_row)
         trace_csv_file.flush()
     
@@ -1191,10 +1302,26 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Compute loss at updated parameters (post-update)
             if trace_csv_writer is not None and epoch % trace_every == 0:
                 loss_eval, loss_trace = chi2_loss(
-                    opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=True)
+                    opt_params,
+                    fixed_params,
+                    data,
+                    uncertainties,
+                    distance_pc,
+                    return_trace=True,
+                    loss_method=loss_method,
+                )
                 loss_value = float(loss_eval)
             else:
-                loss_value = float(chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc))
+                loss_value = float(
+                    chi2_loss(
+                        opt_params,
+                        fixed_params,
+                        data,
+                        uncertainties,
+                        distance_pc,
+                        loss_method=loss_method,
+                    )
+                )
                 loss_trace = None
         
             # Track loss
@@ -1212,7 +1339,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 csv_file.flush()  # Ensure data is written after each epoch
 
             if trace_csv_writer is not None and loss_trace is not None:
-                trace_row = _build_trace_row(epoch, loss_value, loss_trace, grad_norm)
+                trace_row = _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method)
                 trace_csv_writer.writerow(trace_row)
                 trace_csv_file.flush()
         
@@ -1290,6 +1417,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             data,
             uncertainties,
             distance_pc,
+            loss_method=loss_method,
             gradient_tol=gradient_tol,
             normalization_spec=normalization_spec,
         )
