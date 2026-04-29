@@ -844,18 +844,17 @@ def chi2_loss(
         jnp.abs(dmetric_data - overlap_max)
     )
 
-    weights = jnp.exp(- (dist_to_overlap / margin) ** 2)
 
     penalty = jnp.maximum(0.0, overlap_min - dmetric_data) + \
               jnp.maximum(0.0, dmetric_data - overlap_max)
 
     chi2_penalty = jnp.sum((penalty / margin) ** 2)
 
-    chi2_v = jnp.sum(weights * (((v_data - v_model_interp) / v_sigma)**2))
+    chi2_v = jnp.sum((((v_data - v_model_interp) / v_sigma)**2))
 
     if loss_method == 'radecvel':
-        chi2_ra = jnp.sum(weights * (((ra_data - ra_model_interp) / ra_sigma)**2))
-        chi2_dec = jnp.sum(weights * (((dec_data - dec_model_interp) / dec_sigma)**2))
+        chi2_ra = jnp.sum((((ra_data - ra_model_interp) / ra_sigma)**2))
+        chi2_dec = jnp.sum((((dec_data - dec_model_interp) / dec_sigma)**2))
         chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
@@ -873,8 +872,8 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        chi2_r = jnp.sum(weights * (((r_proj_data - r_proj_model) / sigma_r)**2))
-        chi2_theta = jnp.sum(weights * ((dtheta / sigma_theta)**2))
+        chi2_r = jnp.sum((((r_proj_data - r_proj_model) / sigma_r)**2))
+        chi2_theta = jnp.sum(((dtheta / sigma_theta)**2))
         chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
 
 
