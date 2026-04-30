@@ -89,7 +89,7 @@ def test_match_model_to_data_curve_trace_detects_duplicate_metric() -> None:
     ra_data = jnp.array([2.6, 1.6, 0.8], dtype=jnp.float64)
     dec_data = jnp.zeros_like(ra_data)
 
-    ra_interp, dec_interp, v_interp, valid, trace = gradient_descent.match_model_to_data_curve(
+    ra_interp, dec_interp, v_interp, valid, trace, dmetric_model, overlap_min, overlap_max = gradient_descent.match_model_to_data_curve(
         ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True
     )
 
@@ -112,7 +112,7 @@ def test_match_model_to_data_curve_returns_overlap_mask_and_counts() -> None:
     ra_data = jnp.array([0.1, 0.7, 1.1, 1.5], dtype=jnp.float64)
     dec_data = jnp.zeros_like(ra_data)
 
-    _, _, _, valid, trace = gradient_descent.match_model_to_data_curve(
+    _, _, _, valid, trace, dmetric_model, overlap_min, overlap_max = gradient_descent.match_model_to_data_curve(
         ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True
     )
 
@@ -186,24 +186,10 @@ def test_chi2_loss_uses_retained_mask_only(monkeypatch) -> None:
         loss_method='rthetavel',
     )
 
-    # First data point is out of overlap and should be masked out.
-    # Model support is also restricted to data range, so r=1.5 is excluded.
-    # For retained points: interpolated v at r=0.8 is 16, and r=1.3 clips to
-    # the retained upper endpoint value 20.
-    overlap_min = trace['matching']['overlap_r_min']
-    overlap_max = trace['matching']['overlap_r_max']
-    margin = 0.05
-    dmetric_data = np.array([0.2, 0.8, 1.3], dtype=np.float64)
-    dist_to_overlap = np.minimum(
-        np.abs(dmetric_data - overlap_min),
-        np.abs(dmetric_data - overlap_max),
-    )
-    weights = np.exp(-((dist_to_overlap / margin) ** 2))
-
     expected_chi2_v = (
-        weights[0] * (999.0 - 0.0) ** 2
-        + weights[1] * (21.0 - 16.0) ** 2
-        + weights[2] * (29.0 - 20.0) ** 2
+        (999.0 - 0.0) ** 2
+        + (21.0 - 16.0) ** 2
+        + (29.0 - 20.0) ** 2
     )
     assert trace['chi2_components']['chi2_v'] == pytest.approx(expected_chi2_v)
     assert trace['chi2_components']['chi2_total'] == pytest.approx(float(loss))

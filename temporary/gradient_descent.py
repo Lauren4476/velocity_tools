@@ -576,6 +576,14 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         dmetric_data = extract_streamline.get_distance_metric(
             ra_data, dec_data) 
 
+    # compute simple min/max for overlap reporting
+    model_min = jnp.min(dmetric_model)
+    model_max = jnp.max(dmetric_model)
+    data_min = jnp.min(dmetric_data)
+    data_max = jnp.max(dmetric_data)
+    overlap_min = jnp.maximum(model_min, data_min)
+    overlap_max = jnp.minimum(model_max, data_max)
+
     # sort model once
     sort_idx = jnp.argsort(dmetric_model)
     d_model_sorted = dmetric_model[sort_idx]
@@ -593,7 +601,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     valid = jnp.ones(n_points, dtype=bool)
 
     if not return_trace:
-        return ra_model_interp, dec_model_interp, v_model_interp, valid
+        return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max
 
     model_nan_mask = jnp.isnan(ra_model) | jnp.isnan(dec_model) | jnp.isnan(v_model)
     model_nan_count = int(jnp.sum(model_nan_mask))
@@ -627,7 +635,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         'distance_metric_data': dmetric_data_trace,
     }
 
-    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace
+    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max
 
 
 def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return_trace=False):
@@ -671,11 +679,13 @@ def chi2_loss(opt_params, fixed_params, data, uncertainties, distance_pc, return
 
     # Match model to data using arc-length parameterisation
     if return_trace:
-        ra_model_interp, dec_model_interp, v_model_interp, _, matching_trace = match_model_to_data_curve(
-            ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
+        ra_model_interp, dec_model_interp, v_model_interp, _, matching_trace, dmetric_model, overlap_min, overlap_max = (
+            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
+        )
     else:
-        ra_model_interp, dec_model_interp, v_model_interp, _ = match_model_to_data_curve(
-            ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model_interp, dec_model_interp, v_model_interp, _, dmetric_model, overlap_min, overlap_max = (
+            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        )
         
     #### polar plane of sky / velocity loss
     

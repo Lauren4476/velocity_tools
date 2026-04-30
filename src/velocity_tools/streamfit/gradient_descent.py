@@ -719,7 +719,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     valid = data_keep
 
     if not return_trace:
-        return ra_model_interp, dec_model_interp, v_model_interp, valid
+        return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max
 
     model_nan_mask = ~model_finite_mask
     model_nan_count = int(jnp.sum(model_nan_mask))
@@ -759,7 +759,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         'distance_metric_data': dmetric_data_trace,
     }
 
-    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace
+    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max
 def chi2_loss(
     opt_params,
     fixed_params,
@@ -816,46 +816,30 @@ def chi2_loss(
 
     # Match model to data using arc-length parameterisation
     if return_trace:
-        ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace = match_model_to_data_curve(
-            ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
+        ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max = (
+            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
+        )
     else:
-        ra_model_interp, dec_model_interp, v_model_interp, valid = match_model_to_data_curve(
-            ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max = (
+            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        )
         
 
     ### smooth overlap and weighting - penalty for being outside overlap
     dmetric_data = prepared_data.dmetric_data
-    dmetric_model = extract_streamline.get_distance_metric(ra_model, dec_model)
-
-    model_finite = jnp.isfinite(dmetric_model)
-    data_finite = prepared_data.data_finite_mask
-
-    model_min = jnp.min(jnp.where(model_finite, dmetric_model, jnp.inf))
-    model_max = jnp.max(jnp.where(model_finite, dmetric_model, -jnp.inf))
-    data_min = prepared_data.data_min
-    data_max = prepared_data.data_max
-
-    overlap_min = jnp.maximum(model_min, data_min)
-    overlap_max = jnp.minimum(model_max, data_max)
 
     margin = _to_float64(0.05)  # tune this
-
-    dist_to_overlap = jnp.minimum(
-        jnp.abs(dmetric_data - overlap_min),
-        jnp.abs(dmetric_data - overlap_max)
-    )
-
 
     penalty = jnp.maximum(0.0, overlap_min - dmetric_data) + \
               jnp.maximum(0.0, dmetric_data - overlap_max)
 
     chi2_penalty = jnp.sum((penalty / margin) ** 2)
 
-    chi2_v = jnp.sum((((v_data - v_model_interp) / v_sigma)**2))
+    chi2_v = jnp.sum((((v_data - v_model_interp) / v_sigma) ** 2))
 
     if loss_method == 'radecvel':
-        chi2_ra = jnp.sum((((ra_data - ra_model_interp) / ra_sigma)**2))
-        chi2_dec = jnp.sum((((dec_data - dec_model_interp) / dec_sigma)**2))
+        chi2_ra = jnp.sum((((ra_data - ra_model_interp) / ra_sigma) ** 2))
+        chi2_dec = jnp.sum((((dec_data - dec_model_interp) / dec_sigma) ** 2))
         chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
@@ -875,8 +859,8 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        chi2_r = jnp.sum((((r_proj_data - r_proj_model) / sigma_r)**2))
-        chi2_theta = jnp.sum(((dtheta / sigma_theta)**2))
+        chi2_r = jnp.sum((((r_proj_data - r_proj_model) / sigma_r) ** 2))
+        chi2_theta = jnp.sum(((dtheta / sigma_theta) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
 
 
