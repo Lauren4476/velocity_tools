@@ -147,6 +147,7 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     :param v_r0: Initial radial velocity, km/s
     :return: theta, radians
     """
+    r = jnp.asarray(r, dtype=FLOAT_DTYPE)
     rc = r_cent(mass=mass, omega=omega, r0=r0)
 
     # mu and nu are dimensionless
@@ -163,27 +164,14 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     # at initial position r_to_rc = r0/rc = 1/mu
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
 
-    # Initialise arrays
-    orb_ang = jnp.zeros_like(r)
-    theta = jnp.zeros_like(r)
-    phi = jnp.zeros_like(r)
-
-    # get initial orb_ang at r0
-    # orb_ang is varphi in Mendoza+2009
-    #at initial position r_to_rc = r0/rc = 1/mu
-    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-
-    for ind in range(len(r)):
-        r_i = (r[ind] / rc)
-        orb_ang_i = get_orb_ang(r_to_rc=r_i, theta0=theta0, ecc=ecc)
-        orb_ang = orb_ang.at[ind].set(orb_ang_i)
-        theta_i = get_theta(theta0, orb_ang_i, orb_ang0)
-        theta = theta.at[ind].set(theta_i)
-        dphi = get_dphi(theta_i, theta0=theta0)
-        phi = phi.at[ind].set(phi0 + dphi)
+    # Vectorized streamline computation over the full radius array.
+    r_to_rc = r / rc
+    orb_ang = get_orb_ang(r_to_rc=r_to_rc, theta0=theta0, ecc=ecc)
+    theta = get_theta(theta0, orb_ang, orb_ang0)
+    phi = phi0 + get_dphi(theta, theta0=theta0)
 
     # remove values where r_to_rc < 0.5 (inside centrifugal radius)
-    mask = (r / rc) >= 0.5
+    mask = r_to_rc >= 0.5
     orb_ang = jnp.where(mask, orb_ang, jnp.nan)
     theta = jnp.where(mask, theta, jnp.nan)
     phi = jnp.where(mask, phi, jnp.nan)
