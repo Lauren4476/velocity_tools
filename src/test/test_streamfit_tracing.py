@@ -174,12 +174,14 @@ def test_chi2_loss_uses_retained_mask_only(monkeypatch) -> None:
         jnp.array([1.0, 1.0, 1.0], dtype=jnp.float64),
     )
 
+    prepared_data = extract_streamline.prepare_data(data, uncertainties)
     loss, trace = gradient_descent.chi2_loss(
         opt_params,
         fixed_params,
         data,
         uncertainties,
         147.0,
+        prepared_data,
         return_trace=True,
         loss_method='rthetavel',
     )
@@ -251,8 +253,9 @@ def test_chi2_loss_returns_trace(monkeypatch) -> None:
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
     )
 
+    prepared_data = extract_streamline.prepare_data(data, uncertainties)
     loss, trace = gradient_descent.chi2_loss(
-        opt_params, fixed_params, data, uncertainties, 147.0, return_trace=True
+        opt_params, fixed_params, data, uncertainties, 147.0, prepared_data, return_trace=True
     )
 
     assert np.isfinite(float(loss))
@@ -440,8 +443,9 @@ def test_fit_streamline_stops_after_threshold_streak(monkeypatch) -> None:
         jnp.array([0.2, 0.2, 0.2], dtype=jnp.float64),
     )
 
+    prepared_data = extract_streamline.prepare_data(data, uncertainties)
     baseline_loss = float(
-        gradient_descent.chi2_loss(initial_opt_params, fixed_params, data, uncertainties, 147.0)
+        gradient_descent.chi2_loss(initial_opt_params, fixed_params, data, uncertainties, 147.0, prepared_data)
     )
     threshold = baseline_loss + 1.0
 

@@ -760,14 +760,13 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     }
 
     return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace
-
-
 def chi2_loss(
     opt_params,
     fixed_params,
     data,
     uncertainties,
     distance_pc,
+    prepared_data,
     return_trace=False,
     loss_method='radecvel',
 ):
@@ -789,9 +788,12 @@ def chi2_loss(
         Uncertainties on the data
     distance_pc : float
         Distance to source in parsecs
+    prepared_data : PreparedData
+        Precomputed data-only quantities (distance metrics, bounds, polar coords).
+        Created via extract_streamline.prepare_data(data, uncertainties).
 
         
-    Returns:
+            Created via extract_streamline.prepare_data(data, uncertainties).
     --------
     float: Chi-squared loss value
     """
@@ -801,13 +803,12 @@ def chi2_loss(
     opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
     distance_pc = _to_float64(distance_pc)
 
-    ra_data, dec_data, v_data = _coerce_data_tuple_float64(data)
-    ra_sigma, dec_sigma, v_sigma = _coerce_data_tuple_float64(uncertainties)
-    # small values to avoid division by zero
-    eps = _to_float64(1e-8)
-    ra_sigma = jnp.maximum(ra_sigma, eps)
-    dec_sigma = jnp.maximum(dec_sigma, eps)
-    v_sigma = jnp.maximum(v_sigma, eps)
+    ra_data = prepared_data.ra_data
+    dec_data = prepared_data.dec_data
+    v_data = prepared_data.v_data
+    ra_sigma = prepared_data.ra_sigma_safe
+    dec_sigma = prepared_data.dec_sigma_safe
+    v_sigma = prepared_data.v_sigma_safe
 
     # Run forward model
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
@@ -823,16 +824,16 @@ def chi2_loss(
         
 
     ### smooth overlap and weighting - penalty for being outside overlap
-    dmetric_data = extract_streamline.get_distance_metric(ra_data, dec_data)
+    dmetric_data = prepared_data.dmetric_data
     dmetric_model = extract_streamline.get_distance_metric(ra_model, dec_model)
 
     model_finite = jnp.isfinite(dmetric_model)
-    data_finite = jnp.isfinite(dmetric_data)
+    data_finite = prepared_data.data_finite_mask
 
     model_min = jnp.min(jnp.where(model_finite, dmetric_model, jnp.inf))
     model_max = jnp.max(jnp.where(model_finite, dmetric_model, -jnp.inf))
-    data_min = jnp.min(jnp.where(data_finite, dmetric_data, jnp.inf))
-    data_max = jnp.max(jnp.where(data_finite, dmetric_data, -jnp.inf))
+    data_min = prepared_data.data_min
+    data_max = prepared_data.data_max
 
     overlap_min = jnp.maximum(model_min, data_min)
     overlap_max = jnp.minimum(model_max, data_max)
@@ -858,7 +859,9 @@ def chi2_loss(
         chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
-        r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+        # Use precomputed data coordinates
+        r_proj_data = prepared_data.r_proj_data
+        theta_proj_data = prepared_data.theta_proj_data
         r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
             ra_model_interp,
             dec_model_interp,
@@ -938,6 +941,7 @@ def estimate_parameter_errors(
     data,
     uncertainties,
     distance_pc,
+    prepared_data,
     loss_method='radecvel',
     gradient_tol=1e-1,
     normalization_spec=None,
@@ -947,6 +951,8 @@ def estimate_parameter_errors(
 
     Parameters
     ----------
+    prepared_data : PreparedData
+        Precomputed data-only quantities (created via extract_streamline.prepare_data).
     gradient_tol : float or None
         Tolerance on gradient norm in normalized space. If provided and
         normalized-space gradient norm > gradient_tol at best params, a
@@ -982,6 +988,7 @@ def estimate_parameter_errors(
             data,
             uncertainties,
             distance_pc,
+            prepared_data,
             loss_method=loss_method,
         )
 
@@ -1013,6 +1020,7 @@ def estimate_parameter_errors(
                     data,
                     uncertainties,
                     distance_pc,
+                    prepared_data,
                     loss_method=loss_method,
                 )
 
@@ -1162,6 +1170,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
     opt_state = solver.init(opt_params_norm)
 
+    # Precompute data-only quantities once before optimization loop
+    prepared_data = extract_streamline.prepare_data(data, uncertainties)
+
     def loss_from_normalized(norm_opt_params):
         physical_opt_params = _denormalize_opt_params(norm_opt_params, normalization_spec)
         return chi2_loss(
@@ -1171,6 +1182,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             uncertainties,
             distance_pc,
             loss_method=loss_method,
+            prepared_data=prepared_data,
         )
 
     # Create gradient function in normalized space.
@@ -1256,6 +1268,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         csv_writer.writerow(row)
         csv_file.flush()
 
+    # Precompute data-only quantities once before optimization loop
+    prepared_data = extract_streamline.prepare_data(data, uncertainties)
+    
     if trace_csv_writer is not None:
         initial_loss_for_trace, initial_trace = chi2_loss(
             opt_params,
@@ -1265,6 +1280,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             distance_pc,
             return_trace=True,
             loss_method=loss_method,
+            prepared_data=prepared_data,
         )
         initial_norm_grads = loss_and_grad_fn(opt_params_norm)[1]
         initial_grad_norm = float(_gradient_l2_norm(initial_norm_grads))
@@ -1308,6 +1324,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                     distance_pc,
                     return_trace=True,
                     loss_method=loss_method,
+                    prepared_data=prepared_data,
                 )
                 loss_value = float(loss_eval)
             else:
@@ -1319,6 +1336,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                         uncertainties,
                         distance_pc,
                         loss_method=loss_method,
+                        prepared_data=prepared_data,
                     )
                 )
                 loss_trace = None
@@ -1416,6 +1434,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             data,
             uncertainties,
             distance_pc,
+            prepared_data,
             loss_method=loss_method,
             gradient_tol=gradient_tol,
             normalization_spec=normalization_spec,

@@ -11,7 +11,17 @@ Then it will extract a streamline from this cube.
 
 import numpy as np
 from astropy import units as u
+from collections import namedtuple
 import jax.numpy as jnp
+
+
+PreparedData = namedtuple('PreparedData', [
+    'ra_data', 'dec_data', 'v_data',
+    'ra_sigma_safe', 'dec_sigma_safe', 'v_sigma_safe',
+    'dmetric_data', 'data_finite_mask',
+    'data_min', 'data_max',
+    'r_proj_data', 'theta_proj_data',
+])
 
 
 def _wrap_to_pi(angle):
@@ -173,5 +183,60 @@ def cartesian_to_polar(x, y):
     theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 
     return (r, theta)
+
+
+def prepare_data(data, uncertainties):
+    '''
+    Precompute all data-only quantities used by streamfit loss evaluation.
+
+    Parameters
+    ----------
+    data : tuple of arrays (ra_data, dec_data, v_data)
+        Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
+    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
+        Uncertainties on the data
+
+    Returns
+    -------
+    PreparedData
+        Container with precomputed data-only quantities.
+    '''
+    ra_data = jnp.asarray(data[0], dtype=jnp.float64)
+    dec_data = jnp.asarray(data[1], dtype=jnp.float64)
+    v_data = jnp.asarray(data[2], dtype=jnp.float64)
+
+    ra_sigma = jnp.asarray(uncertainties[0], dtype=jnp.float64)
+    dec_sigma = jnp.asarray(uncertainties[1], dtype=jnp.float64)
+    v_sigma = jnp.asarray(uncertainties[2], dtype=jnp.float64)
+
+    eps = jnp.asarray(1e-8, dtype=jnp.float64)
+    ra_sigma_safe = jnp.maximum(ra_sigma, eps)
+    dec_sigma_safe = jnp.maximum(dec_sigma, eps)
+    v_sigma_safe = jnp.maximum(v_sigma, eps)
+
+    dmetric_data = get_distance_metric(ra_data, dec_data)
+    data_finite_mask = jnp.isfinite(ra_data) & jnp.isfinite(dec_data) & jnp.isfinite(dmetric_data)
+
+    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
+    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, -jnp.inf)
+    data_min = jnp.min(data_metric_for_min)
+    data_max = jnp.max(data_metric_for_max)
+
+    r_proj_data, theta_proj_data = cartesian_to_polar(ra_data, dec_data)
+
+    return PreparedData(
+        ra_data=ra_data,
+        dec_data=dec_data,
+        v_data=v_data,
+        ra_sigma_safe=ra_sigma_safe,
+        dec_sigma_safe=dec_sigma_safe,
+        v_sigma_safe=v_sigma_safe,
+        dmetric_data=dmetric_data,
+        data_finite_mask=data_finite_mask,
+        data_min=data_min,
+        data_max=data_max,
+        r_proj_data=r_proj_data,
+        theta_proj_data=theta_proj_data,
+    )
 
 
