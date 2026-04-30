@@ -314,7 +314,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     with open(trace_file, newline='') as fh:
         rows = list(csv.DictReader(fh))
 
-    assert len(rows) == 4  # epoch 0 + 3 optimization epochs
+    assert len(rows) == 3  # epochs 1, 2, 3 with trace_every=1 (no epoch 0 in trace)
     expected_columns = {
         'epoch',
         'loss',
@@ -334,7 +334,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     with open(log_file, newline='') as fh:
         log_rows = list(csv.DictReader(fh))
 
-    assert len(log_rows) == 4  # epoch 0 + 3 optimization epochs
+    assert len(log_rows) == 4  # epochs 0, 1, 2, 3 (0 = initial, 1-3 = after updates 1-3)
     expected_log_columns = {
         'epoch',
         'loss',
