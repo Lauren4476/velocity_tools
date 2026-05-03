@@ -11,7 +11,6 @@ import jax.numpy as jnp
 from jax import jit, grad, value_and_grad, lax
 import jax
 import optax
-from skimage import data
 from . import stream_lines_grad
 from . import extract_streamline
 import csv
@@ -558,11 +557,6 @@ def forward_fill_nans(arr):
     """
     arr = _to_float64(arr)
     is_nan = jnp.isnan(arr)
-    num_nans = int(jnp.sum(is_nan))
-    # if num_nans > 0:
-    #     jax.debug.print(f"[forward_fill_nans] Found {num_nans} NaN values in array of size {arr.size}")
-    # else:
-    #     jax.debug.print("[forward_fill_nans] No forward filling needed")
     arr_clean = jnp.nan_to_num(arr, nan=0.0)
     
     # Forward-fill using scan

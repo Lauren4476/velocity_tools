@@ -10,7 +10,6 @@ The assumed input units are:
 '''
 
 import astropy.units as u
-from scipy import optimize
 from ..helper_functions import *
 #from astropy.constants import G
 import jax
@@ -19,9 +18,7 @@ from jax import lax
 from jax import debug
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", False)
-from jax.scipy.optimize import minimize # may not be needed if using jaxopt
-from jaxopt import LBFGSB # may not be needed if using custom Newton method
-
+from typing import NamedTuple
 #
 # Implementation of stream lines using the prescription from
 # Mendoza et al. (2009)  doi:10.1111/j.1365-2966.2008.14210.x
@@ -30,6 +27,17 @@ from jaxopt import LBFGSB # may not be needed if using custom Newton method
 # Constants 
 eps = 1e-8 # small value to avoid division by zero
 FLOAT_DTYPE = jnp.float64
+
+# Quantities
+class StreamState(NamedTuple):
+    """Important streamline quantities for easy reuse throughout file."""
+
+    rc: jnp.ndarray
+    mu: jnp.ndarray
+    nu: jnp.ndarray
+    epsilon: jnp.ndarray
+    ecc: jnp.ndarray
+    vk0: jnp.ndarray
 
 
 # JAX functions (no Astropy units allowed here)
@@ -44,7 +52,7 @@ def v_k(radius, mass=0.5):
     :return: v_k, km/s
     """
     arg = G * mass / radius
-    return jnp.power(arg, 0.5)
+    return jnp.sqrt(arg)
 
 def r_cent(mass, omega=1e-14, r0=1e4):
     """
@@ -58,8 +66,41 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     """
     r_cent = (jnp.power(r0, 4) * jnp.power(omega, 2) / (G * mass)) # in au^3 km^-2
     r_cent_au = r_cent * (jnp.power(au_in_km, 2)) # in au
-    # jax.debug.print("rc={0} au", r_cent_au)
     return r_cent_au
+
+
+def build_stream_state(mass, r0, theta0, omega, v_r0):
+    """
+    Precompute streamer quantities reused throughout file.
+
+    Returns
+    -------
+    StreamState
+    """
+
+    mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
+    r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
+    theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
+    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
+    v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
+
+    rc = r_cent(mass=mass, omega=omega, r0=r0)
+    mu = rc / r0
+    nu = v_r0 * jnp.sqrt(rc / (G * mass))
+    sin_theta0 = jnp.sin(theta0)
+    sin_theta0_sq = jnp.power(sin_theta0, 2)
+    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * sin_theta0_sq - 2 * mu
+    ecc = jnp.sqrt(1.0 + epsilon * sin_theta0_sq)
+    vk0 = v_k(rc, mass=mass)
+
+    return StreamState(
+        rc=rc,
+        mu=mu,
+        nu=nu,
+        epsilon=epsilon,
+        ecc=ecc,
+        vk0=vk0,
+    )
 
 def safe_arccos(x, eps=1e-8):
     """
@@ -71,8 +112,6 @@ def safe_arccos(x, eps=1e-8):
     :return: arccos of clipped input
     """
     x = jnp.asarray(x)
-    if not jnp.issubdtype(x.dtype, jnp.floating):
-        x = x.astype(FLOAT_DTYPE)
     x = x.astype(FLOAT_DTYPE)
 
     # Keep away from +/-1 by at least a few ULPs of the active dtype.
@@ -80,12 +119,8 @@ def safe_arccos(x, eps=1e-8):
     eps_user = jnp.asarray(eps, dtype=x.dtype)
     eps_floor = jnp.asarray(32.0 * jnp.finfo(x.dtype).eps, dtype=x.dtype)
     eps_eff = jnp.maximum(eps_user, eps_floor)
-    #jax.debug.print("eps used = {eps_eff}", eps_eff=eps_eff)
 
     x_safe = jnp.clip(x, -1.0 + eps_eff, 1.0 - eps_eff)
-    # print if clipping is happening
-    # if jnp.any(x < -1.0 + eps_eff) or jnp.any(x > 1.0 - eps_eff):
-    #     jax.debug.print("Warning: input to arccos was clipped. Original x={x}, clipped x={x_safe}", x=x, x_safe=x_safe)
     return jnp.arccos(x_safe)
 
 
@@ -130,8 +165,7 @@ def get_dphi(theta, theta0=jnp.radians(30)):
 
 
 #TODO: come back and check this function at end
-def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15),
-                omega=1e-14, v_r0=0):
+def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     """
     It calculates the stream line following Mendoza et al. (2009),
     only for r < r0. Point r = r0 is handled outside the function.
@@ -148,17 +182,9 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     :return: theta, radians
     """
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
-    rc = r_cent(mass=mass, omega=omega, r0=r0)
-
-    # mu and nu are dimensionless
-    mu = (rc / r0)
-    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
-    # epsilon is the dimensionless energy
-    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
-    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
-    # jax.debug.print("ecc={0}", ecc)
-    # jax.debug.print("mu={0}", mu)
-    # jax.debug.print("theta0={0}", theta0)
+    rc = stream_state.rc
+    mu = stream_state.mu
+    ecc = stream_state.ecc
 
     # orb_ang is varphi in Mendoza+2009
     # at initial position r_to_rc = r0/rc = 1/mu
@@ -176,15 +202,17 @@ def stream_line(r, mass=0.5, r0=1e4, theta0=jnp.radians(30), phi0=jnp.radians(15
     theta = jnp.where(mask, theta, jnp.nan)
     phi = jnp.where(mask, phi, jnp.nan)
 
-    # jax.debug.print("orb_ang = {orb_ang}", orb_ang=orb_ang)
-    # jax.debug.print("theta = {theta}", theta=theta)
-    # jax.debug.print("phi = {phi}", phi=phi)
     
     return orb_ang, theta, phi #in radians
 
 
-def stream_line_vel(r, theta, orb_ang, mass=0.5, r0=1e4, theta0=jnp.radians(30),
-                omega=1e-14, v_r0=0):
+def stream_line_vel(
+    r,
+    theta,
+    orb_ang,
+    stream_state,
+    theta0=jnp.radians(30),
+):
     """
     It calculates the velocity along the stream line following Mendoza+(2009)
     It takes the radial velocity and rotation at the streamline
@@ -200,24 +228,36 @@ def stream_line_vel(r, theta, orb_ang, mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :param v_r0: Initial radial velocity, km/s
     :return: v_r, v_theta, v_phi in units of km/s
     """
-    rc = r_cent(mass=mass, omega=omega, r0=r0)
+    rc = stream_state.rc
+    ecc = stream_state.ecc
+    vk0 = stream_state.vk0
     r_to_rc = (r / rc)
-    v_k0 = v_k(rc, mass=mass)
-    # mu and nu are dimensionless
-    mu = (rc / r0)
-    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
-    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
-    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
     #
     v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(orb_ang) / r_to_rc /(1 - ecc*jnp.cos(orb_ang))
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
-                  * jnp.power((jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2)), 0.5)
+                  * jnp.sqrt(jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2))
     v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
 
-    return v_r_all * v_k0, v_theta_all * v_k0, v_phi_all * v_k0
+    return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
 
+def build_rotation_matrix(inc, pa):
+    """Construct combined inclination/position-angle rotation matrix."""
 
-def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
+    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
+    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
+
+    ci = jnp.cos(inc)
+    si = jnp.sin(inc)
+    cp = jnp.cos(pa)
+    sp = jnp.sin(pa)
+
+    return jnp.array([
+        [cp, sp * si, -sp * ci],
+        [0.0, ci, si],
+        [sp, -cp * si, cp * ci],
+    ], dtype=FLOAT_DTYPE)
+
+def rotate_xyz(x, y, z, rotation_matrix):
     """
     Rotate on inclination and PA
     x-axis and y-axis are on the plane on the sky,
@@ -232,8 +272,7 @@ def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
     :param x: cartesian x-coordinate, in the direction of decreasing RA
     :param y: cartesian y-coordinate, in the direction away of the observer
     :param z: cartesian z-coordinate, in the direction of increasing Dec.
-    :param inc: Inclination angle. 0=no change. radians
-    :param pa: Change the PA angle. Measured from North due East. radians
+    :param rotation_matrix: 3x3 rotation matrix combining inclination and PA rotations.
     :return: new x, y, and z-coordinates as observed on the sky, with the
     same units as the input ones.
 
@@ -241,21 +280,12 @@ def rotate_xyz(x, y, z, inc=jnp.radians(30), pa=jnp.radians(30)):
     x = jnp.asarray(x, dtype=FLOAT_DTYPE)
     y = jnp.asarray(y, dtype=FLOAT_DTYPE)
     z = jnp.asarray(z, dtype=FLOAT_DTYPE)
-    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
-    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
 
-    xyz = jnp.stack([x, y, z], axis=0)
+    xyz = jnp.stack((x, y, z), axis=0)
 
-    rot_inc = jnp.array([[1, 0, 0],
-                        [0, jnp.cos(inc), jnp.sin(inc)],
-                        [0, -jnp.sin(inc), jnp.cos(inc)]], dtype=FLOAT_DTYPE)
-    rot_pa = jnp.array([[jnp.cos(pa), 0, -jnp.sin(pa)],
-                       [0, 1, 0],
-                       [jnp.sin(pa), 0, jnp.cos(pa)]], dtype=FLOAT_DTYPE)
-    
-    xyz_new = rot_pa @ rot_inc @ xyz
-    x_new, y_new, z_new = jnp.unstack(xyz_new, axis=0)
-    return x_new, y_new, z_new
+    xyz_rot = rotation_matrix @ xyz
+
+    return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
 
 # Astropy wrapper - handles astropy units and calls jax-compatible maths
@@ -296,17 +326,16 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     if rmin is not None:
         rmin = jnp.asarray(rmin, dtype=FLOAT_DTYPE)
 
-    # quantities we will need later
-    rc = r_cent(mass=mass, omega=omega, r0=r0)
-    #jax.debug.print("rc={0} au", rc)
-    mu = (rc / r0)
-    nu = v_r0 * jnp.power((rc / (G * mass)), 0.5)
-    epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * jnp.power(jnp.sin(theta0), 2) - 2 * mu
-    ecc = jnp.power((1 + epsilon * jnp.power(jnp.sin(theta0), 2)), 0.5)
+    stream_state = build_stream_state(mass=mass, r0=r0, theta0=theta0, omega=omega, v_r0=v_r0)
+    rc = stream_state.rc
+    mu = stream_state.mu
+    ecc = stream_state.ecc
+
+    rotation_matrix = build_rotation_matrix(inc, pa)
+
     if rc > r0:
         # early stop if centrifugal radius is larger than r0
         # TODO: ideally centrifugal radius should be fed in as the minimum of r0
-        jax.debug.print("Centrifugal radius (rc={0} au) > initial radius (r0={1} au).", rc, r0)
         raise ValueError('Centrifugal radius is larger than start of streamline')
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
@@ -314,11 +343,10 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     # print("r = {0}".format(r))
 
     # calculate positions and velocities inside r0
-    orb_ang, theta, phi = stream_line(r, mass=mass, r0=r0, theta0=theta0, phi0=phi0,
-                        omega=omega, v_r0=v_r0)
+    orb_ang, theta, phi = stream_line(r, stream_state=stream_state, theta0=theta0, phi0=phi0)
     #
-    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, mass=mass, r0=r0,
-                                          theta0=theta0, omega=omega, v_r0=v_r0)
+    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0)
+
     # prepend initial positions and velocities at r0
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
     theta_full = jnp.concatenate((jnp.asarray([theta0], dtype=FLOAT_DTYPE), theta))
@@ -327,9 +355,8 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
     v_r_full = jnp.concatenate((jnp.asarray([v_r0], dtype=FLOAT_DTYPE), v_r))
     v_theta_full = jnp.concatenate((jnp.asarray([0.0], dtype=FLOAT_DTYPE), v_theta))
-    # we need to calculate v_phi0 (multiply by v_k0)
-    v_k0 = v_k(rc, mass=mass)
-    v_phi0 = v_k0 * jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta0) * (r0/rc))
+    # we need to calculate v_phi0
+    v_phi0 = stream_state.vk0 * jnp.sin(theta0) * stream_state.mu
     v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
 
 
@@ -359,8 +386,8 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     v_y = jnp.where(gd_rmin, v_y, jnp.nan)
     v_z = jnp.where(gd_rmin, v_z, jnp.nan)
     # Rotate
-    return rotate_xyz(x, y, z, inc=inc, pa=pa), \
-           rotate_xyz(v_x, v_y, v_z, inc=inc, pa=pa)
+    return rotate_xyz(x, y, z, rotation_matrix=rotation_matrix), \
+           rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
 
     '''
     OLD mask and rotation logic:
