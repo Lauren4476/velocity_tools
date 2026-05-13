@@ -125,6 +125,50 @@ def test_match_model_to_data_curve_returns_overlap_mask_and_counts() -> None:
     assert trace['overlap_r_max'] == pytest.approx(1.5)
 
 
+def test_coverage_endpoint_penalties_are_one_sided_and_flat() -> None:
+    model_finite_mask = jnp.array([True, True, True], dtype=bool)
+    data_min = jnp.asarray(1.0, dtype=jnp.float64)
+    data_max = jnp.asarray(2.0, dtype=jnp.float64)
+    margin = jnp.asarray(0.10, dtype=jnp.float64)
+    tau = jnp.asarray(0.02, dtype=jnp.float64)
+
+    covered_model = jnp.array([0.80, 1.45, 2.20], dtype=jnp.float64)
+    covered_low, covered_high, covered_total = gradient_descent._coverage_endpoint_penalties(
+        covered_model,
+        model_finite_mask,
+        data_min,
+        data_max,
+        margin,
+        tau=tau,
+    )
+
+    longer_model = jnp.array([0.25, 1.45, 2.95], dtype=jnp.float64)
+    longer_low, longer_high, longer_total = gradient_descent._coverage_endpoint_penalties(
+        longer_model,
+        model_finite_mask,
+        data_min,
+        data_max,
+        margin,
+        tau=tau,
+    )
+
+    short_high_model = jnp.array([0.80, 1.45, 1.82], dtype=jnp.float64)
+    short_low, short_high, short_total = gradient_descent._coverage_endpoint_penalties(
+        short_high_model,
+        model_finite_mask,
+        data_min,
+        data_max,
+        margin,
+        tau=tau,
+    )
+
+    assert float(covered_total) < 1e-3
+    assert float(longer_total) == pytest.approx(float(covered_total), abs=1e-4)
+    assert float(short_total) > float(covered_total)
+    assert float(short_high) > float(covered_high)
+    assert float(short_low) == pytest.approx(float(covered_low), abs=1e-6)
+
+
 def test_match_model_to_data_curve_raises_when_no_overlap() -> None:
     ra_model = jnp.array([0.2, 0.4, 0.6], dtype=jnp.float64)
     dec_model = jnp.zeros_like(ra_model)
@@ -187,8 +231,7 @@ def test_chi2_loss_uses_retained_mask_only(monkeypatch) -> None:
     )
 
     expected_chi2_v = (
-        (999.0 - 0.0) ** 2
-        + (21.0 - 16.0) ** 2
+        (21.0 - 16.0) ** 2
         + (29.0 - 20.0) ** 2
     )
     assert trace['chi2_components']['chi2_v'] == pytest.approx(expected_chi2_v)
@@ -314,7 +357,7 @@ def test_fit_streamline_writes_trace_csv(monkeypatch, tmp_path) -> None:
     with open(trace_file, newline='') as fh:
         rows = list(csv.DictReader(fh))
 
-    assert len(rows) == 3  # epochs 1, 2, 3 with trace_every=1 (no epoch 0 in trace)
+    assert len(rows) == 4  # epochs 0, 1, 2, 3 with trace_every=1
     expected_columns = {
         'epoch',
         'loss',

@@ -31,6 +31,8 @@ LOSS_METHOD_COMPONENT_KEYS = {
 TRACE_COMMON_FIELDNAMES = [
     'epoch',
     'loss',
+    'short_model_penalty',
+    'long_model_penalty',
     'chi2_penalty',
     'chi2_total',
     'grad_norm',
@@ -396,6 +398,28 @@ def _gradient_l2_norm(grad_tree):
     return jnp.sqrt(grad_sum_sq)
 
 
+def _softplus_barrier(value, tau):
+    """Smooth approximation to max(0, value) with transition scale tau."""
+    tau = _to_float64(tau)
+    return tau * jnp.logaddexp(_to_float64(0.0), _to_float64(value) / tau)
+
+
+def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max, margin, tau=0.02):
+    """Penalize only missing endpoint coverage in projected radius."""
+
+    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
+    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
+    model_min = jnp.min(model_metric_for_min)
+    model_max = jnp.max(model_metric_for_max)
+
+    low_shortfall = _softplus_barrier(model_min - data_min + margin, tau)
+    high_shortfall = _softplus_barrier(data_max - model_max + margin, tau)
+
+    low_penalty = jnp.sum((low_shortfall / margin) ** 2)
+    high_penalty = jnp.sum((high_shortfall / margin) ** 2)
+    return low_penalty, high_penalty, low_penalty + high_penalty
+
+
 #not used anymore
 def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=None, grads=None, updates=None):
     """Print a detailed optimization snapshot to trace NaN/Inf origins."""
@@ -453,6 +477,8 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         row[component_key] = chi2_components.get(component_key, float('nan'))
 
     row.update({
+        'short_model_penalty': chi2_components.get('short_model_penalty', float('nan')),
+        'long_model_penalty': chi2_components.get('long_model_penalty', float('nan')),
         'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
@@ -806,15 +832,29 @@ def _chi2_loss_raw(
     )
 
     dmetric_data = prepared_data.dmetric_data
-    margin = _to_float64(0.05)
+    model_finite_mask = (
+        jnp.isfinite(ra_model)
+        & jnp.isfinite(dec_model)
+        & jnp.isfinite(v_model)
+        & jnp.isfinite(dmetric_model)
+    )
+    margin = _to_float64(0.01)
+    tau = _to_float64(0.02)
 
-    penalty = jnp.maximum(0.0, overlap_min - dmetric_data) + jnp.maximum(0.0, dmetric_data - overlap_max)
-    chi2_penalty = jnp.sum((penalty / margin) ** 2)
-    chi2_v = jnp.sum((((v_data - v_model_interp) / v_sigma) ** 2))
+    short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
+        dmetric_model,
+        model_finite_mask,
+        prepared_data.data_min,
+        prepared_data.data_max,
+        margin,
+        tau=tau,
+    )
+    # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
+    chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
     if loss_method == 'radecvel':
-        chi2_ra = jnp.sum((((ra_data - ra_model_interp) / ra_sigma) ** 2))
-        chi2_dec = jnp.sum((((dec_data - dec_model_interp) / dec_sigma) ** 2))
+        chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
+        chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
         chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
     else:
         r_proj_data = prepared_data.r_proj_data
@@ -832,8 +872,9 @@ def _chi2_loss_raw(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        chi2_r = jnp.sum((((r_proj_data - r_proj_model) / sigma_r) ** 2))
-        chi2_theta = jnp.sum(((dtheta / sigma_theta) ** 2))
+        # Only compute chi2 on valid/retained data points
+        chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
+        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
 
     if not return_trace:
@@ -892,6 +933,8 @@ def _chi2_loss_raw(
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
             'chi2_v': chi2_v,
+            'short_model_penalty': short_model_penalty,
+            'long_model_penalty': long_model_penalty,
             'chi2_penalty': chi2_penalty,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
@@ -901,6 +944,8 @@ def _chi2_loss_raw(
             'chi2_r': chi2_r,
             'chi2_theta': chi2_theta,
             'chi2_v': chi2_v,
+            'short_model_penalty': short_model_penalty,
+            'long_model_penalty': long_model_penalty,
             'chi2_penalty': chi2_penalty,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
@@ -998,19 +1043,31 @@ def chi2_loss(
 
     ### smooth overlap and weighting - penalty for being outside overlap
     dmetric_data = prepared_data.dmetric_data
+    model_finite_mask = (
+        jnp.isfinite(ra_model)
+        & jnp.isfinite(dec_model)
+        & jnp.isfinite(v_model)
+        & jnp.isfinite(dmetric_model)
+    )
 
-    margin = _to_float64(0.05)  # tune this
+    margin = _to_float64(0.01)
+    tau = _to_float64(0.02)
 
-    penalty = jnp.maximum(0.0, overlap_min - dmetric_data) + \
-              jnp.maximum(0.0, dmetric_data - overlap_max)
+    short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
+        dmetric_model,
+        model_finite_mask,
+        prepared_data.data_min,
+        prepared_data.data_max,
+        margin,
+        tau=tau,
+    )
 
-    chi2_penalty = jnp.sum((penalty / margin) ** 2)
-
-    chi2_v = jnp.sum((((v_data - v_model_interp) / v_sigma) ** 2))
+    # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
+    chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
     if loss_method == 'radecvel':
-        chi2_ra = jnp.sum((((ra_data - ra_model_interp) / ra_sigma) ** 2))
-        chi2_dec = jnp.sum((((dec_data - dec_model_interp) / dec_sigma) ** 2))
+        chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
+        chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
         chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
@@ -1030,8 +1087,9 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        chi2_r = jnp.sum((((r_proj_data - r_proj_model) / sigma_r) ** 2))
-        chi2_theta = jnp.sum(((dtheta / sigma_theta) ** 2))
+        # Only compute chi2 on valid/retained data points
+        chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
+        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
 
 
@@ -1041,6 +1099,8 @@ def chi2_loss(
                 'chi2_ra': float(chi2_ra),
                 'chi2_dec': float(chi2_dec),
                 'chi2_v': float(chi2_v),
+                'short_model_penalty': float(short_model_penalty),
+                'long_model_penalty': float(long_model_penalty),
                 'chi2_penalty': float(chi2_penalty),
                 'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
@@ -1050,6 +1110,8 @@ def chi2_loss(
                 'chi2_r': float(chi2_r),
                 'chi2_theta': float(chi2_theta),
                 'chi2_v': float(chi2_v),
+                'short_model_penalty': float(short_model_penalty),
+                'long_model_penalty': float(long_model_penalty),
                 'chi2_penalty': float(chi2_penalty),
                 'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
@@ -1455,6 +1517,18 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
         csv_writer.writerow(row)
         csv_file.flush()
+    
+    # Log epoch 0 trace if trace file is requested
+    if trace_csv_writer is not None:
+        # Compute initial loss and trace
+        (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_trace_fn(opt_params_norm)
+        loss_trace = _materialize_trace_tree(loss_trace_raw)
+        grad_norm = float(_gradient_l2_norm(norm_grads_trace))
+        
+        # Build and write trace row for epoch 0
+        trace_row = _build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
+        trace_csv_writer.writerow(trace_row)
+        trace_csv_file.flush()
     
     try:
         for epoch in range(1, n_epochs + 1):
