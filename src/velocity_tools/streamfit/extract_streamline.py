@@ -67,16 +67,22 @@ def reduce_to_1D(streamer_cube, n_elements=10):
     print('Starting reduction')
     nz, ny, nx = streamer_cube.shape
 
-    # create coordinate arrays for RA and Dec in arcsec
+    # create coordinate arrays for RA and Dec in arcsec without assuming the input celestial units
     y_indices, x_indices = np.mgrid[0:ny, 0:nx]
     world_coords = streamer_cube.wcs.celestial.pixel_to_world_values(x_indices.ravel(), y_indices.ravel())
-    ra_coords = (world_coords[0].reshape(ny, nx) - streamer_cube.header['CRVAL1']) * 60 * 60
-    ra_coords = ra_coords * np.cos(streamer_cube.header['CRVAL2'] * np.pi / 180) # cos(dec) correct for declination. in arcsec
-    dec_coords = (world_coords[1].reshape(ny, nx) - streamer_cube.header['CRVAL2']) * 60 * 60 # in arcsec
+    ra_unit = u.Unit(streamer_cube.header.get('CUNIT1', streamer_cube.wcs.celestial.world_axis_units[0]))
+    dec_unit = u.Unit(streamer_cube.header.get('CUNIT2', streamer_cube.wcs.celestial.world_axis_units[1]))
+    ra_ref = streamer_cube.header['CRVAL1'] * ra_unit
+    dec_ref = streamer_cube.header['CRVAL2'] * dec_unit
+    ra_coords = ((world_coords[0].reshape(ny, nx) * ra_unit) - ra_ref).to(u.arcsec).value
+    ra_coords = ra_coords * np.cos(dec_ref.to(u.rad).value) # cos(dec) correct for declination. in arcsec
+    dec_coords = ((world_coords[1].reshape(ny, nx) * dec_unit) - dec_ref).to(u.arcsec).value # in arcsec
 
-    # create velocity array in km/s
-    #TODO: fix this to use spectral_axis and WCS instead of header keywords, to be more robust
-    v_coords = streamer_cube.spectral_axis.to(u.km/u.s).value - (streamer_cube.header['CRVAL3']*1e-3)
+    # create velocity array relative to the reference channel, then express it in km/s
+    spectral_unit = u.Unit(streamer_cube.header.get('CUNIT3', streamer_cube.spectral_axis.unit))
+    spectral_axis = streamer_cube.spectral_axis.to(spectral_unit)
+    v_ref = streamer_cube.header['CRVAL3'] * spectral_unit
+    v_coords = (spectral_axis - v_ref).to(u.km / u.s).value
 
     print('Created coordinate arrays')
 
