@@ -45,6 +45,7 @@ docs/_build/
 
 # Test outputs
 streamfit_test_output/
+test_yu-ru/test_output/
 
 
 # demos
