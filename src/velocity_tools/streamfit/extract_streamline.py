@@ -81,8 +81,7 @@ def reduce_to_1D(streamer_cube, n_elements=10):
     # create velocity array relative to the reference channel, then express it in km/s
     spectral_unit = u.Unit(streamer_cube.header.get('CUNIT3', streamer_cube.spectral_axis.unit))
     spectral_axis = streamer_cube.spectral_axis.to(spectral_unit)
-    v_ref = streamer_cube.header['CRVAL3'] * spectral_unit
-    v_coords = (spectral_axis - v_ref).to(u.km / u.s).value
+    v_coords = spectral_axis.to(u.km / u.s).value
 
     print('Created coordinate arrays')
 
