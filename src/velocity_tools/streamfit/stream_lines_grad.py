@@ -43,6 +43,10 @@ class StreamState(NamedTuple):
 # JAX functions (no Astropy units allowed here)
 # Assumed units: mass (Msun), distances (au), velocities (km/s), angles (radians)
 
+def _to_float64(value):
+    """Convert a numeric value or array-like input to float64."""
+    return jnp.asarray(value, dtype=FLOAT_DTYPE)
+
 def v_k(radius, mass=0.5):
     """
     Velocity term that is repeated in all velocity component.
@@ -83,6 +87,15 @@ def build_stream_state(mass, r0, theta0, omega, v_r0):
     theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
     omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
     v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
+
+    # Protect near-zero v_r0 from creating singularities in nu calculation
+    # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
+    threshold = _to_float64(1e-6)
+    v_r0 = jnp.where(
+        jnp.isclose(v_r0, _to_float64(0.0)),
+        - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
+        v_r0  # normal values -> unchanged
+        )
 
     rc = r_cent(mass=mass, omega=omega, r0=r0)
     mu = rc / r0

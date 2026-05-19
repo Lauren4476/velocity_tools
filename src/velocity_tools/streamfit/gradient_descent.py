@@ -19,6 +19,7 @@ import math
 jax.config.update("jax_enable_x64", True)
 
 FLOAT_DTYPE = jnp.float64
+VR0_MIN = 1e-6
 
 
 LOSS_METHOD_CHOICES = ('radecvel', 'rthetavel')
@@ -158,6 +159,22 @@ def _sanitize_model_param_dict(params, dict_name):
         sanitized['log_omega'] = jnp.log(_to_float64(sanitized['omega']))
     if 'omega' in sanitized:
         del sanitized['omega']
+
+    tiny = _to_float64(1e-8)
+    # Protect against exact polar-angle edge values which can cause
+    # downstream numerical issues (theta=0 or theta=pi). If the user
+    # supplied exactly 0 or pi, nudge by a tiny amount into the open
+    # interval (0, pi).
+    if 'theta0' in sanitized:
+        try:
+            theta_val = _to_float64(sanitized['theta0'])
+            if bool(jnp.all(jnp.isclose(theta_val, _to_float64(0.0)))):
+                sanitized['theta0'] = theta_val + tiny
+            elif bool(jnp.all(jnp.isclose(theta_val, _to_float64(jnp.pi)))):
+                sanitized['theta0'] = theta_val - tiny
+        except Exception:
+            # If anything unexpected happens (non-numeric), leave value as-is
+            pass
 
     unknown = sorted(key for key in sanitized if key not in STREAMLINE_MODEL_PARAM_KEYS)
     if unknown:
@@ -404,19 +421,26 @@ def _softplus_barrier(value, tau):
     return tau * jnp.logaddexp(_to_float64(0.0), _to_float64(value) / tau)
 
 
-def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max, margin, tau=0.02):
+def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     """Penalize only missing endpoint coverage in projected radius."""
+    margin = _to_float64(0.02 * (data_max - data_min))
+    tau = 0.2 * margin
 
     model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
     model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
     model_min = jnp.min(model_metric_for_min)
     model_max = jnp.max(model_metric_for_max)
 
+    #model starts too far out
     low_shortfall = _softplus_barrier(model_min - data_min + margin, tau)
+    #model ends too far in
     high_shortfall = _softplus_barrier(data_max - model_max + margin, tau)
+    #model ends too far out
+    high_excess = _softplus_barrier(model_max - data_max - margin, tau)
 
     low_penalty = jnp.sum((low_shortfall / margin) ** 2)
-    high_penalty = jnp.sum((high_shortfall / margin) ** 2)
+    high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
+
     return low_penalty, high_penalty, low_penalty + high_penalty
 
 
@@ -533,6 +557,16 @@ def forward_model(opt_params, fixed_params, distance_pc):
 
     omega = _omega_from_log_omega(model_params['log_omega'])
 
+    # Protect near-zero v_r0 from creating singularities in physics calculations
+    # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
+    v_r0_protected = model_params['v_r0']
+    threshold = _to_float64(1e-6)
+    v_r0_protected = jnp.where(
+        jnp.isclose(v_r0_protected, _to_float64(0.0)),
+        - jnp.sign(v_r0_protected) * threshold,
+        v_r0_protected
+        )
+
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = stream_lines_grad.xyz_stream(
         mass=model_params['mass'],
@@ -540,7 +574,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
         theta0=model_params['theta0'],
         phi0=model_params['phi0'],
         omega=omega,
-        v_r0=model_params['v_r0'],
+        v_r0=v_r0_protected,
         inc=model_params['inc'],
         pa=model_params['pa'],
         rmin=model_params['rmin'],
@@ -838,16 +872,12 @@ def _chi2_loss_raw(
         & jnp.isfinite(v_model)
         & jnp.isfinite(dmetric_model)
     )
-    margin = _to_float64(0.01)
-    tau = _to_float64(0.02)
 
     short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
         prepared_data.data_max,
-        margin,
-        tau=tau,
     )
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
@@ -1050,16 +1080,11 @@ def chi2_loss(
         & jnp.isfinite(dmetric_model)
     )
 
-    margin = _to_float64(0.01)
-    tau = _to_float64(0.02)
-
     short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
         prepared_data.data_max,
-        margin,
-        tau=tau,
     )
 
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
@@ -1569,6 +1594,28 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Enforce normalized bounds and map back to physical/log values.
             for key in opt_param_keys:
                 opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
+
+            # Gradient-aware epsilon protection for v_r0 near zero:
+            # When v_r0 is very close to zero, use the sign of the gradient to determine
+            # which direction to protect towards, allowing the optimizer to continue smoothly.
+            if 'v_r0' in opt_param_keys:
+                threshold_norm = _to_float64(1e-12)  # normalized space threshold
+                v_r0_norm_val = opt_params_norm['v_r0']
+                if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
+                    # v_r0 is very close to zero; check gradient direction
+                    grad_v_r0 = norm_grads['v_r0']
+                    # In gradient descent, we move opposite to gradient:
+                    # If grad > 0, param should decrease (negative direction)
+                    # If grad < 0, param should increase (positive direction)
+                    protect_sign = -jnp.sign(grad_v_r0)
+                    # Default to positive if gradient is exactly zero
+                    protect_sign = jnp.where(protect_sign == 0, 1.0, protect_sign)
+                    # Set v_r0 to small epsilon in the gradient-indicated direction
+                    epsilon_norm = threshold_norm
+                    opt_params_norm['v_r0'] = protect_sign * epsilon_norm
+
+            # Now materialize physical parameters from the (possibly clamped)
+            # normalized parameters.
             opt_params = _denormalize_opt_params(opt_params_norm, normalization_spec)
         
             # Track loss (store the loss before the update for the loss_history)
