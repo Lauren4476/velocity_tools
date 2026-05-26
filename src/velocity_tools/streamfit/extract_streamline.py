@@ -11,6 +11,7 @@ Then it will extract a streamline from this cube.
 
 import numpy as np
 from astropy import units as u
+from astropy.coordinates import SkyCoord
 from collections import namedtuple
 import jax.numpy as jnp
 
@@ -42,7 +43,7 @@ def _circular_median(theta_vals):
     theta_ref = jnp.median(theta_unwrapped)
     return _wrap_to_pi(theta_ref)
 
-def reduce_to_1D(streamer_cube, n_elements=10):
+def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     '''
     This function will reduce a cube of emission to a 1D 'streamline', 
     by weighted means.
@@ -54,6 +55,7 @@ def reduce_to_1D(streamer_cube, n_elements=10):
     Parameters
     ----------
     streamer_cube : SpectralCube object, should contain only streamer emission
+    yso_centre : SkyCoord, the coordinates of the star, used to compute RA and Dec offsets in arcsec
     n_elements : int, number of elements to reduce the cube to
 
 
@@ -66,17 +68,22 @@ def reduce_to_1D(streamer_cube, n_elements=10):
     '''
     print('Starting reduction')
     nz, ny, nx = streamer_cube.shape
+    yso_centre_icrs = yso_centre.icrs
 
-    # create coordinate arrays for RA and Dec in arcsec without assuming the input celestial units
+    # create coordinate arrays for RA/Dec offsets in arcsec without assuming input celestial units
+    # Use spherical offsets to robustly handle RA wrapping and high-latitude geometry.
     y_indices, x_indices = np.mgrid[0:ny, 0:nx]
     world_coords = streamer_cube.wcs.celestial.pixel_to_world_values(x_indices.ravel(), y_indices.ravel())
     ra_unit = u.Unit(streamer_cube.header.get('CUNIT1', streamer_cube.wcs.celestial.world_axis_units[0]))
     dec_unit = u.Unit(streamer_cube.header.get('CUNIT2', streamer_cube.wcs.celestial.world_axis_units[1]))
-    ra_ref = streamer_cube.header['CRVAL1'] * ra_unit
-    dec_ref = streamer_cube.header['CRVAL2'] * dec_unit
-    ra_coords = ((world_coords[0].reshape(ny, nx) * ra_unit) - ra_ref).to(u.arcsec).value
-    ra_coords = ra_coords * np.cos(dec_ref.to(u.rad).value) # cos(dec) correct for declination. in arcsec
-    dec_coords = ((world_coords[1].reshape(ny, nx) * dec_unit) - dec_ref).to(u.arcsec).value # in arcsec
+    world_sky = SkyCoord(
+        ra=world_coords[0] * ra_unit,
+        dec=world_coords[1] * dec_unit,
+        frame='icrs'
+    )
+    dra, ddec = yso_centre_icrs.spherical_offsets_to(world_sky)
+    ra_coords = dra.to(u.arcsec).value.reshape(ny, nx)
+    dec_coords = ddec.to(u.arcsec).value.reshape(ny, nx)
 
     # create velocity array relative to the reference channel, then express it in km/s
     spectral_unit = u.Unit(streamer_cube.header.get('CUNIT3', streamer_cube.spectral_axis.unit))

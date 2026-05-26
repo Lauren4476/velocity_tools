@@ -423,7 +423,7 @@ def _softplus_barrier(value, tau):
 
 def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     """Penalize only missing endpoint coverage in projected radius."""
-    margin = _to_float64(0.02 * (data_max - data_min))
+    margin = _to_float64(0.2 * (data_max - data_min))
     tau = 0.2 * margin
 
     model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
@@ -433,56 +433,18 @@ def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, dat
 
     #model starts too far out
     low_shortfall = _softplus_barrier(model_min - data_min + margin, tau)
+    #model starts too far in
+    low_excess = _softplus_barrier(data_min - model_min - margin, tau)
     #model ends too far in
     high_shortfall = _softplus_barrier(data_max - model_max + margin, tau)
     #model ends too far out
     high_excess = _softplus_barrier(model_max - data_max - margin, tau)
 
+
     low_penalty = jnp.sum((low_shortfall / margin) ** 2)
     high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
 
     return low_penalty, high_penalty, low_penalty + high_penalty
-
-
-#not used anymore
-def _debug_epoch_snapshot(epoch, stage, opt_params, fixed_params, loss_probe=None, grads=None, updates=None):
-    """Print a detailed optimization snapshot to trace NaN/Inf origins."""
-    print(f"\n[debug-trace] epoch={epoch}, stage={stage}")
-
-    model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
-
-    params_printable = {key: _as_float_or_value(value) for key, value in model_params.items()}
-    omega = _omega_from_log_omega(model_params['log_omega'])
-    params_printable['omega'] = _as_float_or_value(omega)
-    print(f"  opt_params={params_printable}")
-
-    mass = model_params.get('mass', jnp.nan)
-    rmin = model_params.get('rmin', jnp.nan)
-    deltar = model_params.get('deltar', jnp.nan)
-    r0 = model_params.get('r0', jnp.nan)
-    rc = stream_lines_grad.r_cent(mass=mass, omega=omega, r0=r0)
-    r_low = jnp.maximum(rmin, rc * 0.5) if rmin is not None else rc * 0.5
-    r_start = r0 - deltar
-    arange_ok = bool(jnp.isfinite(r_start) & jnp.isfinite(r_low) & (r_start > r_low))
-
-    print(
-        "  derived="
-        f"r0_minus_deltar={_as_float_or_value(r_start)}, "
-        f"rc={_as_float_or_value(rc)}, "
-        f"r_low={_as_float_or_value(r_low)}, "
-        f"arange_ok={arange_ok}"
-    )
-
-    if loss_probe is not None:
-        print(f"  loss_probe={_as_float_or_value(loss_probe)}")
-
-    if grads is not None:
-        grads_printable = {key: _as_float_or_value(value) for key, value in grads.items()}
-        print(f"  grads={grads_printable}")
-
-    if updates is not None:
-        updates_printable = {key: _as_float_or_value(value) for key, value in updates.items()}
-        print(f"  updates={updates_printable}")
 
 
 def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
@@ -713,8 +675,8 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     if not bool(overlap_max >= overlap_min):
         raise ValueError(
             'No physically valid radial overlap between model and data. '
-            f'Model range [{float(model_min):.6g}, {float(model_max):.6g}], '
-            f'data range [{float(data_min):.6g}, {float(data_max):.6g}]'
+            f'Model range [{model_min}, {model_max}], '
+            f'data range [{data_min}, {data_max}]'
         )
 
     data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
@@ -723,7 +685,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     if not bool(jnp.any(data_keep)):
         raise ValueError(
             'No retained data points after overlap filtering. '
-            f'Overlap range [{float(overlap_min):.6g}, {float(overlap_max):.6g}]'
+            f'Overlap range [{overlap_min},{overlap_max}]'
         )
 
     model_retained_count = int(jnp.sum(model_keep))
@@ -1116,7 +1078,6 @@ def chi2_loss(
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
-
 
     if return_trace:
         if loss_method == 'radecvel':
