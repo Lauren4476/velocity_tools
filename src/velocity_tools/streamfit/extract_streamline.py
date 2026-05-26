@@ -145,73 +145,61 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
         
 
 def get_distance_metric(ra_coords, dec_coords, return_trace=False):
-    '''
-    Compute distance metric - used to bin the point cloud into n_elements
-    Uses a radius term plus a cyclic polar-angle deviation term so that
-    nearby points around the branch cut do not look artificially far apart.
-
-    Parameters
-    ----------
-    ra_coords : array
-        RA offsets.
-    dec_coords : array
-        Dec offsets.
-    n_elements : int
-        Number of elements used in distance partitioning.
-    return_trace : bool
-        If True, return extra diagnostics useful for debugging metric instability.
-
-    Returns
-    -------
-    distance_metric, theta_ref
-        Default return values.
-    distance_metric, theta_ref, trace_dict
-        Returned when return_trace=True.
-    '''
+    """
+    Compute radial + angular distance metric for point cloud binning.
+    Uses a circular angular deviation to avoid branch-cut artifacts.
+    """
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
 
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
     finite_r = pc_r[finite_mask]
     finite_theta = pc_theta[finite_mask]
 
-    theta_weight = jnp.asarray(1.0, dtype=pc_r.dtype)
-    theta_ref = jnp.asarray(0.0, dtype=pc_r.dtype)
-    r_percentile_thresh = jnp.asarray(jnp.nan, dtype=pc_r.dtype)
-    r_thresh = jnp.asarray(jnp.nan, dtype=pc_r.dtype)
-    close_point_count = jnp.asarray(0, dtype=jnp.int32)
+    # No valid points
+    if finite_r.size == 0:
+        if return_trace:
+            return pc_r, {
+                "n_points": int(pc_r.size),
+                "n_finite_points": 0,
+                "n_reference_points": 0,
+                "r_percentile_thresh": float("nan"),
+                "r_thresh": float("nan"),
+                "theta_ref": 0.0,
+                "theta_weight": 1.0,
+                "close_point_count": 0,
+            }
+        return pc_r
 
-    if finite_r.size > 0:
-        n_reference_points = max(1, min(10, int(finite_r.size)))
-        r_percentile_thresh = jnp.asarray(100.0 / n_reference_points, dtype=pc_r.dtype)
-        r_thresh = jnp.percentile(finite_r, r_percentile_thresh)
+    theta_weight = 1.0
 
-        close_mask = finite_r <= r_thresh
+    # Get reference angle from points within a radius percentile threshold
+    n_ref = min(10, max(1, int(finite_r.size)))
+    percentile = 100.0 / n_ref
+    r_thresh = jnp.percentile(finite_r, percentile)
 
-        close_theta = finite_theta[close_mask]
-        close_point_count = jnp.asarray(close_theta.size, dtype=jnp.int32)
-        if close_theta.size > 0:
-            theta_ref = _circular_median(close_theta)
-        else:
-            theta_ref = _circular_median(finite_theta)
+    close_theta = finite_theta[finite_r <= r_thresh]
+    ref_theta_source = close_theta if close_theta.size else finite_theta
+    theta_ref = _circular_median(ref_theta_source)
 
-        theta_dev = jnp.pi - jnp.abs(jnp.pi - jnp.abs(_wrap_to_pi(pc_theta - theta_ref)))
-        distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
-        distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
-    else:
-        distance_metric = pc_r
+    # Cyclic angular deviation
+    theta_dev = jnp.pi - jnp.abs(
+        jnp.pi - jnp.abs(_wrap_to_pi(pc_theta - theta_ref))
+    )
+
+    distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
+    distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
 
     if return_trace:
-        trace = {
-            'n_points': int(pc_r.size),
-            'n_finite_points': int(finite_r.size),
-            'n_reference_points': int(min(10, max(1, int(finite_r.size)))) if finite_r.size > 0 else 0,
-            'r_percentile_thresh': float(r_percentile_thresh),
-            'r_thresh': float(r_thresh),
-            'theta_ref': float(theta_ref),
-            'theta_weight': float(theta_weight),
-            'close_point_count': int(close_point_count),
+        return distance_metric, {
+            "n_points": int(pc_r.size),
+            "n_finite_points": int(finite_r.size),
+            "n_reference_points": n_ref,
+            "r_percentile_thresh": percentile,
+            "r_thresh": float(r_thresh),
+            "theta_ref": float(theta_ref),
+            "theta_weight": theta_weight,
+            "close_point_count": int(close_theta.size),
         }
-        return distance_metric, trace
 
     return distance_metric
 

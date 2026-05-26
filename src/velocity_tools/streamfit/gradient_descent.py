@@ -53,8 +53,8 @@ TRACE_COMMON_FIELDNAMES = [
     'data_valid_points',
     'data_retained_count',
     'model_retained_count',
-    'overlap_r_min',
-    'overlap_r_max',
+    'overlap_metric_min',
+    'overlap_metric_max',
 ]
 
 
@@ -484,8 +484,8 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         'data_valid_points': matching.get('data_valid_points', 0),
         'data_retained_count': matching.get('data_retained_count', 0),
         'model_retained_count': matching.get('model_retained_count', 0),
-        'overlap_r_min': matching.get('overlap_r_min', float('nan')),
-        'overlap_r_max': matching.get('overlap_r_max', float('nan')),
+        'overlap_metric_min': matching.get('overlap_metric_min', float('nan')),
+        'overlap_metric_max': matching.get('overlap_metric_max', float('nan')),
     })
 
     return row
@@ -592,16 +592,31 @@ def forward_fill_nans(arr):
     return filled
 
 
+def _distance_metric_overlap_bounds(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
+    """Compute the overlapping range in the streamline distance metric."""
+    model_metric = dmetric_model[model_finite_mask]
+    data_metric = dmetric_data[data_finite_mask]
+
+    model_min = jnp.min(model_metric)
+    model_max = jnp.max(model_metric)
+    data_min = jnp.min(data_metric)
+    data_max = jnp.max(data_metric)
+
+    overlap_min = jnp.maximum(model_min, data_min)
+    overlap_max = jnp.minimum(model_max, data_max)
+    return model_min, model_max, data_min, data_max, overlap_min, overlap_max
+
+
 
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
     """
-    Extract model values corresponding to data positions using the projected
-    radial distance metric from extract_streamline.get_distance_metric.
+    Extract model values corresponding to data positions using the distance metric from
+    extract_streamline.get_distance_metric.
 
-    Matching is restricted to the physically overlapping radial domain:
-    1. Data is restricted to the model-supported radial range.
-    2. Model is restricted to the data-supported radial range.
+    Matching is restricted to the physically overlapping distance-metric domain:
+    1. Data is restricted to the model-supported metric range.
+    2. Model is restricted to the data-supported metric range.
     3. Interpolation is performed only on the overlap support.
 
     Parameters
@@ -620,7 +635,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     Raises
     ------
     ValueError
-        If no valid model/data points exist, there is no radial overlap, or
+        If no valid model/data points exist, there is no metric overlap, or
         fewer than two model points remain in the overlap domain.
     """
 
@@ -630,7 +645,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     ra_data = _to_float64(ra_data)
     dec_data = _to_float64(dec_data)
 
-    # Compute projected radial metric for model/data in float64.
+    # Compute the streamline distance metric for model/data in float64.
     if return_trace:
         dmetric_model, dmetric_model_trace = extract_streamline.get_distance_metric(
             ra_model, dec_model, return_trace=True)
@@ -659,24 +674,18 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     if not bool(jnp.any(data_finite_mask)):
         raise ValueError('No finite data points are available for model-data matching.')
 
-    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
-    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
-    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
-    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, -jnp.inf)
-
-    model_min = jnp.min(model_metric_for_min)
-    model_max = jnp.max(model_metric_for_max)
-    data_min = jnp.min(data_metric_for_min)
-    data_max = jnp.max(data_metric_for_max)
-
-    overlap_min = jnp.maximum(model_min, data_min)
-    overlap_max = jnp.minimum(model_max, data_max)
+    model_min, model_max, data_min, data_max, overlap_min, overlap_max = _distance_metric_overlap_bounds(
+        dmetric_model,
+        model_finite_mask,
+        dmetric_data,
+        data_finite_mask,
+    )
 
     if not bool(overlap_max >= overlap_min):
         raise ValueError(
-            'No physically valid radial overlap between model and data. '
-            f'Model range [{model_min}, {model_max}], '
-            f'data range [{data_min}, {data_max}]'
+            'No physically valid distance-metric overlap between model and data. '
+            f'Model metric range [{model_min}, {model_max}], '
+            f'data metric range [{data_min}, {data_max}]'
         )
 
     data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
@@ -764,8 +773,8 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         'data_points_total': int(ra_data.size),
         'data_valid_points': int(jnp.sum(data_finite_mask)),
         'data_retained_count': int(jnp.sum(data_keep)),
-        'overlap_r_min': float(overlap_min),
-        'overlap_r_max': float(overlap_max),
+        'overlap_metric_min': float(overlap_min),
+        'overlap_metric_max': float(overlap_max),
         'model_metric_span': model_metric_span,
         'model_metric_min_gap': model_metric_min_gap,
         'model_metric_near_tie_count': model_metric_near_tie_count,
@@ -884,22 +893,16 @@ def _chi2_loss_raw(
         & jnp.isfinite(dmetric_data)
     )
 
+    model_min, model_max, data_min, data_max, overlap_min, overlap_max = _distance_metric_overlap_bounds(
+        dmetric_model,
+        model_finite_mask,
+        dmetric_data,
+        data_finite_mask,
+    )
+
     model_nan_count = jnp.sum(~model_finite_mask)
     model_points_total = ra_model.size
     model_valid_points = model_points_total - model_nan_count
-
-    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
-    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
-    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
-    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, -jnp.inf)
-
-    model_min = jnp.min(model_metric_for_min)
-    model_max = jnp.max(model_metric_for_max)
-    data_min = jnp.min(data_metric_for_min)
-    data_max = jnp.max(data_metric_for_max)
-
-    overlap_min = jnp.maximum(model_min, data_min)
-    overlap_max = jnp.minimum(model_max, data_max)
 
     data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
     model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
@@ -951,8 +954,8 @@ def _chi2_loss_raw(
         'data_points_total': ra_data.size,
         'data_valid_points': jnp.sum(data_finite_mask),
         'data_retained_count': jnp.sum(data_keep),
-        'overlap_r_min': overlap_min,
-        'overlap_r_max': overlap_max,
+        'overlap_metric_min': overlap_min,
+        'overlap_metric_max': overlap_max,
         'model_metric_span': model_metric_span,
         'model_metric_min_gap': model_metric_min_gap,
         'model_metric_near_tie_count': model_metric_near_tie_count,
