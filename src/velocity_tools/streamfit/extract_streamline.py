@@ -43,6 +43,11 @@ def _circular_median(theta_vals):
     theta_ref = jnp.median(theta_unwrapped)
     return _wrap_to_pi(theta_ref)
 
+
+def _wrap_to_pi_numpy(angle):
+    '''Wrap angles to [-pi, pi).'''
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
 def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     '''
     This function will reduce a cube of emission to a 1D 'streamline', 
@@ -142,9 +147,8 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
 def get_distance_metric(ra_coords, dec_coords, return_trace=False):
     '''
     Compute distance metric - used to bin the point cloud into n_elements
-    Basically just distance on the plane of the sky
-
-    (used to include polar angle as well)
+    Uses a radius term plus a cyclic polar-angle deviation term so that
+    nearby points around the branch cut do not look artificially far apart.
 
     Parameters
     ----------
@@ -165,11 +169,47 @@ def get_distance_metric(ra_coords, dec_coords, return_trace=False):
         Returned when return_trace=True.
     '''
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
-    distance_metric = pc_r
+
+    finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
+    finite_r = pc_r[finite_mask]
+    finite_theta = pc_theta[finite_mask]
+
+    theta_weight = jnp.asarray(1.0, dtype=pc_r.dtype)
+    theta_ref = jnp.asarray(0.0, dtype=pc_r.dtype)
+    r_percentile_thresh = jnp.asarray(jnp.nan, dtype=pc_r.dtype)
+    r_thresh = jnp.asarray(jnp.nan, dtype=pc_r.dtype)
+    close_point_count = jnp.asarray(0, dtype=jnp.int32)
+
+    if finite_r.size > 0:
+        n_reference_points = max(1, min(10, int(finite_r.size)))
+        r_percentile_thresh = jnp.asarray(100.0 / n_reference_points, dtype=pc_r.dtype)
+        r_thresh = jnp.percentile(finite_r, r_percentile_thresh)
+
+        close_mask = finite_r <= r_thresh
+
+        close_theta = finite_theta[close_mask]
+        close_point_count = jnp.asarray(close_theta.size, dtype=jnp.int32)
+        if close_theta.size > 0:
+            theta_ref = _circular_median(close_theta)
+        else:
+            theta_ref = _circular_median(finite_theta)
+
+        theta_dev = jnp.pi - jnp.abs(jnp.pi - jnp.abs(_wrap_to_pi(pc_theta - theta_ref)))
+        distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
+        distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
+    else:
+        distance_metric = pc_r
 
     if return_trace:
         trace = {
             'n_points': int(pc_r.size),
+            'n_finite_points': int(finite_r.size),
+            'n_reference_points': int(min(10, max(1, int(finite_r.size)))) if finite_r.size > 0 else 0,
+            'r_percentile_thresh': float(r_percentile_thresh),
+            'r_thresh': float(r_thresh),
+            'theta_ref': float(theta_ref),
+            'theta_weight': float(theta_weight),
+            'close_point_count': int(close_point_count),
         }
         return distance_metric, trace
 
@@ -195,6 +235,92 @@ def cartesian_to_polar(x, y):
     theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 
     return (r, theta)
+
+
+def get_metric_partitions(pc_coords, n_elements):
+    '''
+    Compute percentile partitions for the streamline distance metric.
+
+    Parameters
+    ----------
+    pc_coords : array
+        Point cloud coordinates. Index 0 = RA, Index 1 = Dec, Index 2 = velocity.
+    n_elements : int
+        Number of partitions to compute.
+
+    Returns
+    -------
+    partitions : ndarray
+        Percentile boundaries of the distance metric.
+    '''
+    if n_elements < 1:
+        raise ValueError('n_elements must be >= 1')
+
+    ra_coords = pc_coords[0]
+    dec_coords = pc_coords[1]
+    distance_metric = np.asarray(get_distance_metric(ra_coords, dec_coords))
+    finite_mask = np.isfinite(distance_metric)
+    finite_metric = distance_metric[finite_mask]
+
+    if finite_metric.size == 0:
+        return np.full(n_elements + 1, np.nan, dtype=np.float64)
+
+    b_per = np.linspace(0.0, 100.0, n_elements + 1)
+    return np.asarray([np.percentile(finite_metric, per) for per in b_per], dtype=np.float64)
+
+
+def _get_metric_reference_trace(pc_coords):
+    '''Return the metric reference angle and weight used for boundary sampling.'''
+    ra_coords = pc_coords[0]
+    dec_coords = pc_coords[1]
+    _, trace = get_distance_metric(ra_coords, dec_coords, return_trace=True)
+    theta_ref = float(trace.get('theta_ref', 0.0))
+    theta_weight = float(trace.get('theta_weight', 1.0))
+    return theta_ref, theta_weight
+
+
+def sample_metric_boundary(partition_radius, theta_ref, theta_weight=1.0, n_samples=720):
+    '''Sample a constant-metric boundary as a closed RA/Dec curve.'''
+    if n_samples < 4:
+        raise ValueError('n_samples must be >= 4')
+
+    theta = np.linspace(-np.pi, np.pi, n_samples, endpoint=False)
+    theta_dev = np.pi - np.abs(np.pi - np.abs(_wrap_to_pi_numpy(theta - theta_ref)))
+    radius = partition_radius / np.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
+    ra = radius * np.cos(theta)
+    dec = radius * np.sin(theta)
+    return ra, dec
+
+
+def sample_metric_boundaries(pc_coords, partitions, n_samples=720):
+    '''Sample all metric boundary curves for a point cloud and partition set.'''
+    theta_ref, theta_weight = _get_metric_reference_trace(pc_coords)
+    curves = [
+        sample_metric_boundary(partition_radius, theta_ref, theta_weight=theta_weight, n_samples=n_samples)
+        for partition_radius in np.asarray(partitions)
+    ]
+    trace = {
+        'theta_ref': theta_ref,
+        'theta_weight': theta_weight,
+    }
+    return curves, trace
+
+
+def plot_metric_boundaries(
+    ax,
+    pc_coords,
+    partitions,
+    color='lightgrey',
+    linewidth=1,
+    alpha=0.5,
+    n_samples=720,
+    zorder=1,
+):
+    '''Plot metric boundary curves on an RA/Dec axis.'''
+    curves, trace = sample_metric_boundaries(pc_coords, partitions, n_samples=n_samples)
+    for ra, dec in curves:
+        ax.plot(ra, dec, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+    return curves, trace
 
 
 def prepare_data(data, uncertainties):
