@@ -47,6 +47,7 @@ def _to_float64(value):
     """Convert a numeric value or array-like input to float64."""
     return jnp.asarray(value, dtype=FLOAT_DTYPE)
 
+@jax.jit
 def v_k(radius, mass=0.5):
     """
     Velocity term that is repeated in all velocity component.
@@ -58,6 +59,7 @@ def v_k(radius, mass=0.5):
     arg = G * mass / radius
     return jnp.sqrt(arg)
 
+@jax.jit
 def r_cent(mass, omega=1e-14, r0=1e4):
     """
     Centrifugal radius or disk radius in the Ulrich (1976)'s model.
@@ -73,6 +75,7 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     return r_cent_au
 
 
+@jax.jit
 def build_stream_state(mass, r0, theta0, omega, v_r0):
     """
     Precompute streamer quantities reused throughout file.
@@ -115,6 +118,7 @@ def build_stream_state(mass, r0, theta0, omega, v_r0):
         vk0=vk0,
     )
 
+@jax.jit
 def safe_arccos(x, eps=1e-8):
     """
     Safe arccos function with clipping to valid range [-1, 1].
@@ -136,7 +140,7 @@ def safe_arccos(x, eps=1e-8):
     x_safe = jnp.clip(x, -1.0 + eps_eff, 1.0 - eps_eff)
     return jnp.arccos(x_safe)
 
-
+@jax.jit
 def get_theta(theta0, orb_ang, orb_ang0):
     """
     Gets theta from theta0, orb_ang, and orb_ang0, in radians.
@@ -151,6 +155,7 @@ def get_theta(theta0, orb_ang, orb_ang0):
     return theta
 
 
+@jax.jit
 def get_orb_ang(r_to_rc, theta0, ecc):
     """
     Gets orb_ang (varphi in Mendoza+2009), in radians.
@@ -164,6 +169,7 @@ def get_orb_ang(r_to_rc, theta0, ecc):
     orb_ang = safe_arccos(cos_orb_ang)
     return orb_ang
 
+@jax.jit
 def get_dphi(theta, theta0=jnp.radians(30)):
     """
     Gets the difference in Phi between initial and current, in radians.
@@ -178,6 +184,7 @@ def get_dphi(theta, theta0=jnp.radians(30)):
 
 
 #TODO: come back and check this function at end
+@jax.jit
 def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     """
     It calculates the stream line following Mendoza et al. (2009),
@@ -219,6 +226,7 @@ def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     return orb_ang, theta, phi #in radians
 
 
+@jax.jit
 def stream_line_vel(
     r,
     theta,
@@ -253,6 +261,7 @@ def stream_line_vel(
 
     return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
 
+@jax.jit
 def build_rotation_matrix(inc, pa):
     """Construct combined inclination/position-angle rotation matrix."""
 
@@ -270,6 +279,7 @@ def build_rotation_matrix(inc, pa):
         [sp, -cp * si, cp * ci],
     ], dtype=FLOAT_DTYPE)
 
+@jax.jit
 def rotate_xyz(x, y, z, rotation_matrix):
     """
     Rotate on inclination and PA

@@ -14,6 +14,7 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from collections import namedtuple
 import jax.numpy as jnp
+import jax
 
 
 PreparedData = namedtuple('PreparedData', [
@@ -25,11 +26,12 @@ PreparedData = namedtuple('PreparedData', [
 ])
 
 
+@jax.jit
 def _wrap_to_pi(angle):
     """Wrap angles to [-pi, pi)."""
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-
+@jax.jit
 def _circular_median(theta_vals):
     """
     Compute a branch-cut-safe median angle.
@@ -203,7 +205,7 @@ def get_distance_metric(ra_coords, dec_coords, return_trace=False):
 
     return distance_metric
 
-
+@jax.jit
 def cartesian_to_polar(x, y):
     '''
     Convert cartesian coordinates (x,y) to polar coordinates
@@ -272,11 +274,11 @@ def sample_metric_boundary(partition_radius, theta_ref, theta_weight=1.0, n_samp
     if n_samples < 4:
         raise ValueError('n_samples must be >= 4')
 
-    theta = np.linspace(-np.pi, np.pi, n_samples, endpoint=False)
-    theta_dev = np.pi - np.abs(np.pi - np.abs(_wrap_to_pi_numpy(theta - theta_ref)))
-    radius = partition_radius / np.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
-    ra = radius * np.cos(theta)
-    dec = radius * np.sin(theta)
+    theta = jnp.linspace(-jnp.pi, jnp.pi, n_samples, endpoint=False)
+    theta_dev = jnp.pi - jnp.abs(jnp.pi - jnp.abs(_wrap_to_pi(theta - theta_ref)))
+    radius = partition_radius / jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
+    ra = radius * jnp.cos(theta)
+    dec = radius * jnp.sin(theta)
     return ra, dec
 
 

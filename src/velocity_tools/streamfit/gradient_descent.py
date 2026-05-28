@@ -406,6 +406,7 @@ def _tree_has_nonfinite_values(tree):
     return False
 
 
+@jax.jit
 def _gradient_l2_norm(grad_tree):
     """Compute L2 norm of gradients across all leaves in a pytree."""
     grad_leaves = jax.tree_util.tree_leaves(grad_tree)
@@ -414,17 +415,17 @@ def _gradient_l2_norm(grad_tree):
         grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
     return jnp.sqrt(grad_sum_sq)
 
-
+@jax.jit
 def _softplus_barrier(value, tau):
     """Smooth approximation to max(0, value) with transition scale tau."""
     tau = _to_float64(tau)
     return tau * jnp.logaddexp(_to_float64(0.0), _to_float64(value) / tau)
 
-
+@jax.jit
 def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     """Penalize only missing endpoint coverage in projected radius."""
     margin = _to_float64(0.2 * (data_max - data_min))
-    tau = 0.2 * margin
+    tau = 0.8 * margin
 
     model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
     model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
@@ -441,7 +442,7 @@ def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, dat
     high_excess = _softplus_barrier(model_max - data_max - margin, tau)
 
 
-    low_penalty = jnp.sum((low_shortfall / margin) ** 2)
+    low_penalty = ((low_shortfall / margin) ** 2 + (low_excess / margin) **2)
     high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
 
     return low_penalty, high_penalty, low_penalty + high_penalty
@@ -560,7 +561,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
 
     return ra_model, dec_model, v_model
 
-
+@jax.jit
 def forward_fill_nans(arr):
     """
     Forward-fill NaN values in a JAX-compatible way.
@@ -605,6 +606,44 @@ def _distance_metric_overlap_bounds(dmetric_model, model_finite_mask, dmetric_da
     overlap_min = jnp.maximum(model_min, data_min)
     overlap_max = jnp.minimum(model_max, data_max)
     return model_min, model_max, data_min, data_max, overlap_min, overlap_max
+
+@jax.jit
+def _order_model_support_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
+    """Order finite model support by distance metric, skipping argsort when already monotonic."""
+    dmetric_model = _to_float64(dmetric_model)
+    ra_model = _to_float64(ra_model)
+    dec_model = _to_float64(dec_model)
+    v_model = _to_float64(v_model)
+
+    if dmetric_model.size <= 1:
+        return dmetric_model, ra_model, dec_model, v_model
+
+    sort_tol = _to_float64(sort_tol)
+    d_diff = jnp.diff(dmetric_model)
+    ascending = jnp.all(d_diff >= -sort_tol)
+    descending = jnp.all(d_diff <= sort_tol)
+
+    def _keep_order(_):
+        return dmetric_model, ra_model, dec_model, v_model
+
+    def _reverse_order(_):
+        return dmetric_model[::-1], ra_model[::-1], dec_model[::-1], v_model[::-1]
+
+    def _sorted_order(_):
+        sort_idx = jnp.argsort(dmetric_model)
+        return (
+            dmetric_model[sort_idx],
+            ra_model[sort_idx],
+            dec_model[sort_idx],
+            v_model[sort_idx],
+        )
+
+    return lax.cond(
+        ascending,
+        _keep_order,
+        lambda _: lax.cond(descending, _reverse_order, _sorted_order, operand=None),
+        operand=None,
+    )
 
 
 
@@ -704,13 +743,19 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
             f'{model_retained_count} point(s) available; need at least 2.'
         )
 
-    # Sort model once by metric.
-    sort_idx = jnp.argsort(dmetric_model)
-    d_model_sorted = dmetric_model[sort_idx]
-    ra_sorted = ra_model[sort_idx]
-    dec_sorted = dec_model[sort_idx]
-    v_sorted = v_model[sort_idx]
-    model_keep_sorted = model_keep[sort_idx]
+    # Reduce to finite model support once, then keep or reorder it only when needed.
+    finite_dmetric = dmetric_model[model_finite_mask]
+    finite_ra = ra_model[model_finite_mask]
+    finite_dec = dec_model[model_finite_mask]
+    finite_v = v_model[model_finite_mask]
+    d_model_sorted, ra_sorted, dec_sorted, v_sorted = _order_model_support_by_metric(
+        finite_dmetric,
+        finite_ra,
+        finite_dec,
+        finite_v,
+    )
+
+    model_keep_sorted = (d_model_sorted >= overlap_min) & (d_model_sorted <= overlap_max)
 
     # Build edge anchors on retained support so clipped interpolation uses only
     # overlap-domain endpoints.
