@@ -32,9 +32,11 @@ LOSS_METHOD_COMPONENT_KEYS = {
 TRACE_COMMON_FIELDNAMES = [
     'epoch',
     'loss',
-    'short_model_penalty',
-    'long_model_penalty',
     'chi2_penalty',
+    'low_shortfall_penalty',
+    'low_excess_penalty',
+    'high_shortfall_penalty',
+    'high_excess_penalty',
     'chi2_total',
     'grad_norm',
     'theta_ref_model',
@@ -444,8 +446,9 @@ def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, dat
 
     low_penalty = ((low_shortfall / margin) ** 2 + (low_excess / margin) **2)
     high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
+    total_penalty = (low_penalty + high_penalty)
 
-    return low_penalty, high_penalty, low_penalty + high_penalty
+    return total_penalty, low_shortfall, low_excess, high_shortfall, high_excess
 
 
 def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
@@ -464,8 +467,10 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         row[component_key] = chi2_components.get(component_key, float('nan'))
 
     row.update({
-        'short_model_penalty': chi2_components.get('short_model_penalty', float('nan')),
-        'long_model_penalty': chi2_components.get('long_model_penalty', float('nan')),
+        'low_shortfall_penalty': chi2_components.get('low_shortfall_penalty', float('nan')),
+        'low_excess_penalty': chi2_components.get('low_excess_penalty', float('nan')),
+        'high_shortfall_penalty': chi2_components.get('high_shortfall_penalty', float('nan')),
+        'high_excess_penalty': chi2_components.get('high_excess_penalty', float('nan')),
         'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
@@ -708,6 +713,9 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         & jnp.isfinite(dmetric_data)
     )
 
+    # print(f"Model finite points: {jnp.sum(model_finite_mask)} / {ra_model.size}")
+    # print(f"Model non-finite points: {jnp.sum(~model_finite_mask)} / {ra_model.size}")
+    # print(f"Model points ra: {ra_model}")
     if not bool(jnp.any(model_finite_mask)):
         raise ValueError('No finite model points are available for model-data matching.')
     if not bool(jnp.any(data_finite_mask)):
@@ -889,7 +897,7 @@ def _chi2_loss_raw(
         & jnp.isfinite(dmetric_model)
     )
 
-    short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
+    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = _coverage_endpoint_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
@@ -973,9 +981,11 @@ def _chi2_loss_raw(
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
             'chi2_v': chi2_v,
-            'short_model_penalty': short_model_penalty,
-            'long_model_penalty': long_model_penalty,
             'chi2_penalty': chi2_penalty,
+            'low_shortfall_penalty': low_shortfall,
+            'low_excess_penalty': low_excess,
+            'high_shortfall_penalty': high_shortfall,
+            'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -984,9 +994,11 @@ def _chi2_loss_raw(
             'chi2_r': chi2_r,
             'chi2_theta': chi2_theta,
             'chi2_v': chi2_v,
-            'short_model_penalty': short_model_penalty,
-            'long_model_penalty': long_model_penalty,
             'chi2_penalty': chi2_penalty,
+            'low_shortfall_penalty': low_shortfall,
+            'low_excess_penalty': low_excess,
+            'high_shortfall_penalty': high_shortfall,
+            'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -1090,7 +1102,7 @@ def chi2_loss(
         & jnp.isfinite(dmetric_model)
     )
 
-    short_model_penalty, long_model_penalty, chi2_penalty = _coverage_endpoint_penalties(
+    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = _coverage_endpoint_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
@@ -1133,9 +1145,11 @@ def chi2_loss(
                 'chi2_ra': float(chi2_ra),
                 'chi2_dec': float(chi2_dec),
                 'chi2_v': float(chi2_v),
-                'short_model_penalty': float(short_model_penalty),
-                'long_model_penalty': float(long_model_penalty),
                 'chi2_penalty': float(chi2_penalty),
+                'low_shortfall_penalty': float(low_shortfall),
+                'low_excess_penalty': float(low_excess),
+                'high_shortfall_penalty': float(high_shortfall),
+                'high_excess_penalty': float(high_excess),
                 'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
             }
@@ -1144,9 +1158,11 @@ def chi2_loss(
                 'chi2_r': float(chi2_r),
                 'chi2_theta': float(chi2_theta),
                 'chi2_v': float(chi2_v),
-                'short_model_penalty': float(short_model_penalty),
-                'long_model_penalty': float(long_model_penalty),
                 'chi2_penalty': float(chi2_penalty),
+                'low_shortfall_penalty': float(low_shortfall),
+                'low_excess_penalty': float(low_excess),
+                'high_shortfall_penalty': float(high_shortfall),
+                'high_excess_penalty': float(high_excess),
                 'overlap_width': float(overlap_max - overlap_min),
                 'chi2_total': float(chi2_total),
             }
