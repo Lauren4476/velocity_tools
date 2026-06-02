@@ -1,14 +1,14 @@
 '''
-This file contains the loss function and optimization routines for streamfit.
+This file contains the loss function and optimisation routines for streamfit.
 
-The optimization uses Adam (adaptive moment estimation) optimizer to fit
+The optimisation uses adam (adaptive moment estimation) optimiser to fit
 streamline model parameters to observed data by minimizing chi-squared loss.
 
-Last updated: 30-03-26
+Last updated: 02-06-26
 '''
 
 import jax.numpy as jnp
-from jax import jit, grad, value_and_grad, lax
+from jax import value_and_grad, lax
 import jax
 import optax
 from . import stream_lines_grad
@@ -18,9 +18,8 @@ import math
 
 jax.config.update("jax_enable_x64", True)
 
-FLOAT_DTYPE = jnp.float64
+# settings and constants
 VR0_MIN = 1e-6
-
 
 LOSS_METHOD_CHOICES = ('radecvel', 'rthetavel')
 
@@ -60,19 +59,19 @@ TRACE_COMMON_FIELDNAMES = [
 ]
 
 
-def _validate_loss_method(loss_method):
-    """Validate and normalize the selected loss method."""
+def check_loss_method(loss_method):
+    """Check that the selected loss method is valid and return it"""
     if loss_method not in LOSS_METHOD_CHOICES:
         raise ValueError(
             f"Unknown loss_method '{loss_method}'. "
-            f"Supported options are: {list(LOSS_METHOD_CHOICES)}"
+            f"Choose from: {list(LOSS_METHOD_CHOICES)}"
         )
     return loss_method
 
 
-def _trace_fieldnames_for_loss_method(loss_method):
-    """Return trace CSV headers for a given loss method."""
-    loss_method = _validate_loss_method(loss_method)
+def trace_fieldnames_for_loss_method(loss_method):
+    """Return the trace csv headers for the chosen loss method"""
+    loss_method = check_loss_method(loss_method)
     return ['epoch', 'loss', *LOSS_METHOD_COMPONENT_KEYS[loss_method], *TRACE_COMMON_FIELDNAMES[2:]]
 
 
@@ -91,7 +90,7 @@ STREAMLINE_MODEL_PARAM_KEYS = (
 )
 
 
-DEFAULT_OPTIMIZABLE_PARAM_KEYS = (
+DEFAULT_optimisABLE_PARAM_KEYS = (
     'r0',
     'theta0',
     'phi0',
@@ -100,8 +99,8 @@ DEFAULT_OPTIMIZABLE_PARAM_KEYS = (
 )
 
 
-def _is_numeric_value(value):
-    """Return True for scalar/array-like numeric values, excluding booleans."""
+def is_numeric_value(value):
+    """Return True for scalar/array-like numeric values"""
     try:
         arr = jnp.asarray(value)
     except Exception:
@@ -111,77 +110,76 @@ def _is_numeric_value(value):
     return bool(jnp.issubdtype(arr.dtype, jnp.number))
 
 
-def _to_float64(value):
-    """Convert a numeric value or array-like input to float64."""
-    return jnp.asarray(value, dtype=FLOAT_DTYPE)
+def to_float64(value):
+    """Convert a numeric value or array-like input to float64"""
+    return jnp.asarray(value, dtype=jnp.float64)
 
 
-def _coerce_opt_params_float64(opt_params):
-    """Return optimization parameters coerced to float64."""
+def make_opt_params_float64(opt_params):
+    """Return optimisation parameters as float64"""
     coerced = {}
     for key, value in opt_params.items():
-        if _is_numeric_value(value):
-            coerced[key] = _to_float64(value)
+        if is_numeric_value(value):
+            coerced[key] = to_float64(value)
         else:
             coerced[key] = value
     return coerced
 
 
-def _coerce_fixed_params_float64(fixed_params):
-    """Return fixed-parameter dictionary with numeric values coerced to float64."""
+def make_fixed_params_float64(fixed_params):
+    """Return fixed-parameter dictionary with numeric values as float64"""
     coerced = {}
     for key, value in fixed_params.items():
         if value is None or isinstance(value, bool):
             coerced[key] = value
-        elif _is_numeric_value(value):
-            coerced[key] = _to_float64(value)
+        elif is_numeric_value(value):
+            coerced[key] = to_float64(value)
         else:
             coerced[key] = value
     return coerced
 
 
-def _coerce_data_tuple_float64(values):
-    """Coerce tuple/list of arrays to float64 arrays."""
-    return tuple(_to_float64(value) for value in values)
+def make_data_tuple_float64(values):
+    """Convert tuple/list of arrays to float64 arrays"""
+    return tuple(to_float64(value) for value in values)
 
 
-def _sanitize_model_param_dict(params, dict_name):
-    """Coerce a parameter dictionary to float64 and normalize aliases."""
+def clean_model_param_dict(params, dict_name):
+    """Convert parameter dictionary to float64 and standardise it"""
     if params is None:
         params = {}
     if not isinstance(params, dict):
         raise TypeError(f"{dict_name} must be a dictionary, got {type(params).__name__}.")
 
     if dict_name == 'initial_opt_params':
-        sanitized = _coerce_opt_params_float64(params.copy())
+        sanitized = make_opt_params_float64(params.copy())
     else:
-        sanitized = _coerce_fixed_params_float64(params.copy())
+        sanitized = make_fixed_params_float64(params.copy())
 
     if 'omega' in sanitized and 'log_omega' not in sanitized:
-        sanitized['log_omega'] = jnp.log(_to_float64(sanitized['omega']))
+        sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
     if 'omega' in sanitized:
         del sanitized['omega']
 
-    tiny = _to_float64(1e-8)
+    tiny = to_float64(1e-8)
     # Protect against exact polar-angle edge values which can cause
-    # downstream numerical issues (theta=0 or theta=pi). If the user
-    # supplied exactly 0 or pi, nudge by a tiny amount into the open
-    # interval (0, pi).
+    # downstream numerical issues (theta=0 or theta=pi). 
+    # If the uservsupplied exactly 0 or pi, 
+    # nudge by a tiny amount into the open interval (0, pi).
     if 'theta0' in sanitized:
         try:
-            theta_val = _to_float64(sanitized['theta0'])
-            if bool(jnp.all(jnp.isclose(theta_val, _to_float64(0.0)))):
+            theta_val = to_float64(sanitized['theta0'])
+            if bool(jnp.all(jnp.isclose(theta_val, to_float64(0.0)))):
                 sanitized['theta0'] = theta_val + tiny
-            elif bool(jnp.all(jnp.isclose(theta_val, _to_float64(jnp.pi)))):
+            elif bool(jnp.all(jnp.isclose(theta_val, to_float64(jnp.pi)))):
                 sanitized['theta0'] = theta_val - tiny
         except Exception:
-            # If anything unexpected happens (non-numeric), leave value as-is
             pass
 
     unknown = sorted(key for key in sanitized if key not in STREAMLINE_MODEL_PARAM_KEYS)
     if unknown:
         raise KeyError(
-            f"Unknown parameter keys in {dict_name}: {unknown}. "
+            f"Unknown parameter keys in {dict_name}: {unknown} "
             f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
         )
 
@@ -192,17 +190,17 @@ def _validate_param_value_types(opt_params, fixed_params):
     """Validate numeric/None value types for model parameters."""
     for key, value in opt_params.items():
         if key == 'rmin' and value is None:
-            raise ValueError("Optimizable parameter 'rmin' cannot be None.")
-        if isinstance(value, bool) or not _is_numeric_value(value):
+            raise ValueError("optimisable parameter 'rmin' cannot be None.")
+        if isinstance(value, bool) or not is_numeric_value(value):
             raise TypeError(
-                f"Optimizable parameter '{key}' must be numeric. "
+                f"optimisable parameter '{key}' must be numeric. "
                 f"Got value of type {type(value).__name__}."
             )
 
     for key, value in fixed_params.items():
         if key == 'rmin' and value is None:
             continue
-        if isinstance(value, bool) or not _is_numeric_value(value):
+        if isinstance(value, bool) or not is_numeric_value(value):
             raise TypeError(
                 f"Fixed parameter '{key}' must be numeric"
                 " (or None only for 'rmin'). "
@@ -212,8 +210,8 @@ def _validate_param_value_types(opt_params, fixed_params):
 
 def _sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
     """Sanitize and validate opt/fixed parameter partition for streamline modeling."""
-    opt_params = _sanitize_model_param_dict(initial_opt_params, 'initial_opt_params')
-    fixed_params = _sanitize_model_param_dict(fixed_params, 'fixed_params')
+    opt_params = clean_model_param_dict(initial_opt_params, 'initial_opt_params')
+    fixed_params = clean_model_param_dict(fixed_params, 'fixed_params')
 
     overlap = sorted(set(opt_params) & set(fixed_params))
     if overlap:
@@ -233,7 +231,7 @@ def _sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty
 
     if require_nonempty_opt and len(opt_params) == 0:
         raise ValueError(
-            "initial_opt_params must contain at least one optimizable parameter. "
+            "initial_opt_params must contain at least one optimisable parameter. "
             f"You can choose any subset of: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
         )
 
@@ -282,18 +280,18 @@ def _normalize_param_bounds(param_bounds):
 
 
 def _build_normalization_spec(opt_params, param_bounds):
-    """Build bounds-derived shift/scale metadata for optimized parameters."""
+    """Build bounds-derived shift/scale metadata for optimised parameters."""
     if param_bounds is None:
         raise ValueError(
-            "param_bounds is required because optimization is performed in normalized space. "
-            "Provide bounds for every optimized parameter."
+            "param_bounds is required because optimisation is performed in normalized space. "
+            "Provide bounds for every optimised parameter."
         )
 
     missing = sorted(key for key in opt_params if key not in param_bounds)
     if missing:
         raise ValueError(
-            "Missing bounds for optimized parameters: "
-            f"{missing}. Please add (min, max) entries for all optimized keys."
+            "Missing bounds for optimised parameters: "
+            f"{missing}. Please add (min, max) entries for all optimised keys."
         )
 
     normalization_spec = {}
@@ -305,8 +303,8 @@ def _build_normalization_spec(opt_params, param_bounds):
                 f"Got: {bounds!r}"
             )
 
-        lower = _to_float64(bounds[0])
-        upper = _to_float64(bounds[1])
+        lower = to_float64(bounds[0])
+        upper = to_float64(bounds[1])
         if not bool(jnp.isfinite(lower)) or not bool(jnp.isfinite(upper)):
             raise ValueError(f"Bounds for '{key}' must be finite. Got ({bounds[0]}, {bounds[1]}).")
         if not bool(upper > lower):
@@ -314,7 +312,7 @@ def _build_normalization_spec(opt_params, param_bounds):
                 f"Bounds for '{key}' must satisfy min < max. Got ({float(lower)}, {float(upper)})."
             )
 
-        value = _to_float64(value)
+        value = to_float64(value)
         if not bool(jnp.isfinite(value)):
             raise ValueError(f"Initial value for '{key}' must be finite. Got {value}.")
         if not bool((value >= lower) & (value <= upper)):
@@ -333,29 +331,29 @@ def _build_normalization_spec(opt_params, param_bounds):
 
 
 def _normalize_opt_params(opt_params, normalization_spec):
-    """Normalize optimized parameters to [0, 1] using x_norm=(x-min)/(max-min)."""
+    """Normalize optimised parameters to [0, 1] using x_norm=(x-min)/(max-min)."""
     normalized = {}
     for key, value in opt_params.items():
         offset = normalization_spec[key]['offset']
         scale = normalization_spec[key]['scale']
-        normalized[key] = (_to_float64(value) - offset) / scale
+        normalized[key] = (to_float64(value) - offset) / scale
     return normalized
 
 
 def _denormalize_opt_params(norm_opt_params, normalization_spec):
-    """Convert normalized optimized parameters back to physical/log parameter values."""
+    """Convert normalized optimised parameters back to physical/log parameter values."""
     denormalized = {}
     for key, value in norm_opt_params.items():
         offset = normalization_spec[key]['offset']
         scale = normalization_spec[key]['scale']
-        denormalized[key] = _to_float64(value) * scale + offset
+        denormalized[key] = to_float64(value) * scale + offset
     return denormalized
 
 
 def _params_dict_to_vector(opt_params):
     """Convert parameter dict to ordered vector."""
     keys = list(opt_params.keys())
-    vec = jnp.array([opt_params[k] for k in keys], dtype=FLOAT_DTYPE)
+    vec = jnp.array([opt_params[k] for k in keys], dtype=jnp.float64)
     return vec, keys
 
 
@@ -364,7 +362,7 @@ def _vector_to_params_dict(vec, keys):
     return {k: vec[i] for i, k in enumerate(keys)}
 
 def _omega_from_log_omega(log_omega):
-    """Convert optimization-space log_omega to physical omega (1/s)."""
+    """Convert optimisation-space log_omega to physical omega (1/s)."""
     return jnp.exp(log_omega)
 
 
@@ -412,7 +410,7 @@ def _tree_has_nonfinite_values(tree):
 def _gradient_l2_norm(grad_tree):
     """Compute L2 norm of gradients across all leaves in a pytree."""
     grad_leaves = jax.tree_util.tree_leaves(grad_tree)
-    grad_sum_sq = jnp.asarray(0.0, dtype=FLOAT_DTYPE)
+    grad_sum_sq = jnp.asarray(0.0, dtype=jnp.float64)
     for grad_leaf in grad_leaves:
         grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
     return jnp.sqrt(grad_sum_sq)
@@ -420,13 +418,13 @@ def _gradient_l2_norm(grad_tree):
 @jax.jit
 def _softplus_barrier(value, tau):
     """Smooth approximation to max(0, value) with transition scale tau."""
-    tau = _to_float64(tau)
-    return tau * jnp.logaddexp(_to_float64(0.0), _to_float64(value) / tau)
+    tau = to_float64(tau)
+    return tau * jnp.logaddexp(to_float64(0.0), to_float64(value) / tau)
 
 @jax.jit
 def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     """Penalize only missing endpoint coverage in projected radius."""
-    margin = _to_float64(0.2 * (data_max - data_min))
+    margin = to_float64(0.2 * (data_max - data_min))
     tau = 0.8 * margin
 
     model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
@@ -453,7 +451,7 @@ def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, dat
 
 def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
     """Flatten nested trace dictionary into a CSV row."""
-    loss_method = _validate_loss_method(loss_method)
+    loss_method = check_loss_method(loss_method)
     chi2_components = loss_trace.get('chi2_components', {})
     matching = loss_trace.get('matching', {})
     model_metric_trace = matching.get('distance_metric_model', {})
@@ -504,7 +502,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
     Parameters:
     -----------
     opt_params : dict
-        Dictionary containing optimizable parameters (any subset of
+        Dictionary containing optimisable parameters (any subset of
         STREAMLINE_MODEL_PARAM_KEYS).
     fixed_params : dict
         Dictionary containing fixed parameters (the complementary subset).
@@ -521,16 +519,16 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - Line-of-sight velocities in km/s, relative to v_lsr
     """
     model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
-    distance_pc = _to_float64(distance_pc)
+    distance_pc = to_float64(distance_pc)
 
     omega = _omega_from_log_omega(model_params['log_omega'])
 
     # Protect near-zero v_r0 from creating singularities in physics calculations
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
     v_r0_protected = model_params['v_r0']
-    threshold = _to_float64(1e-6)
+    threshold = to_float64(1e-6)
     v_r0_protected = jnp.where(
-        jnp.isclose(v_r0_protected, _to_float64(0.0)),
+        jnp.isclose(v_r0_protected, to_float64(0.0)),
         - jnp.sign(v_r0_protected) * threshold,
         v_r0_protected
         )
@@ -583,7 +581,7 @@ def forward_fill_nans(arr):
     filled : array
         Array with NaN values forward-filled
     """
-    arr = _to_float64(arr)
+    arr = to_float64(arr)
     is_nan = jnp.isnan(arr)
     arr_clean = jnp.nan_to_num(arr, nan=0.0)
     
@@ -615,15 +613,15 @@ def _distance_metric_overlap_bounds(dmetric_model, model_finite_mask, dmetric_da
 @jax.jit
 def _order_model_support_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
     """Order finite model support by distance metric, skipping argsort when already monotonic."""
-    dmetric_model = _to_float64(dmetric_model)
-    ra_model = _to_float64(ra_model)
-    dec_model = _to_float64(dec_model)
-    v_model = _to_float64(v_model)
+    dmetric_model = to_float64(dmetric_model)
+    ra_model = to_float64(ra_model)
+    dec_model = to_float64(dec_model)
+    v_model = to_float64(v_model)
 
     if dmetric_model.size <= 1:
         return dmetric_model, ra_model, dec_model, v_model
 
-    sort_tol = _to_float64(sort_tol)
+    sort_tol = to_float64(sort_tol)
     d_diff = jnp.diff(dmetric_model)
     ascending = jnp.all(d_diff >= -sort_tol)
     descending = jnp.all(d_diff <= sort_tol)
@@ -683,11 +681,11 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         fewer than two model points remain in the overlap domain.
     """
 
-    ra_model = _to_float64(ra_model)
-    dec_model = _to_float64(dec_model)
-    v_model = _to_float64(v_model)
-    ra_data = _to_float64(ra_data)
-    dec_data = _to_float64(dec_data)
+    ra_model = to_float64(ra_model)
+    dec_model = to_float64(dec_model)
+    v_model = to_float64(v_model)
+    ra_data = to_float64(ra_data)
+    dec_data = to_float64(dec_data)
 
     # Compute the streamline distance metric for model/data in float64.
     if return_trace:
@@ -792,7 +790,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
 
     ra_model_interp = jnp.where(data_keep, ra_interp_all, ra_data)
     dec_model_interp = jnp.where(data_keep, dec_interp_all, dec_data)
-    v_model_interp = jnp.where(data_keep, v_interp_all, _to_float64(0.0))
+    v_model_interp = jnp.where(data_keep, v_interp_all, to_float64(0.0))
 
     valid = data_keep
 
@@ -871,10 +869,10 @@ def _chi2_loss_raw(
 ):
     """Compute chi-squared loss and, when requested, return a trace tree with raw JAX values."""
 
-    loss_method = _validate_loss_method(loss_method)
+    loss_method = check_loss_method(loss_method)
 
     opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
-    distance_pc = _to_float64(distance_pc)
+    distance_pc = to_float64(distance_pc)
 
     ra_data = prepared_data.ra_data
     dec_data = prepared_data.dec_data
@@ -921,7 +919,7 @@ def _chi2_loss_raw(
         dtheta = extract_streamline._wrap_to_pi(theta_proj_data - theta_proj_model)
 
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = _to_float64(1e-8)
+        r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
@@ -969,12 +967,12 @@ def _chi2_loss_raw(
         model_metric_duplicate_count = jnp.sum(d_diff == 0.0)
         model_metric_non_monotonic_count = jnp.sum(d_diff < 0.0)
     else:
-        model_metric_min_gap = _to_float64(float('nan'))
-        model_metric_near_tie_count = _to_float64(0.0)
-        model_metric_duplicate_count = _to_float64(0.0)
-        model_metric_non_monotonic_count = _to_float64(0.0)
+        model_metric_min_gap = to_float64(float('nan'))
+        model_metric_near_tie_count = to_float64(0.0)
+        model_metric_duplicate_count = to_float64(0.0)
+        model_metric_non_monotonic_count = to_float64(0.0)
 
-    model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else _to_float64(0.0)
+    model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
 
     if loss_method == 'radecvel':
         chi2_components = {
@@ -1046,7 +1044,7 @@ def chi2_loss(
     Parameters:
     -----------
     opt_params : dict
-        Optimizable streamline model parameters (any subset of
+        optimisable streamline model parameters (any subset of
         STREAMLINE_MODEL_PARAM_KEYS).
     fixed_params : dict
         Fixed streamline model parameters (complementary subset).
@@ -1066,10 +1064,10 @@ def chi2_loss(
     float: Chi-squared loss value
     """
 
-    loss_method = _validate_loss_method(loss_method)
+    loss_method = check_loss_method(loss_method)
 
     opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
-    distance_pc = _to_float64(distance_pc)
+    distance_pc = to_float64(distance_pc)
 
     ra_data = prepared_data.ra_data
     dec_data = prepared_data.dec_data
@@ -1129,7 +1127,7 @@ def chi2_loss(
         dtheta = extract_streamline._wrap_to_pi(theta_proj_data - theta_proj_model)
 
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = _to_float64(1e-8)
+        r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
@@ -1225,13 +1223,13 @@ def estimate_parameter_errors(
         normalized-space gradient norm > gradient_tol at best params, a
         warning is issued because the quadratic approximation may not be valid.
     normalization_spec : dict or None
-        Bounds-derived normalization metadata for optimized parameters.
+        Bounds-derived normalization metadata for optimised parameters.
         Required to evaluate gradient_tol in normalized space.
 
     Returns
     -------
     dict
-        1-sigma uncertainties for each optimizable parameter
+        1-sigma uncertainties for each optimisable parameter
     array
         covariance matrix
     """
@@ -1245,7 +1243,7 @@ def estimate_parameter_errors(
 
     # convert dict -> vector
     params_vec, keys = _params_dict_to_vector(best_opt_params)
-    loss_method = _validate_loss_method(loss_method)
+    loss_method = check_loss_method(loss_method)
 
     def loss_vec(theta_vec):
         params = _vector_to_params_dict(theta_vec, keys)
@@ -1271,7 +1269,7 @@ def estimate_parameter_errors(
             missing_norm_keys = [key for key in keys if key not in normalization_spec]
             if missing_norm_keys:
                 raise ValueError(
-                    "normalization_spec is missing optimized parameter keys required "
+                    "normalization_spec is missing optimised parameter keys required "
                     f"for gradient_tol check: {missing_norm_keys}"
                 )
 
@@ -1299,7 +1297,7 @@ def estimate_parameter_errors(
                     "WARNING: Normalized-space gradient norm at best fit = "
                     f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
                 )
-                print("Optimization may not have reached a minimum yet.")
+                print("optimisation may not have reached a minimum yet.")
                 print("Parameter uncertainties may be unreliable or incalculable. Consider:")
                 print("    - Increasing n_epochs")
                 print("    - Reducing learning rate for finer convergence")
@@ -1329,22 +1327,22 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    output_uncertainties=False,
                    ):
     """
-    Fit streamline model parameters to data using Adam optimizer.
-    Any supported streamline parameter can be optimized or fixed.
+    Fit streamline model parameters to data using Adam optimiser.
+    Any supported streamline parameter can be optimised or fixed.
     Parameters are split by dictionary membership:
-    - keys in initial_opt_params are optimized
+    - keys in initial_opt_params are optimised
     - keys in fixed_params are held fixed
     The union must contain each key in STREAMLINE_MODEL_PARAM_KEYS exactly once.
     
     Parameters:
     -----------
     initial_opt_params : dict
-        Initial guesses for the parameters to optimize.
+        Initial guesses for the parameters to optimise.
         Allowed keys are STREAMLINE_MODEL_PARAM_KEYS.
-        Historically, the default optimized subset is:
-        DEFAULT_OPTIMIZABLE_PARAM_KEYS.
+        Historically, the default optimised subset is:
+        DEFAULT_optimisABLE_PARAM_KEYS.
     fixed_params : dict
-        Fixed (non-optimized) parameters using the same key space.
+        Fixed (non-optimised) parameters using the same key space.
         Together with initial_opt_params, this must provide a full,
         non-overlapping partition of STREAMLINE_MODEL_PARAM_KEYS.
     data : tuple of arrays (ra_data, dec_data, v_data)
@@ -1357,13 +1355,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Adam learning rate applied uniformly to all normalized parameters.
     param_bounds : dict or None
         Parameter bounds in physical/log parameter units.
-        Optimization is performed in normalized space using
+        optimisation is performed in normalized space using
         x_norm = (x - min) / (max - min), so bounds are required for all
-        optimized keys and are used as normalization anchors.
+        optimised keys and are used as normalization anchors.
         You may provide 'omega' bounds as linear bounds; these are converted
         to 'log_omega' bounds internally.
     n_epochs : int
-        Maximum number of optimization iterations
+        Maximum number of optimisation iterations
     beta1 : float
         Adam exponential decay rate for first moment
     beta2 : float
@@ -1383,19 +1381,19 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Must be >= 1.
     loss_method : str
         Loss definition to use. Options:
-        - 'radecvel': optimize RA, Dec, and velocity residuals.
-        - 'rthetavel': optimize radial distance, polar angle, and velocity residuals.
+        - 'radecvel': optimise RA, Dec, and velocity residuals.
+        - 'rthetavel': optimise radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
     loss_threshold : float or None
         Optional absolute loss threshold for threshold-based stopping.
-        If provided, optimization stops after loss is <= loss_threshold for
+        If provided, optimisation stops after loss is <= loss_threshold for
         loss_threshold_epochs consecutive epochs.
     loss_threshold_epochs : int
         Number of consecutive epochs with loss <= loss_threshold required to
         trigger threshold-based early stopping. Must be >= 1.
     gradient_tol : float or None
         Optional gradient norm tolerance for stopping in normalized space.
-        If provided, optimization stops when the L2 norm of gradients with
+        If provided, optimisation stops when the L2 norm of gradients with
         respect to normalized parameters
         is less than this threshold for gradient_tol_epochs consecutive epochs,
         indicating convergence.
@@ -1420,22 +1418,22 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
     Returns:
     --------   
-    dict: Optimized parameters (same keys as initial_opt_params), including
-        derived 'omega' when 'log_omega' is optimized.
+    dict: optimised parameters (same keys as initial_opt_params), including
+        derived 'omega' when 'log_omega' is optimised.
     list: Loss history (indexed by epoch: loss_history[i] = loss at epoch i)
     """
     # Initialize parameters
-    loss_method = _validate_loss_method(loss_method)
+    loss_method = check_loss_method(loss_method)
     opt_params, fixed_params = _sanitize_param_partition(
         initial_opt_params,
         fixed_params,
         require_nonempty_opt=True,
     )
     opt_param_keys = list(opt_params.keys())
-    data = _coerce_data_tuple_float64(data)
-    uncertainties = _coerce_data_tuple_float64(uncertainties)
-    distance_pc = _to_float64(distance_pc)
-    learning_rate = _to_float64(learning_rate)
+    data = make_data_tuple_float64(data)
+    uncertainties = make_data_tuple_float64(uncertainties)
+    distance_pc = to_float64(distance_pc)
+    learning_rate = to_float64(learning_rate)
     if not bool(jnp.isfinite(learning_rate)):
         raise ValueError(f'learning_rate must be finite. Got {learning_rate}.')
     if not bool(learning_rate > 0):
@@ -1443,7 +1441,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     param_bounds = _normalize_param_bounds(param_bounds)
     normalization_spec = _build_normalization_spec(opt_params, param_bounds)
 
-    # Keep optimization variables in normalized coordinates; convert back to
+    # Keep optimisation variables in normalized coordinates; convert back to
     # physical/log units only when evaluating the forward model and diagnostics.
     opt_params_norm = _normalize_opt_params(opt_params, normalization_spec)
 
@@ -1452,7 +1450,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
     opt_state = solver.init(opt_params_norm)
 
-    # Precompute data-only quantities once before optimization loop
+    # Precompute data-only quantities once before optimisation loop
     prepared_data = extract_streamline.prepare_data(data, uncertainties)
 
     def loss_from_normalized(norm_opt_params):
@@ -1517,7 +1515,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     csv_writer = None
     if log_file is not None:
         csv_file = open(log_file, 'w', newline='')
-        # Create header: epoch, loss, then all optimizable params
+        # Create header: epoch, loss, then all optimisable params
         fieldnames = ['epoch', 'loss'] + opt_param_keys
         if 'log_omega' in opt_params and 'omega' not in fieldnames:
             fieldnames.append('omega')
@@ -1531,14 +1529,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         trace_csv_file = open(trace_file, 'w', newline='')
         trace_csv_writer = csv.DictWriter(
             trace_csv_file,
-            fieldnames=_trace_fieldnames_for_loss_method(loss_method),
+            fieldnames=trace_fieldnames_for_loss_method(loss_method),
         )
         trace_csv_writer.writeheader()
         trace_csv_file.flush()
     
-    print(f"Starting optimization with {n_epochs} epochs...")
+    print(f"Starting optimisation with {n_epochs} epochs...")
     print(f"Loss method: {loss_method}")
-    print(f"Optimizing parameters: {opt_param_keys}")
+    print(f"optimising parameters: {opt_param_keys}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
     if loss_threshold is not None:
         print(
@@ -1550,11 +1548,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             f"Gradient norm stopping enabled (normalized space): ||grad|| < {gradient_tol:.6g} "
             f"for {gradient_tol_epochs} consecutive epochs."
         )
-    print(f"Initial optimizable values:")
+    print(f"Initial optimisable values:")
     for key in opt_param_keys:
         print(f"  {key}: {opt_params[key]:.3e}")
     
-    # Precompute data-only quantities once before optimization loop
+    # Precompute data-only quantities once before optimisation loop
     prepared_data = extract_streamline.prepare_data(data, uncertainties)
     
     # Log epoch 0: initial state (before any updates)
@@ -1622,9 +1620,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             # Gradient-aware epsilon protection for v_r0 near zero:
             # When v_r0 is very close to zero, use the sign of the gradient to determine
-            # which direction to protect towards, allowing the optimizer to continue smoothly.
+            # which direction to protect towards, allowing the optimiser to continue smoothly.
             if 'v_r0' in opt_param_keys:
-                threshold_norm = _to_float64(1e-12)  # normalized space threshold
+                threshold_norm = to_float64(1e-12)  # normalized space threshold
                 v_r0_norm_val = opt_params_norm['v_r0']
                 if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
                     # v_r0 is very close to zero; check gradient direction
@@ -1745,12 +1743,12 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         # Always close the CSV file if it was opened
         if csv_file is not None:
             csv_file.close()
-            print(f"Optimization log saved to: {log_file}")
+            print(f"Optimisation log saved to: {log_file}")
         if trace_csv_file is not None:
             trace_csv_file.close()
             print(f"Matching trace log saved to: {trace_file}")
 
-    print(f"Optimization complete!")
+    print(f"Optimisation complete!")
     print(f"\nFinal loss: {best_loss:.6f}")
     print(f"Best-fit parameters found at epoch: {best_epoch}")
     for key in ordered_best_opt_params.keys():
