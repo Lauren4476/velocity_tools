@@ -13,6 +13,7 @@ import jax
 import optax
 from . import stream_lines_grad
 from . import extract_streamline
+from . import outputs
 import csv
 import math
 
@@ -38,8 +39,6 @@ TRACE_COMMON_FIELDNAMES = [
     'high_excess_penalty',
     'chi2_total',
     'grad_norm',
-    'theta_ref_model',
-    'theta_ref_data',
     'model_points_total',
     'model_nan_count',
     'model_valid_points',
@@ -87,15 +86,6 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'rmin',
     'deltar',
     'v_lsr',
-)
-
-
-DEFAULT_optimisABLE_PARAM_KEYS = (
-    'r0',
-    'theta0',
-    'phi0',
-    'log_omega',
-    'v_r0',
 )
 
 
@@ -186,15 +176,15 @@ def clean_model_param_dict(params, dict_name):
     return sanitized
 
 
-def _validate_param_value_types(opt_params, fixed_params):
-    """Validate numeric/None value types for model parameters."""
+def check_param_types(opt_params, fixed_params):
+    """Check that model parameters are of the correct type (numeric or None for rmin)"""
     for key, value in opt_params.items():
         if key == 'rmin' and value is None:
-            raise ValueError("optimisable parameter 'rmin' cannot be None.")
+            raise ValueError("'rmin' cannot be None")
         if isinstance(value, bool) or not is_numeric_value(value):
             raise TypeError(
-                f"optimisable parameter '{key}' must be numeric. "
-                f"Got value of type {type(value).__name__}."
+                f"Optimisable parameter '{key}' must be numeric, "
+                f"got value of type {type(value).__name__}."
             )
 
     for key, value in fixed_params.items():
@@ -203,254 +193,174 @@ def _validate_param_value_types(opt_params, fixed_params):
         if isinstance(value, bool) or not is_numeric_value(value):
             raise TypeError(
                 f"Fixed parameter '{key}' must be numeric"
-                " (or None only for 'rmin'). "
-                f"Got value of type {type(value).__name__}."
+                " (or None only for 'rmin'), "
+                f"got value of type {type(value).__name__}."
             )
 
 
-def _sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
-    """Sanitize and validate opt/fixed parameter partition for streamline modeling."""
+def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
+    """Sanitize and validate opt/fixed parameter partition for streamline modeling"""
     opt_params = clean_model_param_dict(initial_opt_params, 'initial_opt_params')
     fixed_params = clean_model_param_dict(fixed_params, 'fixed_params')
 
     overlap = sorted(set(opt_params) & set(fixed_params))
     if overlap:
         raise KeyError(
-            f"Parameters cannot be present in both initial_opt_params and fixed_params: {overlap}"
+            f"Parameters cannot be present in both initial_opt_params and fixed_params! Overlap: {overlap}"
         )
 
-    missing = [
-        key for key in STREAMLINE_MODEL_PARAM_KEYS
-        if key not in opt_params and key not in fixed_params
-    ]
+    missing = []
+    for key in STREAMLINE_MODEL_PARAM_KEYS:
+        if key not in opt_params and key not in fixed_params:
+            missing.append(key)
     if missing:
         raise KeyError(
             "Missing required streamline parameters across initial_opt_params and fixed_params: "
-            f"{missing}. Supported model keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+            f"{missing}. The list of parameters is: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
         )
 
     if require_nonempty_opt and len(opt_params) == 0:
         raise ValueError(
             "initial_opt_params must contain at least one optimisable parameter. "
-            f"You can choose any subset of: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
         )
 
-    _validate_param_value_types(opt_params, fixed_params)
+    check_param_types(opt_params, fixed_params)
 
     return opt_params, fixed_params
 
 
-def _resolve_model_params(opt_params, fixed_params):
-    """Return merged model parameters and sanitized opt/fixed dictionaries."""
-    opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
+def prepare_model_params(opt_params, fixed_params):
+    """Construct merged model parameters and clean opt/fixed dictionaries"""
+    opt_params, fixed_params = sanitize_param_partition(opt_params, fixed_params)
     model_params = fixed_params.copy()
     model_params.update(opt_params)
     return model_params, opt_params, fixed_params
 
 
-def _normalize_param_bounds(param_bounds):
-    """Normalize parameter-bound keys and convert omega bounds to log-space."""
+def standardise_param_bounds(param_bounds):
+    """Check/standardise parameter-bound keys and convert omega bounds to log-space."""
     if param_bounds is None:
         return None
 
-    normalized = dict(param_bounds)
-    if 'omega' in normalized:
-        if 'log_omega' in normalized:
+    standardised = dict(param_bounds)
+    if 'omega' in standardised:
+        if 'log_omega' in standardised:
             raise KeyError(
                 "param_bounds contains both 'omega' and 'log_omega'. "
-                "Please provide only one key."
+                "Please provide only one of these."
             )
-        omega_min, omega_max = normalized.pop('omega')
+        omega_min, omega_max = standardised.pop('omega')
         omega_min = float(omega_min)
         omega_max = float(omega_max)
         if omega_min <= 0 or omega_max <= 0:
-            raise ValueError("Omega bounds must be strictly positive when using 'omega' bounds.")
+            raise ValueError("'omega' bounds must be positive")
         if omega_min >= omega_max:
-            raise ValueError("Omega bounds must satisfy omega_min < omega_max.")
-        normalized['log_omega'] = (math.log(omega_min), math.log(omega_max))
+            raise ValueError("'omega' bounds must satisfy omega_min < omega_max")
+        standardised['log_omega'] = (math.log(omega_min), math.log(omega_max))
 
-    unknown = sorted(key for key in normalized if key not in STREAMLINE_MODEL_PARAM_KEYS)
+    unknown = sorted(key for key in standardised if key not in STREAMLINE_MODEL_PARAM_KEYS)
     if unknown:
         raise KeyError(
-            f"Unknown keys in param_bounds: {unknown}. "
-            f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+            f"Unknown params in param_bounds: {unknown}. "
+            f"Supported params are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
         )
 
-    return normalized
+    return standardised
 
 
-def _build_normalization_spec(opt_params, param_bounds):
-    """Build bounds-derived shift/scale metadata for optimised parameters."""
+def build_normalisation_spec(opt_params, param_bounds):
+    """Build shift and scale for normalisation ofoptimised parameters, from bounds."""
     if param_bounds is None:
         raise ValueError(
-            "param_bounds is required because optimisation is performed in normalized space. "
-            "Provide bounds for every optimised parameter."
+            "param_bounds is required because optimisation is performed in normalised space. "
+            "Provide bounds for every parameter you want to optimise."
         )
-
-    missing = sorted(key for key in opt_params if key not in param_bounds)
+ 
+    missing = []
+    for key in opt_params:        
+        if key not in param_bounds:
+            missing.append(key)
     if missing:
         raise ValueError(
             "Missing bounds for optimised parameters: "
-            f"{missing}. Please add (min, max) entries for all optimised keys."
+            f"{missing}. Please add (min, max) entries for all parameters you want to optimise."
         )
 
-    normalization_spec = {}
+    normalisation_spec = {}
     for key, value in opt_params.items():
         bounds = param_bounds[key]
         if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
             raise ValueError(
-                f"Bounds for '{key}' must be a 2-element (min, max) tuple/list. "
+                f"Bounds for '{key}' must be a 2-element (min, max) tuple."
                 f"Got: {bounds!r}"
             )
 
-        lower = to_float64(bounds[0])
-        upper = to_float64(bounds[1])
-        if not bool(jnp.isfinite(lower)) or not bool(jnp.isfinite(upper)):
-            raise ValueError(f"Bounds for '{key}' must be finite. Got ({bounds[0]}, {bounds[1]}).")
-        if not bool(upper > lower):
+        lower_bound = to_float64(bounds[0])
+        upper_bound = to_float64(bounds[1])
+        if not bool(jnp.isfinite(lower_bound)) or not bool(jnp.isfinite(upper_bound)):
+            raise ValueError(f"Bounds for '{key}' must be finite. Got ({lower_bound}, {upper_bound})")
+        if not bool(upper_bound > lower_bound):
             raise ValueError(
-                f"Bounds for '{key}' must satisfy min < max. Got ({float(lower)}, {float(upper)})."
+                f"Bounds for '{key}' must satisfy min < max. Got ({float(lower_bound)}, {float(upper_bound)})"
             )
 
         value = to_float64(value)
-        if not bool(jnp.isfinite(value)):
-            raise ValueError(f"Initial value for '{key}' must be finite. Got {value}.")
-        if not bool((value >= lower) & (value <= upper)):
+        if not bool((value >= lower_bound) & (value <= upper_bound)):
             raise ValueError(
-                f"Initial value for '{key}' ({float(value)}) is outside bounds "
-                f"({float(lower)}, {float(upper)})."
+                f"Initial value for '{key}' ({float(value)}) is outside bounds"
+                f"({float(lower_bound)}, {float(upper_bound)})."
             )
 
-        scale = upper - lower
-        normalization_spec[key] = {
-            'offset': lower,
+        scale = upper_bound - lower_bound
+        normalisation_spec[key] = {
+            'offset': lower_bound,
             'scale': scale,
         }
 
-    return normalization_spec
+    return normalisation_spec
 
 
-def _normalize_opt_params(opt_params, normalization_spec):
-    """Normalize optimised parameters to [0, 1] using x_norm=(x-min)/(max-min)."""
-    normalized = {}
+def normalise_opt_params(opt_params, normalisation_spec):
+    """normalise optimised parameters to [0, 1]"""
+    normalised = {}
     for key, value in opt_params.items():
-        offset = normalization_spec[key]['offset']
-        scale = normalization_spec[key]['scale']
-        normalized[key] = (to_float64(value) - offset) / scale
-    return normalized
+        offset = normalisation_spec[key]['offset']
+        scale = normalisation_spec[key]['scale']
+        normalised[key] = (to_float64(value) - offset) / scale
+    return normalised
 
 
-def _denormalize_opt_params(norm_opt_params, normalization_spec):
-    """Convert normalized optimised parameters back to physical/log parameter values."""
-    denormalized = {}
+def denormalise_opt_params(norm_opt_params, normalisation_spec):
+    """Convert normalised optimised parameters back to physical/log parameter values"""
+    denormalised = {}
     for key, value in norm_opt_params.items():
-        offset = normalization_spec[key]['offset']
-        scale = normalization_spec[key]['scale']
-        denormalized[key] = to_float64(value) * scale + offset
-    return denormalized
+        offset = normalisation_spec[key]['offset']
+        scale = normalisation_spec[key]['scale']
+        denormalised[key] = to_float64(value) * scale + offset
+    return denormalised
 
 
-def _params_dict_to_vector(opt_params):
-    """Convert parameter dict to ordered vector."""
+def params_dict_to_vector(opt_params):
+    """Convert parameter dict to ordered vector"""
     keys = list(opt_params.keys())
     vec = jnp.array([opt_params[k] for k in keys], dtype=jnp.float64)
     return vec, keys
 
 
-def _vector_to_params_dict(vec, keys):
-    """Convert parameter vector back to dict."""
+def vector_to_params_dict(vec, keys):
+    """Convert parameter vector back to dict"""
     return {k: vec[i] for i, k in enumerate(keys)}
 
-def _omega_from_log_omega(log_omega):
-    """Convert optimisation-space log_omega to physical omega (1/s)."""
-    return jnp.exp(log_omega)
 
-
-def _with_derived_omega(opt_params):
-    """Return a shallow copy including derived physical omega when available."""
+def with_derived_omega(opt_params):
+    """Return a copy of the opt params including omega, when it is available"""
     params_with_omega = opt_params.copy()
     if 'log_omega' in params_with_omega and 'omega' not in params_with_omega:
-        params_with_omega['omega'] = _omega_from_log_omega(params_with_omega['log_omega'])
+        params_with_omega['omega'] = jnp.exp(params_with_omega['log_omega'])
     return params_with_omega
 
-
-def _as_float_or_value(value):
-    """Convert scalar-like values to Python floats for readable diagnostics."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return value
-
-
-def _dict_nonfinite_keys(values_dict):
-    """Return dict keys whose values contain NaN/Inf."""
-    bad_keys = []
-    for key, value in values_dict.items():
-        if not bool(jnp.all(jnp.isfinite(value))):
-            bad_keys.append(key)
-    return bad_keys
-
-
-def _tree_has_nonfinite_values(tree):
-    """Check whether any numeric leaf in a pytree contains NaN/Inf."""
-    leaves = jax.tree_util.tree_leaves(tree)
-    for leaf in leaves:
-        if leaf is None:
-            continue
-        try:
-            if not bool(jnp.all(jnp.isfinite(leaf))):
-                return True
-        except TypeError:
-            # Non-numeric leaf (e.g., metadata), ignore.
-            continue
-    return False
-
-
-@jax.jit
-def _gradient_l2_norm(grad_tree):
-    """Compute L2 norm of gradients across all leaves in a pytree."""
-    grad_leaves = jax.tree_util.tree_leaves(grad_tree)
-    grad_sum_sq = jnp.asarray(0.0, dtype=jnp.float64)
-    for grad_leaf in grad_leaves:
-        grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
-    return jnp.sqrt(grad_sum_sq)
-
-@jax.jit
-def _softplus_barrier(value, tau):
-    """Smooth approximation to max(0, value) with transition scale tau."""
-    tau = to_float64(tau)
-    return tau * jnp.logaddexp(to_float64(0.0), to_float64(value) / tau)
-
-@jax.jit
-def _coverage_endpoint_penalties(dmetric_model, model_finite_mask, data_min, data_max):
-    """Penalize only missing endpoint coverage in projected radius."""
-    margin = to_float64(0.2 * (data_max - data_min))
-    tau = 0.8 * margin
-
-    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
-    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
-    model_min = jnp.min(model_metric_for_min)
-    model_max = jnp.max(model_metric_for_max)
-
-    #model starts too far out
-    low_shortfall = _softplus_barrier(model_min - data_min + margin, tau)
-    #model starts too far in
-    low_excess = _softplus_barrier(data_min - model_min - margin, tau)
-    #model ends too far in
-    high_shortfall = _softplus_barrier(data_max - model_max + margin, tau)
-    #model ends too far out
-    high_excess = _softplus_barrier(model_max - data_max - margin, tau)
-
-
-    low_penalty = ((low_shortfall / margin) ** 2 + (low_excess / margin) **2)
-    high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
-    total_penalty = (low_penalty + high_penalty)
-
-    return total_penalty, low_shortfall, low_excess, high_shortfall, high_excess
-
-
-def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
-    """Flatten nested trace dictionary into a CSV row."""
+def build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
+    """Flatten trace dictionary into a CSV row for output"""
     loss_method = check_loss_method(loss_method)
     chi2_components = loss_trace.get('chi2_components', {})
     matching = loss_trace.get('matching', {})
@@ -472,8 +382,6 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
-        'theta_ref_model': model_metric_trace.get('theta_ref', float('nan')),
-        'theta_ref_data': data_metric_trace.get('theta_ref', float('nan')),
         'model_points_total': matching.get('model_points_total', 0),
         'model_nan_count': matching.get('model_nan_count', 0),
         'model_valid_points': matching.get('model_valid_points', 0),
@@ -494,6 +402,75 @@ def _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
 
     return row
 
+def trace_tree_to_python(value):
+    """Go through the trace tree and convert JAX arrays to Python scalars where possible"""
+    # go through containers, converting JAX arrays to Python scalars where possible, and leaving non-numeric values as-is
+    if isinstance(value, dict):
+        return {key: trace_tree_to_python(v) for key, v in value.items()}
+    if isinstance(value, list):
+        return [trace_tree_to_python(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(trace_tree_to_python(v) for v in value)
+    # preserve Nones as-is
+    if value is None:
+        return None
+    # convert jax arrays to python scalars where posible
+    try:
+        array_value = jnp.asarray(value)
+    except Exception:
+        return value
+    # if it's a scalar array, convert to scalar
+    if array_value.ndim == 0:
+        return array_value.item()
+    return value
+
+
+@jax.jit
+def gradient_l2_norm(grad_tree):
+    """Compute L2 norm of gradients across all leaves in a pytree
+    (a pytree is a nested structure of lists/dicts/tuples containing arrays, 
+    used by jax for gradients)."""
+    grad_leaves = jax.tree_util.tree_leaves(grad_tree)
+    grad_sum_sq = jnp.asarray(0.0, dtype=jnp.float64)
+    for grad_leaf in grad_leaves:
+        grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
+    return jnp.sqrt(grad_sum_sq)
+
+@jax.jit
+def softplus_barrier(value, tau):
+    """Smooth approximation to max(0, value) with transition scale tau."""
+    tau = to_float64(tau)
+    return tau * jnp.logaddexp(to_float64(0.0), to_float64(value) / tau)
+
+@jax.jit
+def coverage_penalties(dmetric_model, model_finite_mask, data_min, data_max):
+    """Penalise differences between model and data coverage in distance metric,
+    using smooth barrier functions to keep differentiability"""
+    margin = to_float64(0.2 * (data_max - data_min))
+    tau = 0.8 * margin
+
+    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
+    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
+    model_min = jnp.min(model_metric_for_min)
+    model_max = jnp.max(model_metric_for_max)
+
+    #model starts too far out
+    low_shortfall = softplus_barrier(model_min - data_min + margin, tau)
+    #model starts too far in
+    low_excess = softplus_barrier(data_min - model_min - margin, tau)
+    #model ends too far in
+    high_shortfall = softplus_barrier(data_max - model_max + margin, tau)
+    #model ends too far out
+    high_excess = softplus_barrier(model_max - data_max - margin, tau)
+
+
+    low_penalty = ((low_shortfall / margin) ** 2 + (low_excess / margin) **2)
+    high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
+    total_penalty = (low_penalty + high_penalty)
+
+    return total_penalty, low_shortfall, low_excess, high_shortfall, high_excess
+
+
 
 def forward_model(opt_params, fixed_params, distance_pc):
     """
@@ -503,25 +480,25 @@ def forward_model(opt_params, fixed_params, distance_pc):
     -----------
     opt_params : dict
         Dictionary containing optimisable parameters (any subset of
-        STREAMLINE_MODEL_PARAM_KEYS).
+        STREAMLINE_MODEL_PARAM_KEYS)
     fixed_params : dict
-        Dictionary containing fixed parameters (the complementary subset).
+        Dictionary containing fixed parameters (the complementary subset)
         Together with opt_params, this must define all keys in
-        STREAMLINE_MODEL_PARAM_KEYS exactly once.
+        STREAMLINE_MODEL_PARAM_KEYS exactly once
     distance_pc : float
         Distance to source in parsecs
         
     Returns:
     --------
-    tuple: (ra_offsets, dec_offsets, velocities) each in appropriate units
+    tuple: (ra_offsets, dec_offsets, velocities)
         - RA offsets in arcsec (negative for standard convention)
         - Dec offsets in arcsec
         - Line-of-sight velocities in km/s, relative to v_lsr
     """
-    model_params, _, _ = _resolve_model_params(opt_params, fixed_params)
+    model_params, _, _ = prepare_model_params(opt_params, fixed_params)
     distance_pc = to_float64(distance_pc)
 
-    omega = _omega_from_log_omega(model_params['log_omega'])
+    omega = jnp.exp(model_params['log_omega'])
 
     # Protect near-zero v_r0 from creating singularities in physics calculations
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
@@ -546,58 +523,21 @@ def forward_model(opt_params, fixed_params, distance_pc):
         rmin=model_params['rmin'],
         deltar=model_params['deltar']
     )
-    
-    # Filter out sentinel values (used for points below rmin)
-    # Sentinel value is -1e10, which is unphysical for positions
-    # TODO: is this used?
-    sentinel = -1e10
-    valid_mask = (x > sentinel + 1e8)  # Points where x is NOT the sentinel
-    
+     
     # Convert positions from au to arcsec offsets
     # x = RA offset (with negative for standard RA convention)
     # z = Dec offset
     # y = line-of-sight velocity
-    ra_model = jnp.where(valid_mask, -x / distance_pc, jnp.nan)  # arcsec
-    dec_model = jnp.where(valid_mask, z / distance_pc, jnp.nan)  # arcsec
-    # make velocity absolute by adding back v_lsr 
-    v_model = jnp.where(valid_mask, vy + model_params['v_lsr'], jnp.nan)  # km/s  (absolute)
+    ra_model = -x / distance_pc  # arcsec
+    dec_model = z / distance_pc  # arcsec
+    # make velocity absolute by adding back v_lsr
+    v_model = vy + model_params['v_lsr']  # km/s 
 
     return ra_model, dec_model, v_model
 
-@jax.jit
-def forward_fill_nans(arr):
-    """
-    Forward-fill NaN values in a JAX-compatible way.
-    Each NaN is replaced with the last non-NaN value before it.
-    Uses lax.scan for JIT compatibility.
-    
-    Parameters:
-    -----------
-    arr : array
-        1D array potentially containing NaN values
-        
-    Returns:
-    --------
-    filled : array
-        Array with NaN values forward-filled
-    """
-    arr = to_float64(arr)
-    is_nan = jnp.isnan(arr)
-    arr_clean = jnp.nan_to_num(arr, nan=0.0)
-    
-    # Forward-fill using scan
-    def body_fn(last_valid, x_and_is_nan):
-        x, x_is_nan = x_and_is_nan
-        new_val = jnp.where(x_is_nan, last_valid, x)
-        return new_val, new_val
-    
-    init_carry = arr_clean[0]
-    _, filled = jax.lax.scan(body_fn, init_carry, (arr_clean, is_nan))
-    return filled
 
-
-def _distance_metric_overlap_bounds(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
-    """Compute the overlapping range in the streamline distance metric."""
+def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
+    """Compute the overlapping range in the streamline distance metric between data and model"""
     model_metric = dmetric_model[model_finite_mask]
     data_metric = dmetric_data[data_finite_mask]
 
@@ -611,7 +551,7 @@ def _distance_metric_overlap_bounds(dmetric_model, model_finite_mask, dmetric_da
     return model_min, model_max, data_min, data_max, overlap_min, overlap_max
 
 @jax.jit
-def _order_model_support_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
+def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
     """Order finite model support by distance metric, skipping argsort when already monotonic."""
     dmetric_model = to_float64(dmetric_model)
     ra_model = to_float64(ra_model)
@@ -626,59 +566,44 @@ def _order_model_support_by_metric(dmetric_model, ra_model, dec_model, v_model, 
     ascending = jnp.all(d_diff >= -sort_tol)
     descending = jnp.all(d_diff <= sort_tol)
 
-    def _keep_order(_):
+    def keep_order(_):
         return dmetric_model, ra_model, dec_model, v_model
 
-    def _reverse_order(_):
+    def reverse_order(_):
         return dmetric_model[::-1], ra_model[::-1], dec_model[::-1], v_model[::-1]
 
-    def _sorted_order(_):
+    def sorted_order(_):
         sort_idx = jnp.argsort(dmetric_model)
-        return (
-            dmetric_model[sort_idx],
-            ra_model[sort_idx],
-            dec_model[sort_idx],
-            v_model[sort_idx],
-        )
+        return (dmetric_model[sort_idx], ra_model[sort_idx], dec_model[sort_idx], v_model[sort_idx])
 
     return lax.cond(
         ascending,
-        _keep_order,
-        lambda _: lax.cond(descending, _reverse_order, _sorted_order, operand=None),
+        keep_order,
+        lambda _: lax.cond(descending, reverse_order, sorted_order, operand=None),
         operand=None,
     )
-
-
 
 
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
     """
     Extract model values corresponding to data positions using the distance metric from
-    extract_streamline.get_distance_metric.
+    extract_streamline.get_distance_metric
 
     Matching is restricted to the physically overlapping distance-metric domain:
-    1. Data is restricted to the model-supported metric range.
-    2. Model is restricted to the data-supported metric range.
-    3. Interpolation is performed only on the overlap support.
+    1. data is restricted to the model-supported metric range
+    2. model is restricted to the data-supported metric range
+    3. interpolation is performed on the overlap
 
     Parameters
     ----------
     return_trace : bool
-        If True, also return a trace dictionary containing diagnostics on
-        distance metric stability and model-point ordering.
+        If True, also return a trace dictionary containing diagnostics
 
     Returns
     -------
-    tuple
-        (ra_model_interp, dec_model_interp, v_model_interp, valid)
+    tuple (ra_model_interp, dec_model_interp, v_model_interp, valid)
         where valid is a boolean mask with shape len(original data), marking
-        retained data points inside the overlap domain.
-
-    Raises
-    ------
-    ValueError
-        If no valid model/data points exist, there is no metric overlap, or
-        fewer than two model points remain in the overlap domain.
+        retained data points
     """
 
     ra_model = to_float64(ra_model)
@@ -711,15 +636,12 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         & jnp.isfinite(dmetric_data)
     )
 
-    # print(f"Model finite points: {jnp.sum(model_finite_mask)} / {ra_model.size}")
-    # print(f"Model non-finite points: {jnp.sum(~model_finite_mask)} / {ra_model.size}")
-    # print(f"Model points ra: {ra_model}")
     if not bool(jnp.any(model_finite_mask)):
         raise ValueError('No finite model points are available for model-data matching.')
     if not bool(jnp.any(data_finite_mask)):
         raise ValueError('No finite data points are available for model-data matching.')
 
-    model_min, model_max, data_min, data_max, overlap_min, overlap_max = _distance_metric_overlap_bounds(
+    model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
         dmetric_model,
         model_finite_mask,
         dmetric_data,
@@ -749,12 +671,12 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
             f'{model_retained_count} point(s) available; need at least 2.'
         )
 
-    # Reduce to finite model support once, then keep or reorder it only when needed.
+    # reduce to finite model support once, then keep or reorder it only when needed
     finite_dmetric = dmetric_model[model_finite_mask]
     finite_ra = ra_model[model_finite_mask]
     finite_dec = dec_model[model_finite_mask]
     finite_v = v_model[model_finite_mask]
-    d_model_sorted, ra_sorted, dec_sorted, v_sorted = _order_model_support_by_metric(
+    d_model_sorted, ra_sorted, dec_sorted, v_sorted = order_model_by_metric(
         finite_dmetric,
         finite_ra,
         finite_dec,
@@ -763,8 +685,8 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
 
     model_keep_sorted = (d_model_sorted >= overlap_min) & (d_model_sorted <= overlap_max)
 
-    # Build edge anchors on retained support so clipped interpolation uses only
-    # overlap-domain endpoints.
+    # build edge anchors on retained support so clipped interpolation uses only
+    # overlap-domain endpoints
     first_keep_idx = jnp.argmax(model_keep_sorted)
     last_keep_idx = model_keep_sorted.size - 1 - jnp.argmax(jnp.flip(model_keep_sorted))
 
@@ -781,8 +703,8 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     v_support = jnp.where(model_keep_sorted, v_sorted, jnp.where(is_below_overlap, v_first, v_last))
     d_support = jnp.clip(d_model_sorted, overlap_min, overlap_max)
 
-    # Interpolate only on overlap support. For dropped data points, query at
-    # overlap_min and then overwrite with finite placeholders.
+    # interpolate only on overlap
+    # for dropped data points, query at overlap_min and then overwrite with finite placeholders
     d_query = jnp.where(data_keep, dmetric_data, overlap_min)
     ra_interp_all = jnp.interp(d_query, d_support, ra_support)
     dec_interp_all = jnp.interp(d_query, d_support, dec_support)
@@ -838,40 +760,142 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max
 
 
-def _materialize_trace_tree(value):
-    """Convert a trace tree with JAX scalars into plain Python values."""
-    if isinstance(value, dict):
-        return {key: _materialize_trace_tree(subvalue) for key, subvalue in value.items()}
-    if isinstance(value, list):
-        return [_materialize_trace_tree(subvalue) for subvalue in value]
-    if isinstance(value, tuple):
-        return tuple(_materialize_trace_tree(subvalue) for subvalue in value)
-    if value is None:
-        return None
-    try:
-        array_value = jnp.asarray(value)
-    except Exception:
-        return value
-    if array_value.ndim == 0:
-        return array_value.item()
-    return value
-
-
-def _chi2_loss_raw(
+# TODO: in progress to jax jit the loss function. 
+# this is a bit tricky because of the model-data matching and the coverage penalties, which need to be carefully implemented in a jax-compatible way to maintain differentiability and efficiency. 
+'''
+def chi2_loss_jax(
     opt_params,
     fixed_params,
-    data,
-    uncertainties,
+    distance_pc,
+    prepared_data,
+    loss_method='radecvel'
+):
+    """Compute chi-squared loss. jax-compatible, trace is a pytree of jax arrays"""
+    
+    loss_method = check_loss_method(loss_method)
+
+    opt_params, fixed_params = sanitize_param_partition(opt_params, fixed_params)
+    distance_pc = to_float64(distance_pc)
+
+    ra_data = prepared_data.ra_data
+    dec_data = prepared_data.dec_data
+    v_data = prepared_data.v_data
+
+    ra_sigma = prepared_data.ra_sigma_safe
+    dec_sigma = prepared_data.dec_sigma_safe
+    v_sigma = prepared_data.v_sigma_safe
+
+    ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
+
+    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max = (
+        match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+    )
+
+    model_mask = (
+        jnp.isfinite(ra_model)
+        & jnp.isfinite(dec_model)
+        & jnp.isfinite(v_model)
+        & jnp.isfinite(dmetric_model)
+    )
+
+    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
+        dmetric_model,
+        model_mask,
+        prepared_data.data_min,
+        prepared_data.data_max,
+    )
+
+    # shared chi2_velocity term on valid/retained data points
+    chi2_v = jnp.sum(((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2)
+
+    def radec_case(_):
+        chi2_ra = jnp.sum(((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2)
+        chi2_dec = jnp.sum(((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2)
+        chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
+
+        trace = {
+            'chi2': {
+                'ra': chi2_ra,
+                'dec': chi2_dec,
+                'v': chi2_v,
+            },
+            "penalty": chi2_penalty,
+            "low_shortfall": low_shortfall,
+            "low_excess": low_excess,
+            "high_shortfall": high_shortfall,
+            "high_excess": high_excess,
+            'chi2_total': chi2_total,
+        }
+
+        return chi2_total, trace
+    
+    def rtheta_case(_):
+        r_proj_data = prepared_data.r_proj_data
+        theta_proj_data = prepared_data.theta_proj_data
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
+            ra_model_interp,
+            dec_model_interp,
+        )
+
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+
+        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+        r_eps = to_float64(1e-8)
+        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.maximum(sigma_theta, r_eps)
+
+        chi2_r = jnp.sum(((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2)
+        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
+        chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
+
+        trace = {
+            'chi2': {
+                'r': chi2_r,
+                'theta': chi2_theta,
+                'v': chi2_v,
+            },
+            "penalty": chi2_penalty,
+            "low_shortfall": low_shortfall,
+            "low_excess": low_excess,
+            "high_shortfall": high_shortfall,
+            "high_excess": high_excess,
+            'chi2_total': chi2_total,
+        }
+
+        return chi2_total, trace
+    
+    return lax.cond(loss_method == 'radecvel', radec_case, rtheta_case, operand=None)
+
+def chi2_loss_new(
+    opt_params,
+    fixed_params,
+    distance_pc,
+    prepared_data,
+    loss_method='radecvel',
+    return_trace=False):
+    """Compute chi-squared loss and optionally return a diagnostic trace dictionary (python, not jax compatible)"""
+
+    loss, trace = chi2_loss_jax(opt_params, fixed_params, distance_pc, prepared_data, loss_method)
+    if not return_trace:
+        return loss
+    
+    trace_python = outputs.trace_tree_to_python(trace)
+    return loss, trace_python'''
+
+def chi2_loss_raw(
+    opt_params,
+    fixed_params,
     distance_pc,
     prepared_data,
     return_trace=False,
     loss_method='radecvel',
 ):
-    """Compute chi-squared loss and, when requested, return a trace tree with raw JAX values."""
+    """Compute chi-squared loss and optionally return a diagnostic trace tree"""
 
     loss_method = check_loss_method(loss_method)
 
-    opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
+    opt_params, fixed_params = sanitize_param_partition(opt_params, fixed_params)
     distance_pc = to_float64(distance_pc)
 
     ra_data = prepared_data.ra_data
@@ -888,6 +912,7 @@ def _chi2_loss_raw(
     )
 
     dmetric_data = prepared_data.dmetric_data
+
     model_finite_mask = (
         jnp.isfinite(ra_model)
         & jnp.isfinite(dec_model)
@@ -895,7 +920,7 @@ def _chi2_loss_raw(
         & jnp.isfinite(dmetric_model)
     )
 
-    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = _coverage_endpoint_penalties(
+    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
@@ -916,7 +941,7 @@ def _chi2_loss_raw(
             dec_model_interp,
         )
 
-        dtheta = extract_streamline._wrap_to_pi(theta_proj_data - theta_proj_model)
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
 
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
         r_eps = to_float64(1e-8)
@@ -932,19 +957,13 @@ def _chi2_loss_raw(
     if not return_trace:
         return chi2_total
 
-    model_finite_mask = (
-        jnp.isfinite(ra_model)
-        & jnp.isfinite(dec_model)
-        & jnp.isfinite(v_model)
-        & jnp.isfinite(dmetric_model)
-    )
     data_finite_mask = (
         jnp.isfinite(ra_data)
         & jnp.isfinite(dec_data)
         & jnp.isfinite(dmetric_data)
     )
 
-    model_min, model_max, data_min, data_max, overlap_min, overlap_max = _distance_metric_overlap_bounds(
+    model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
         dmetric_model,
         model_finite_mask,
         dmetric_data,
@@ -1029,8 +1048,6 @@ def _chi2_loss_raw(
 def chi2_loss(
     opt_params,
     fixed_params,
-    data,
-    uncertainties,
     distance_pc,
     prepared_data,
     return_trace=False,
@@ -1048,10 +1065,6 @@ def chi2_loss(
         STREAMLINE_MODEL_PARAM_KEYS).
     fixed_params : dict
         Fixed streamline model parameters (complementary subset).
-    data : tuple of arrays (ra_data, dec_data, v_data)
-        Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
-    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
-        Uncertainties on the data
     distance_pc : float
         Distance to source in parsecs
     prepared_data : PreparedData
@@ -1066,7 +1079,7 @@ def chi2_loss(
 
     loss_method = check_loss_method(loss_method)
 
-    opt_params, fixed_params = _sanitize_param_partition(opt_params, fixed_params)
+    opt_params, fixed_params = sanitize_param_partition(opt_params, fixed_params)
     distance_pc = to_float64(distance_pc)
 
     ra_data = prepared_data.ra_data
@@ -1093,6 +1106,7 @@ def chi2_loss(
 
     ### smooth overlap and weighting - penalty for being outside overlap
     dmetric_data = prepared_data.dmetric_data
+
     model_finite_mask = (
         jnp.isfinite(ra_model)
         & jnp.isfinite(dec_model)
@@ -1100,7 +1114,7 @@ def chi2_loss(
         & jnp.isfinite(dmetric_model)
     )
 
-    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = _coverage_endpoint_penalties(
+    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = coverage_penalties(
         dmetric_model,
         model_finite_mask,
         prepared_data.data_min,
@@ -1124,7 +1138,7 @@ def chi2_loss(
             dec_model_interp,
         )
 
-        dtheta = extract_streamline._wrap_to_pi(theta_proj_data - theta_proj_model)
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
 
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
         r_eps = to_float64(1e-8)
@@ -1174,31 +1188,6 @@ def chi2_loss(
 
     return chi2_total
 
-    '''
-
-    ### Original RA/Dec/velocity loss
-
-    # Compute chi-squared components
-    chi2_ra = jnp.sum(((ra_data - ra_model_interp) / ra_sigma)**2)
-    chi2_dec = jnp.sum(((dec_data - dec_model_interp) / dec_sigma)**2)
-    chi2_v = jnp.sum(((v_data - v_model_interp) / v_sigma)**2)
-    # Total chi-squared
-    chi2_total = chi2_ra + chi2_dec + chi2_v
-
-    if return_trace:
-        loss_trace = {
-            'chi2_components': {
-                'chi2_ra': float(chi2_ra),
-                'chi2_dec': float(chi2_dec),
-                'chi2_v': float(chi2_v),
-                'chi2_total': float(chi2_total),
-            },
-            'matching': matching_trace,
-        }
-        return chi2_total, loss_trace
-
-    return chi2_total
-    '''
 
 def estimate_parameter_errors(
     best_opt_params,
@@ -1209,7 +1198,7 @@ def estimate_parameter_errors(
     prepared_data,
     loss_method='radecvel',
     gradient_tol=1e-1,
-    normalization_spec=None,
+    normalisation_spec=None,
 ):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
@@ -1219,12 +1208,12 @@ def estimate_parameter_errors(
     prepared_data : PreparedData
         Precomputed data-only quantities (created via extract_streamline.prepare_data).
     gradient_tol : float or None
-        Tolerance on gradient norm in normalized space. If provided and
-        normalized-space gradient norm > gradient_tol at best params, a
+        Tolerance on gradient norm in normalised space. If provided and
+        normalised-space gradient norm > gradient_tol at best params, a
         warning is issued because the quadratic approximation may not be valid.
-    normalization_spec : dict or None
-        Bounds-derived normalization metadata for optimised parameters.
-        Required to evaluate gradient_tol in normalized space.
+    normalisation_spec : dict or None
+        Bounds-derived normalisation metadata for optimised parameters.
+        Required to evaluate gradient_tol in normalised space.
 
     Returns
     -------
@@ -1242,59 +1231,55 @@ def estimate_parameter_errors(
             raise ValueError('gradient_tol must be positive when provided.')
 
     # convert dict -> vector
-    params_vec, keys = _params_dict_to_vector(best_opt_params)
+    params_vec, keys = params_dict_to_vector(best_opt_params)
     loss_method = check_loss_method(loss_method)
 
     def loss_vec(theta_vec):
-        params = _vector_to_params_dict(theta_vec, keys)
+        params = vector_to_params_dict(theta_vec, keys)
         return chi2_loss(
             params,
             fixed_params,
-            data,
-            uncertainties,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
         )
 
-    # Check gradient magnitude at best-fit parameters in normalized space.
+    # Check gradient magnitude at best-fit parameters in normalised space.
     if gradient_tol is not None:
-        if normalization_spec is None:
+        if normalisation_spec is None:
             print(
-                "WARNING: gradient_tol is interpreted in normalized space, but "
-                "normalization_spec was not provided. Skipping gradient_tol check "
+                "WARNING: gradient_tol is interpreted in normalised space, but "
+                "normalisation_spec was not provided. Skipping gradient_tol check "
                 "for uncertainty estimation."
             )
         else:
-            missing_norm_keys = [key for key in keys if key not in normalization_spec]
+            missing_norm_keys = [key for key in keys if key not in normalisation_spec]
             if missing_norm_keys:
                 raise ValueError(
-                    "normalization_spec is missing optimised parameter keys required "
+                    "normalisation_spec is missing optimised parameter keys required "
                     f"for gradient_tol check: {missing_norm_keys}"
                 )
 
-            norm_opt_params = _normalize_opt_params(best_opt_params, normalization_spec)
-            norm_params_vec, _ = _params_dict_to_vector(norm_opt_params)
+            norm_opt_params = normalise_opt_params(best_opt_params, normalisation_spec)
+            norm_params_vec, _ = params_dict_to_vector(norm_opt_params)
 
             def norm_loss_vec(theta_norm_vec):
-                norm_params = _vector_to_params_dict(theta_norm_vec, keys)
-                physical_params = _denormalize_opt_params(norm_params, normalization_spec)
+                norm_params = vector_to_params_dict(theta_norm_vec, keys)
+                physical_params = denormalise_opt_params(norm_params, normalisation_spec)
                 return chi2_loss(
                     physical_params,
                     fixed_params,
-                    data,
-                    uncertainties,
                     distance_pc,
                     prepared_data,
                     loss_method=loss_method,
                 )
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-            norm_grad_norm = float(_gradient_l2_norm(norm_grad_vec))
+            norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
 
             if norm_grad_norm > gradient_tol:
                 print(
-                    "WARNING: Normalized-space gradient norm at best fit = "
+                    "WARNING: normalised-space gradient norm at best fit = "
                     f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
                 )
                 print("optimisation may not have reached a minimum yet.")
@@ -1339,8 +1324,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     initial_opt_params : dict
         Initial guesses for the parameters to optimise.
         Allowed keys are STREAMLINE_MODEL_PARAM_KEYS.
-        Historically, the default optimised subset is:
-        DEFAULT_optimisABLE_PARAM_KEYS.
     fixed_params : dict
         Fixed (non-optimised) parameters using the same key space.
         Together with initial_opt_params, this must provide a full,
@@ -1352,12 +1335,12 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     distance_pc : float
             Distance to source in parsecs
     learning_rate : float
-        Adam learning rate applied uniformly to all normalized parameters.
+        Adam learning rate applied uniformly to all normalised parameters.
     param_bounds : dict or None
         Parameter bounds in physical/log parameter units.
-        optimisation is performed in normalized space using
+        optimisation is performed in normalised space using
         x_norm = (x - min) / (max - min), so bounds are required for all
-        optimised keys and are used as normalization anchors.
+        optimised keys and are used as normalisation anchors.
         You may provide 'omega' bounds as linear bounds; these are converted
         to 'log_omega' bounds internally.
     n_epochs : int
@@ -1392,14 +1375,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Number of consecutive epochs with loss <= loss_threshold required to
         trigger threshold-based early stopping. Must be >= 1.
     gradient_tol : float or None
-        Optional gradient norm tolerance for stopping in normalized space.
+        Optional gradient norm tolerance for stopping in normalised space.
         If provided, optimisation stops when the L2 norm of gradients with
-        respect to normalized parameters
+        respect to normalised parameters
         is less than this threshold for gradient_tol_epochs consecutive epochs,
         indicating convergence.
     gradient_tol_epochs : int
         Number of consecutive epochs with ||grad|| < gradient_tol required to
-        trigger normalized-space gradient norm-based early stopping. Must be >= 1.
+        trigger normalised-space gradient norm-based early stopping. Must be >= 1.
         
     **IMPORTANT: Epoch and Loss Semantics**
     
@@ -1424,7 +1407,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     """
     # Initialize parameters
     loss_method = check_loss_method(loss_method)
-    opt_params, fixed_params = _sanitize_param_partition(
+    opt_params, fixed_params = sanitize_param_partition(
         initial_opt_params,
         fixed_params,
         require_nonempty_opt=True,
@@ -1438,14 +1421,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         raise ValueError(f'learning_rate must be finite. Got {learning_rate}.')
     if not bool(learning_rate > 0):
         raise ValueError(f'learning_rate must be > 0. Got {float(learning_rate)}.')
-    param_bounds = _normalize_param_bounds(param_bounds)
-    normalization_spec = _build_normalization_spec(opt_params, param_bounds)
+    param_bounds = standardise_param_bounds(param_bounds)
+    normalisation_spec = build_normalisation_spec(opt_params, param_bounds)
 
-    # Keep optimisation variables in normalized coordinates; convert back to
+    # Keep optimisation variables in normalised coordinates; convert back to
     # physical/log units only when evaluating the forward model and diagnostics.
-    opt_params_norm = _normalize_opt_params(opt_params, normalization_spec)
+    opt_params_norm = normalise_opt_params(opt_params, normalisation_spec)
 
-    # Use one global learning rate on normalized parameters.
+    # Use one global learning rate on normalised parameters.
     solver = optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
 
     opt_state = solver.init(opt_params_norm)
@@ -1453,38 +1436,34 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     # Precompute data-only quantities once before optimisation loop
     prepared_data = extract_streamline.prepare_data(data, uncertainties)
 
-    def loss_from_normalized(norm_opt_params):
-        physical_opt_params = _denormalize_opt_params(norm_opt_params, normalization_spec)
+    def loss_from_normalised(norm_opt_params):
+        physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
         return chi2_loss(
             physical_opt_params,
             fixed_params,
-            data,
-            uncertainties,
             distance_pc,
             loss_method=loss_method,
             prepared_data=prepared_data,
         )
 
-    def loss_from_normalized_with_trace(norm_opt_params):
-        physical_opt_params = _denormalize_opt_params(norm_opt_params, normalization_spec)
-        return _chi2_loss_raw(
+    def loss_from_normalised_with_trace(norm_opt_params):
+        physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
+        return chi2_loss_raw(
             physical_opt_params,
             fixed_params,
-            data,
-            uncertainties,
             distance_pc,
             prepared_data,
             return_trace=True,
             loss_method=loss_method,
         )
 
-    # Create gradient functions in normalized space.
-    loss_and_grad_fn = value_and_grad(loss_from_normalized)
-    loss_and_trace_fn = value_and_grad(loss_from_normalized_with_trace, has_aux=True)
+    # Create gradient functions in normalised space.
+    loss_and_grad_fn = value_and_grad(loss_from_normalised)
+    loss_and_trace_fn = value_and_grad(loss_from_normalised_with_trace, has_aux=True)
     
     # Track loss history
     loss_history = []
-    initial_loss = float(loss_from_normalized(opt_params_norm))
+    initial_loss = float(loss_from_normalised(opt_params_norm))
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_epoch = 0
@@ -1545,7 +1524,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         )
     if gradient_tol is not None:
         print(
-            f"Gradient norm stopping enabled (normalized space): ||grad|| < {gradient_tol:.6g} "
+            f"Gradient norm stopping enabled (normalised space): ||grad|| < {gradient_tol:.6g} "
             f"for {gradient_tol_epochs} consecutive epochs."
         )
     print(f"Initial optimisable values:")
@@ -1562,7 +1541,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         for key in opt_param_keys:
             row[key] = float(opt_params[key])
         if 'log_omega' in opt_params:
-            row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
+            row['omega'] = float(jnp.exp(opt_params['log_omega']))
         csv_writer.writerow(row)
         csv_file.flush()
     
@@ -1570,11 +1549,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if trace_csv_writer is not None:
         # Compute initial loss and trace
         (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_trace_fn(opt_params_norm)
-        loss_trace = _materialize_trace_tree(loss_trace_raw)
-        grad_norm = float(_gradient_l2_norm(norm_grads_trace))
+        loss_trace = trace_tree_to_python(loss_trace_raw)
+        grad_norm = float(gradient_l2_norm(norm_grads_trace))
         
         # Build and write trace row for epoch 0
-        trace_row = _build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
+        trace_row = build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
         trace_csv_writer.writerow(trace_row)
         trace_csv_file.flush()
     
@@ -1582,20 +1561,20 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         for epoch in range(1, n_epochs + 1):
             if epoch % info_every == 0:
                 print(f"\n Starting Epoch {epoch} -------------------------")
-            # Compute loss and gradients at current (pre-update) normalized parameters.
+            # Compute loss and gradients at current (pre-update) normalised parameters.
             # At the START of iteration i, we're at state S(i-1).
             # The loss computed here is loss(S(i-1)), which is what we want to log for CSV epoch (i-1).
             trace_requested = trace_csv_writer is not None and epoch % trace_every == 0
             loss_trace = None
             if trace_requested:
                 (loss_value, loss_trace_raw), norm_grads = loss_and_trace_fn(opt_params_norm)
-                loss_trace = _materialize_trace_tree(loss_trace_raw)
+                loss_trace = trace_tree_to_python(loss_trace_raw)
             else:
                 loss_value, norm_grads = loss_and_grad_fn(opt_params_norm)
             loss_value = float(loss_value)
 
-            # Compute gradient norm in normalized space for stopping criteria and logging.
-            grad_norm = float(_gradient_l2_norm(norm_grads))
+            # Compute gradient norm in normalised space for stopping criteria and logging.
+            grad_norm = float(gradient_l2_norm(norm_grads))
 
             # LOG DEFERRED EPOCH: Log epoch (epoch - 1) using loss computed at current state (S(epoch-1))
             # (This is the loss AFTER applying update epoch-1, which is what we want for CSV epoch epoch-1)
@@ -1606,15 +1585,15 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                     for key in opt_param_keys:
                         row[key] = float(opt_params[key])
                     if 'log_omega' in opt_params:
-                        row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
+                        row['omega'] = float(jnp.exp(opt_params['log_omega']))
                     csv_writer.writerow(row)
                     csv_file.flush()
 
-            # Perform Optax Adam step in normalized space (apply update).
+            # Perform Optax Adam step in normalised space (apply update).
             updates, opt_state = solver.update(norm_grads, opt_state, params=opt_params_norm)
             opt_params_norm = optax.apply_updates(opt_params_norm, updates)
 
-            # Enforce normalized bounds and map back to physical/log values.
+            # Enforce normalised bounds and map back to physical/log values.
             for key in opt_param_keys:
                 opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
 
@@ -1622,7 +1601,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # When v_r0 is very close to zero, use the sign of the gradient to determine
             # which direction to protect towards, allowing the optimiser to continue smoothly.
             if 'v_r0' in opt_param_keys:
-                threshold_norm = to_float64(1e-12)  # normalized space threshold
+                threshold_norm = to_float64(1e-12)  # normalised space threshold
                 v_r0_norm_val = opt_params_norm['v_r0']
                 if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
                     # v_r0 is very close to zero; check gradient direction
@@ -1638,15 +1617,15 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                     opt_params_norm['v_r0'] = protect_sign * epsilon_norm
 
             # Now materialize physical parameters from the (possibly clamped)
-            # normalized parameters.
-            opt_params = _denormalize_opt_params(opt_params_norm, normalization_spec)
+            # normalised parameters.
+            opt_params = denormalise_opt_params(opt_params_norm, normalisation_spec)
         
             # Track loss (store the loss before the update for the loss_history)
             loss_history.append(loss_value)
 
             if trace_csv_writer is not None and loss_trace is not None:
                 # Use the loss value from before the update for trace logging
-                trace_row = _build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method)
+                trace_row = build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method)
                 trace_csv_writer.writerow(trace_row)
                 trace_csv_file.flush()
         
@@ -1688,7 +1667,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             if gradient_tol is not None and gradient_tol_counter >= gradient_tol_epochs:
                 print(
-                    f"\nEarly stopping at epoch {epoch}: normalized gradient norm {grad_norm:.6e} < {gradient_tol:.6e} "
+                    f"\nEarly stopping at epoch {epoch}: normalised gradient norm {grad_norm:.6e} < {gradient_tol:.6e} "
                     f"for {gradient_tol_epochs} consecutive epochs"
                 )
                 break
@@ -1701,13 +1680,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         # At this point, opt_params contains the parameters from the end of the final iteration.
         # We need to compute the loss at these parameters to complete the CSV epoch logging.
         if csv_writer is not None:
-            loss_final = float(loss_from_normalized(opt_params_norm))
+            loss_final = float(loss_from_normalised(opt_params_norm))
             # epoch is the last epoch number from the loop (either n_epochs or early stopping)
             row = {'epoch': epoch, 'loss': loss_final}
             for key in opt_param_keys:
                 row[key] = float(opt_params[key])
             if 'log_omega' in opt_params:
-                row['omega'] = float(_omega_from_log_omega(opt_params['log_omega']))
+                row['omega'] = float(jnp.exp(opt_params['log_omega']))
             csv_writer.writerow(row)
             csv_file.flush()
         
@@ -1718,21 +1697,19 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             best_loss_for_trace, best_trace = chi2_loss(
                 best_opt_params,
                 fixed_params,
-                data,
-                uncertainties,
                 distance_pc,
+                prepared_data,
                 return_trace=True,
                 loss_method=loss_method,
-                prepared_data=prepared_data,
             )
             best_loss_for_trace = float(best_loss_for_trace)
             
             # Compute best gradient norm for trace
-            best_norm_grads = loss_and_grad_fn(_normalize_opt_params(best_opt_params, normalization_spec))[1]
-            best_grad_norm = float(_gradient_l2_norm(best_norm_grads))
+            best_norm_grads = loss_and_grad_fn(normalise_opt_params(best_opt_params, normalisation_spec))[1]
+            best_grad_norm = float(gradient_l2_norm(best_norm_grads))
             
             # Log trace row for best epoch
-            best_trace_row = _build_trace_row(best_epoch, best_loss_for_trace, best_trace, best_grad_norm, loss_method)
+            best_trace_row = build_trace_row(best_epoch, best_loss_for_trace, best_trace, best_grad_norm, loss_method)
             trace_csv_writer.writerow(best_trace_row)
             trace_csv_file.flush()
     
@@ -1766,7 +1743,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             prepared_data,
             loss_method=loss_method,
             gradient_tol=gradient_tol,
-            normalization_spec=normalization_spec,
+            normalisation_spec=normalisation_spec,
         )
         print("\nParameter uncertainties (1-sigma):")
         for k, v in param_errors.items():
@@ -1775,4 +1752,4 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         param_errors = None
 
 
-    return _with_derived_omega(ordered_best_opt_params), loss_history, param_errors
+    return with_derived_omega(ordered_best_opt_params), loss_history, param_errors
