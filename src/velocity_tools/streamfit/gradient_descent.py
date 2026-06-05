@@ -336,7 +336,11 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     for key, value in norm_opt_params.items():
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
-        denormalised[key] = to_float64(value) * scale + offset
+        if key == 'phi0':
+            # special handling for phi0 because circular
+            denormalised[key] = jnp.mod(to_float64(value) * scale + offset, 2*jnp.pi)
+        else:
+            denormalised[key] = to_float64(value) * scale + offset
     return denormalised
 
 
@@ -1440,7 +1444,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             # Enforce normalised bounds and map back to physical/log values.
             for key in opt_param_keys:
-                opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
+                if key == 'phi0':
+                    # phi0 is a cyclic parameter; wrap to [0, 1) in normalised space to enforce bounds
+                    opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0) 
+                else:
+                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
 
             # Gradient-aware epsilon protection for v_r0 near zero:
             # When v_r0 is very close to zero, use the sign of the gradient to determine
