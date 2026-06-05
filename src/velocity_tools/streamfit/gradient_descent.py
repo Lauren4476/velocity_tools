@@ -32,11 +32,11 @@ LOSS_METHOD_COMPONENT_KEYS = {
 TRACE_COMMON_FIELDNAMES = [
     'epoch',
     'loss',
-    'chi2_penalty',
-    'low_shortfall_penalty',
-    'low_excess_penalty',
-    'high_shortfall_penalty',
-    'high_excess_penalty',
+    # 'chi2_penalty',
+    # 'low_shortfall_penalty',
+    # 'low_excess_penalty',
+    # 'high_shortfall_penalty',
+    # 'high_excess_penalty',
     'chi2_total',
     'grad_norm',
     'model_points_total',
@@ -375,11 +375,11 @@ def build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         row[component_key] = chi2_components.get(component_key, float('nan'))
 
     row.update({
-        'low_shortfall_penalty': chi2_components.get('low_shortfall_penalty', float('nan')),
-        'low_excess_penalty': chi2_components.get('low_excess_penalty', float('nan')),
-        'high_shortfall_penalty': chi2_components.get('high_shortfall_penalty', float('nan')),
-        'high_excess_penalty': chi2_components.get('high_excess_penalty', float('nan')),
-        'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
+        # 'low_shortfall_penalty': chi2_components.get('low_shortfall_penalty', float('nan')),
+        # 'low_excess_penalty': chi2_components.get('low_excess_penalty', float('nan')),
+        # 'high_shortfall_penalty': chi2_components.get('high_shortfall_penalty', float('nan')),
+        # 'high_excess_penalty': chi2_components.get('high_excess_penalty', float('nan')),
+        # 'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
         'model_points_total': matching.get('model_points_total', 0),
@@ -437,12 +437,14 @@ def gradient_l2_norm(grad_tree):
     return jnp.sqrt(grad_sum_sq)
 
 @jax.jit
+# obsolete - penalties not used anymore
 def softplus_barrier(value, tau):
     """Smooth approximation to max(0, value) with transition scale tau."""
     tau = to_float64(tau)
     return tau * jnp.logaddexp(to_float64(0.0), to_float64(value) / tau)
 
 @jax.jit
+# obsolete - penalties not used anymore
 def coverage_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     """Penalise differences between model and data coverage in distance metric,
     using smooth barrier functions to keep differentiability"""
@@ -589,10 +591,12 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     Extract model values corresponding to data positions using the distance metric from
     extract_streamline.get_distance_metric
 
-    Matching is restricted to the physically overlapping distance-metric domain:
-    1. data is restricted to the model-supported metric range
-    2. model is restricted to the data-supported metric range
-    3. interpolation is performed on the overlap
+    Method:
+    1. Compute the distance metric for model and data points
+    2. Apply finite masks
+    3. Normalise both metrics to [0, 1] based on their finite ranges
+    4. Map data normalised positions to model normalised positions
+    5. Interpolate model RA, Dec, and velocity at the mapped positions
 
     Parameters
     ----------
@@ -601,7 +605,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
 
     Returns
     -------
-    tuple (ra_model_interp, dec_model_interp, v_model_interp, valid)
+    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace
         where valid is a boolean mask with shape len(original data), marking
         retained data points
     """
@@ -624,264 +628,111 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
         dmetric_data = extract_streamline.get_distance_metric(
             ra_data, dec_data) 
 
-    model_finite_mask = (
+    # only finite values are valid
+    model_valid_mask = (
         jnp.isfinite(ra_model)
         & jnp.isfinite(dec_model)
         & jnp.isfinite(v_model)
         & jnp.isfinite(dmetric_model)
     )
-    data_finite_mask = (
+    data_valid_mask = (
         jnp.isfinite(ra_data)
         & jnp.isfinite(dec_data)
         & jnp.isfinite(dmetric_data)
     )
 
-    if not bool(jnp.any(model_finite_mask)):
-        raise ValueError('No finite model points are available for model-data matching.')
-    if not bool(jnp.any(data_finite_mask)):
-        raise ValueError('No finite data points are available for model-data matching.')
+    d_model_f = dmetric_model[model_valid_mask]
+    ra_model_f = ra_model[model_valid_mask]
+    dec_model_f = dec_model[model_valid_mask]
+    v_model_f = v_model[model_valid_mask]
+    d_data_f = dmetric_data[data_valid_mask]
 
-    model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
-        dmetric_model,
-        model_finite_mask,
-        dmetric_data,
-        data_finite_mask,
-    )
+    # filter model to keep only model points with dmetric >= minimum of data dmetric
+    # this is becuase the model shouldn't go further in than the innermost data point
+    # as this is where we no longer observe the streamer
+    dmetric_min_data = jnp.min(d_data_f)
+    model_keep_mask = d_model_f >= dmetric_min_data
 
-    if not bool(overlap_max >= overlap_min):
-        raise ValueError(
-            'No physically valid distance-metric overlap between model and data. '
-            f'Model metric range [{model_min}, {model_max}], '
-            f'data metric range [{data_min}, {data_max}]'
-        )
+    d_model_f = d_model_f[model_keep_mask]
+    ra_model_f = ra_model_f[model_keep_mask]
+    dec_model_f = dec_model_f[model_keep_mask]
+    v_model_f = v_model_f[model_keep_mask]
 
-    data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
-    model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
+    model_points_total = ra_model.size
+    data_points_total = ra_data.size
+    model_nan_count = model_points_total - jnp.sum(model_valid_mask)
+    data_nan_count = data_points_total - jnp.sum(data_valid_mask)
 
-    if not bool(jnp.any(data_keep)):
-        raise ValueError(
-            'No retained data points after overlap filtering. '
-            f'Overlap range [{overlap_min},{overlap_max}]'
-        )
 
-    model_retained_count = int(jnp.sum(model_keep))
-    if model_retained_count < 2:
-        raise ValueError(
-            'Insufficient retained model support for interpolation after overlap filtering: '
-            f'{model_retained_count} point(s) available; need at least 2.'
-        )
 
-    # reduce to finite model support once, then keep or reorder it only when needed
-    finite_dmetric = dmetric_model[model_finite_mask]
-    finite_ra = ra_model[model_finite_mask]
-    finite_dec = dec_model[model_finite_mask]
-    finite_v = v_model[model_finite_mask]
+    # check there are enough points for matching
+    model_valid_points = d_model_f.size
+    data_valid_points = d_data_f.size
+    model_has_enough = model_valid_points >= 2
+    data_has_any = data_valid_points >= 1
+
+
     d_model_sorted, ra_sorted, dec_sorted, v_sorted = order_model_by_metric(
-        finite_dmetric,
-        finite_ra,
-        finite_dec,
-        finite_v,
+        d_model_f,
+        ra_model_f,
+        dec_model_f,
+        v_model_f,
     )
 
-    model_keep_sorted = (d_model_sorted >= overlap_min) & (d_model_sorted <= overlap_max)
+    # model diffs and stats for trace
+    d_diff_mod = jnp.diff(d_model_sorted)
 
-    # build edge anchors on retained support so clipped interpolation uses only
-    # overlap-domain endpoints
-    first_keep_idx = jnp.argmax(model_keep_sorted)
-    last_keep_idx = model_keep_sorted.size - 1 - jnp.argmax(jnp.flip(model_keep_sorted))
+    model_metric_min_gap = jnp.where(d_diff_mod.size > 0, jnp.min(d_diff_mod), jnp.nan)
+    model_metric_near_tie_count = jnp.where(d_diff_mod.size > 0, jnp.sum(jnp.abs(d_diff_mod) <= 1e-8), 0)
+    model_metric_duplicate_count = jnp.where(d_diff_mod.size > 0, jnp.sum(d_diff_mod == 0.0), 0)
+    model_metric_non_monotonic_count = jnp.where(d_diff_mod.size > 0, jnp.sum(d_diff_mod < 0.0), 0)
 
-    ra_first = ra_sorted[first_keep_idx]
-    dec_first = dec_sorted[first_keep_idx]
-    v_first = v_sorted[first_keep_idx]
-    ra_last = ra_sorted[last_keep_idx]
-    dec_last = dec_sorted[last_keep_idx]
-    v_last = v_sorted[last_keep_idx]
+    # metric ranges
+    model_min = jnp.min(d_model_sorted)
+    model_max = jnp.max(d_model_sorted)
+    data_min = jnp.min(d_data_f)
+    data_max = jnp.max(d_data_f)
+    model_span = model_max - model_min
+    data_span = data_max - data_min
+    model_span_safe = jnp.where(model_span == 0.0, 1.0, model_span)
+    data_span_safe = jnp.where(data_span == 0.0, 1.0, data_span)
 
-    is_below_overlap = d_model_sorted < overlap_min
-    ra_support = jnp.where(model_keep_sorted, ra_sorted, jnp.where(is_below_overlap, ra_first, ra_last))
-    dec_support = jnp.where(model_keep_sorted, dec_sorted, jnp.where(is_below_overlap, dec_first, dec_last))
-    v_support = jnp.where(model_keep_sorted, v_sorted, jnp.where(is_below_overlap, v_first, v_last))
-    d_support = jnp.clip(d_model_sorted, overlap_min, overlap_max)
+    # normalise to [0, 1] and map data metric to model metric space
+    d_data_norm = (d_data_f - data_min) / data_span_safe
+    d_model_goal = model_min + d_data_norm * model_span_safe
 
-    # interpolate only on overlap
-    # for dropped data points, query at overlap_min and then overwrite with finite placeholders
-    d_query = jnp.where(data_keep, dmetric_data, overlap_min)
-    ra_interp_all = jnp.interp(d_query, d_support, ra_support)
-    dec_interp_all = jnp.interp(d_query, d_support, dec_support)
-    v_interp_all = jnp.interp(d_query, d_support, v_support)
+    # interpolation to get model values at the exact goal positions
+    ra_model_interp = jnp.interp(d_model_goal, d_model_sorted, ra_sorted)
+    dec_model_interp = jnp.interp(d_model_goal, d_model_sorted, dec_sorted)
+    v_model_interp = jnp.interp(d_model_goal, d_model_sorted, v_sorted)
 
-    ra_model_interp = jnp.where(data_keep, ra_interp_all, ra_data)
-    dec_model_interp = jnp.where(data_keep, dec_interp_all, dec_data)
-    v_model_interp = jnp.where(data_keep, v_interp_all, to_float64(0.0))
+    valid = data_valid_mask
 
-    valid = data_keep
 
     if not return_trace:
-        return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max
-
-    model_nan_mask = ~model_finite_mask
-    model_nan_count = int(jnp.sum(model_nan_mask))
-    model_points_total = int(ra_model.size)
-    model_valid_points = model_points_total - model_nan_count
-
-    d_diff = jnp.diff(d_model_sorted)
-    if d_diff.size > 0:
-        model_metric_min_gap = float(jnp.min(d_diff))
-        model_metric_near_tie_count = int(jnp.sum(jnp.abs(d_diff) <= 1e-8))
-        model_metric_duplicate_count = int(jnp.sum(d_diff == 0.0))
-        model_metric_non_monotonic_count = int(jnp.sum(d_diff < 0.0))
-    else:
-        model_metric_min_gap = float('nan')
-        model_metric_near_tie_count = 0
-        model_metric_duplicate_count = 0
-        model_metric_non_monotonic_count = 0
-
-    model_metric_span = float(d_model_sorted[-1] - d_model_sorted[0]) if d_model_sorted.size > 1 else 0.0
-
+        return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model
+    
     matching_trace = {
-        'model_points_total': model_points_total,
-        'model_nan_count': model_nan_count,
-        'model_valid_points': model_valid_points,
-        'model_retained_count': model_retained_count,
-        'data_points_total': int(ra_data.size),
-        'data_valid_points': int(jnp.sum(data_finite_mask)),
-        'data_retained_count': int(jnp.sum(data_keep)),
-        'overlap_metric_min': float(overlap_min),
-        'overlap_metric_max': float(overlap_max),
-        'model_metric_span': model_metric_span,
-        'model_metric_min_gap': model_metric_min_gap,
-        'model_metric_near_tie_count': model_metric_near_tie_count,
-        'model_metric_duplicate_count': model_metric_duplicate_count,
-        'model_metric_non_monotonic_count': model_metric_non_monotonic_count,
-        'distance_metric_model': dmetric_model_trace,
-        'distance_metric_data': dmetric_data_trace,
+        "model_points_total": model_points_total,
+        "model_nan_count": model_nan_count,
+        "model_valid_points": model_valid_points,
+        "data_points_total": data_points_total,
+        "data_nan_count": data_nan_count,
+        "data_valid_points": data_valid_points,
+        "model_metric_min_gap": model_metric_min_gap,
+        "model_metric_near_tie_count": model_metric_near_tie_count,
+        "model_metric_duplicate_count": model_metric_duplicate_count,
+        "model_metric_non_monotonic_count": model_metric_non_monotonic_count,
+        "model_metric_min": model_min,
+        "model_metric_max": model_max,
+        "data_metric_min": data_min,
+        "data_metric_max": data_max,
+        "model_metric_span": model_span,
+        "data_metric_span": data_span,
     }
 
-    return ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max
+    return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace
 
-
-# TODO: in progress to jax jit the loss function. 
-# this is a bit tricky because of the model-data matching and the coverage penalties, which need to be carefully implemented in a jax-compatible way to maintain differentiability and efficiency. 
-'''
-def chi2_loss_jax(
-    opt_params,
-    fixed_params,
-    distance_pc,
-    prepared_data,
-    loss_method='radecvel'
-):
-    """Compute chi-squared loss. jax-compatible, trace is a pytree of jax arrays"""
-    
-    loss_method = check_loss_method(loss_method)
-
-    opt_params, fixed_params = sanitize_param_partition(opt_params, fixed_params)
-    distance_pc = to_float64(distance_pc)
-
-    ra_data = prepared_data.ra_data
-    dec_data = prepared_data.dec_data
-    v_data = prepared_data.v_data
-
-    ra_sigma = prepared_data.ra_sigma_safe
-    dec_sigma = prepared_data.dec_sigma_safe
-    v_sigma = prepared_data.v_sigma_safe
-
-    ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
-
-    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max = (
-        match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
-    )
-
-    model_mask = (
-        jnp.isfinite(ra_model)
-        & jnp.isfinite(dec_model)
-        & jnp.isfinite(v_model)
-        & jnp.isfinite(dmetric_model)
-    )
-
-    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
-        dmetric_model,
-        model_mask,
-        prepared_data.data_min,
-        prepared_data.data_max,
-    )
-
-    # shared chi2_velocity term on valid/retained data points
-    chi2_v = jnp.sum(((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2)
-
-    def radec_case(_):
-        chi2_ra = jnp.sum(((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2)
-        chi2_dec = jnp.sum(((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2)
-        chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
-
-        trace = {
-            'chi2': {
-                'ra': chi2_ra,
-                'dec': chi2_dec,
-                'v': chi2_v,
-            },
-            "penalty": chi2_penalty,
-            "low_shortfall": low_shortfall,
-            "low_excess": low_excess,
-            "high_shortfall": high_shortfall,
-            "high_excess": high_excess,
-            'chi2_total': chi2_total,
-        }
-
-        return chi2_total, trace
-    
-    def rtheta_case(_):
-        r_proj_data = prepared_data.r_proj_data
-        theta_proj_data = prepared_data.theta_proj_data
-        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
-            ra_model_interp,
-            dec_model_interp,
-        )
-
-        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
-
-        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = to_float64(1e-8)
-        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
-        sigma_theta = jnp.maximum(sigma_theta, r_eps)
-
-        chi2_r = jnp.sum(((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2)
-        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
-
-        trace = {
-            'chi2': {
-                'r': chi2_r,
-                'theta': chi2_theta,
-                'v': chi2_v,
-            },
-            "penalty": chi2_penalty,
-            "low_shortfall": low_shortfall,
-            "low_excess": low_excess,
-            "high_shortfall": high_shortfall,
-            "high_excess": high_excess,
-            'chi2_total': chi2_total,
-        }
-
-        return chi2_total, trace
-    
-    return lax.cond(loss_method == 'radecvel', radec_case, rtheta_case, operand=None)
-
-def chi2_loss_new(
-    opt_params,
-    fixed_params,
-    distance_pc,
-    prepared_data,
-    loss_method='radecvel',
-    return_trace=False):
-    """Compute chi-squared loss and optionally return a diagnostic trace dictionary (python, not jax compatible)"""
-
-    loss, trace = chi2_loss_jax(opt_params, fixed_params, distance_pc, prepared_data, loss_method)
-    if not return_trace:
-        return loss
-    
-    trace_python = outputs.trace_tree_to_python(trace)
-    return loss, trace_python'''
 
 def chi2_loss_raw(
     opt_params,
@@ -907,7 +758,7 @@ def chi2_loss_raw(
 
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
 
-    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max = (
+    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model = (
         match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
     )
 
@@ -920,19 +771,21 @@ def chi2_loss_raw(
         & jnp.isfinite(dmetric_model)
     )
 
-    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
-        dmetric_model,
-        model_finite_mask,
-        prepared_data.data_min,
-        prepared_data.data_max,
-    )
+    # penalties not used anymore
+    # chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
+    #     dmetric_model,
+    #     model_finite_mask,
+    #     prepared_data.data_min,
+    #     prepared_data.data_max,
+    # )
+
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
     if loss_method == 'radecvel':
         chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
         chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
+        chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
     else:
         r_proj_data = prepared_data.r_proj_data
         theta_proj_data = prepared_data.theta_proj_data
@@ -952,7 +805,7 @@ def chi2_loss_raw(
         # Only compute chi2 on valid/retained data points
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
+        chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
 
     if not return_trace:
         return chi2_total
@@ -998,11 +851,11 @@ def chi2_loss_raw(
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
             'chi2_v': chi2_v,
-            'chi2_penalty': chi2_penalty,
-            'low_shortfall_penalty': low_shortfall,
-            'low_excess_penalty': low_excess,
-            'high_shortfall_penalty': high_shortfall,
-            'high_excess_penalty': high_excess,
+            # 'chi2_penalty': chi2_penalty,
+            # 'low_shortfall_penalty': low_shortfall,
+            # 'low_excess_penalty': low_excess,
+            # 'high_shortfall_penalty': high_shortfall,
+            # 'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -1011,11 +864,11 @@ def chi2_loss_raw(
             'chi2_r': chi2_r,
             'chi2_theta': chi2_theta,
             'chi2_v': chi2_v,
-            'chi2_penalty': chi2_penalty,
-            'low_shortfall_penalty': low_shortfall,
-            'low_excess_penalty': low_excess,
-            'high_shortfall_penalty': high_shortfall,
-            'high_excess_penalty': high_excess,
+            # 'chi2_penalty': chi2_penalty,
+            # 'low_shortfall_penalty': low_shortfall,
+            # 'low_excess_penalty': low_excess,
+            # 'high_shortfall_penalty': high_shortfall,
+            # 'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -1095,17 +948,13 @@ def chi2_loss(
 
     # Match model to data using arc-length parameterisation
     if return_trace:
-        ra_model_interp, dec_model_interp, v_model_interp, valid, matching_trace, dmetric_model, overlap_min, overlap_max = (
+        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace = (
             match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
         )
     else:
-        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, overlap_min, overlap_max = (
+        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model = (
             match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
         )
-        
-
-    ### smooth overlap and weighting - penalty for being outside overlap
-    dmetric_data = prepared_data.dmetric_data
 
     model_finite_mask = (
         jnp.isfinite(ra_model)
@@ -1114,12 +963,13 @@ def chi2_loss(
         & jnp.isfinite(dmetric_model)
     )
 
-    chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = coverage_penalties(
-        dmetric_model,
-        model_finite_mask,
-        prepared_data.data_min,
-        prepared_data.data_max,
-    )
+    # penalties not used anymore
+    # chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = coverage_penalties(
+    #     dmetric_model,
+    #     model_finite_mask,
+    #     prepared_data.data_min,
+    #     prepared_data.data_max,
+    # )
 
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
@@ -1127,7 +977,7 @@ def chi2_loss(
     if loss_method == 'radecvel':
         chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
         chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v + chi2_penalty
+        chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
         # Use precomputed data coordinates
@@ -1149,7 +999,7 @@ def chi2_loss(
         # Only compute chi2 on valid/retained data points
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v + chi2_penalty
+        chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
 
     if return_trace:
         if loss_method == 'radecvel':
@@ -1157,12 +1007,11 @@ def chi2_loss(
                 'chi2_ra': float(chi2_ra),
                 'chi2_dec': float(chi2_dec),
                 'chi2_v': float(chi2_v),
-                'chi2_penalty': float(chi2_penalty),
-                'low_shortfall_penalty': float(low_shortfall),
-                'low_excess_penalty': float(low_excess),
-                'high_shortfall_penalty': float(high_shortfall),
-                'high_excess_penalty': float(high_excess),
-                'overlap_width': float(overlap_max - overlap_min),
+                # 'chi2_penalty': float(chi2_penalty),
+                # 'low_shortfall_penalty': float(low_shortfall),
+                # 'low_excess_penalty': float(low_excess),
+                # 'high_shortfall_penalty': float(high_shortfall),
+                # 'high_excess_penalty': float(high_excess),
                 'chi2_total': float(chi2_total),
             }
         else:
@@ -1170,12 +1019,11 @@ def chi2_loss(
                 'chi2_r': float(chi2_r),
                 'chi2_theta': float(chi2_theta),
                 'chi2_v': float(chi2_v),
-                'chi2_penalty': float(chi2_penalty),
-                'low_shortfall_penalty': float(low_shortfall),
-                'low_excess_penalty': float(low_excess),
-                'high_shortfall_penalty': float(high_shortfall),
-                'high_excess_penalty': float(high_excess),
-                'overlap_width': float(overlap_max - overlap_min),
+                # 'chi2_penalty': float(chi2_penalty),
+                # 'low_shortfall_penalty': float(low_shortfall),
+                # 'low_excess_penalty': float(low_excess),
+                # 'high_shortfall_penalty': float(high_shortfall),
+                # 'high_excess_penalty': float(high_excess),
                 'chi2_total': float(chi2_total),
             }
 
@@ -1530,9 +1378,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Initial optimisable values:")
     for key in opt_param_keys:
         print(f"  {key}: {opt_params[key]:.3e}")
-    
-    # Precompute data-only quantities once before optimisation loop
-    prepared_data = extract_streamline.prepare_data(data, uncertainties)
     
     # Log epoch 0: initial state (before any updates)
     initial_loss = float(initial_loss)

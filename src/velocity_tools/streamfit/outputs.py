@@ -211,6 +211,7 @@ def plot_morphology(
     title=None,
     xlim=None,
     ylim=None,
+    legend_loc='lower right',
     save_folder=None,
     save_name='streamline_morphology',
     show=True,
@@ -321,7 +322,7 @@ def plot_morphology(
         ax.set_ylim(ylim)
     ax.invert_xaxis()
     ax.set_title(title)
-    ax.legend()
+    ax.legend(loc=legend_loc)
     if save_folder is not None:
         plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
         plt.close()
@@ -434,6 +435,7 @@ def plot_ra_vel(
     title=None,
     vlim=None,
     ralim=None,
+    legend_loc='lower right',
     save_path=None,
     show=False,
 ):
@@ -476,7 +478,7 @@ def plot_ra_vel(
     # flip RA axis to match astronomical convention
     ax.invert_xaxis()
 
-    ax.legend()
+    ax.legend(loc=legend_loc)
 
     if save_path is not None:
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
@@ -596,6 +598,7 @@ def plot_dec_vel(
     title=None,
     vlim=None,
     declim=None,
+    legend_loc='lower right',
     save_path=None,
     show=False,
 ):
@@ -636,7 +639,7 @@ def plot_dec_vel(
     if declim is not None:
         ax.set_xlim(declim)
 
-    ax.legend()
+    ax.legend(loc=legend_loc)
 
     if save_path is not None:
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
@@ -742,6 +745,7 @@ def plot_vel_radius(
     title=None,
     xlim=None,
     ylim=None,
+    legend_loc='lower right',
     save_path=None,
     show=False,
 ):
@@ -874,9 +878,9 @@ def plot_vel_radius(
         ax.set_ylim(kde_background["ylim"])
 
     if data_handle is not None:
-        ax.legend(handles=[data_handle, model_handle])
+        ax.legend(handles=[data_handle, model_handle], loc=legend_loc)
     else:
-        ax.legend()
+        ax.legend(loc=legend_loc)
 
     if save_path is not None:
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
