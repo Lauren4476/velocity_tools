@@ -10,6 +10,7 @@ Last updated: 02-06-26
 import jax.numpy as jnp
 from jax import value_and_grad, lax
 import jax
+from jax.experimental import checkify
 import optax
 from . import stream_lines_grad
 from . import extract_streamline
@@ -21,12 +22,14 @@ jax.config.update("jax_enable_x64", True)
 
 # settings and constants
 VR0_MIN = 1e-6
+BIG = 1e30
+BIG_NEG = -1e30
 
-LOSS_METHOD_CHOICES = ('radecvel', 'rthetavel')
+LOSS_METHOD_CHOICES = [0, 1]
 
 LOSS_METHOD_COMPONENT_KEYS = {
-    'radecvel': ('chi2_ra', 'chi2_dec', 'chi2_v'),
-    'rthetavel': ('chi2_r', 'chi2_theta', 'chi2_v'),
+    0: ('chi2_ra', 'chi2_dec', 'chi2_v'), #radecvel
+    1: ('chi2_r', 'chi2_theta', 'chi2_v'), #rthetavel
 }
 
 TRACE_COMMON_FIELDNAMES = [
@@ -43,10 +46,6 @@ TRACE_COMMON_FIELDNAMES = [
     'model_nan_count',
     'model_valid_points',
     'model_metric_span',
-    'model_metric_min_gap',
-    'model_metric_near_tie_count',
-    'model_metric_duplicate_count',
-    'model_metric_non_monotonic_count',
     'model_inner_count',
     'data_inner_count',
     'data_points_total',
@@ -63,7 +62,7 @@ def check_loss_method(loss_method):
     if loss_method not in LOSS_METHOD_CHOICES:
         raise ValueError(
             f"Unknown loss_method '{loss_method}'. "
-            f"Choose from: {list(LOSS_METHOD_CHOICES)}"
+            f"Choose from: 0: radecvel 1: rthetavel"
         )
     return loss_method
 
@@ -390,10 +389,6 @@ def build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         'model_nan_count': matching.get('model_nan_count', 0),
         'model_valid_points': matching.get('model_valid_points', 0),
         'model_metric_span': matching.get('model_metric_span', float('nan')),
-        'model_metric_min_gap': matching.get('model_metric_min_gap', float('nan')),
-        'model_metric_near_tie_count': matching.get('model_metric_near_tie_count', 0),
-        'model_metric_duplicate_count': matching.get('model_metric_duplicate_count', 0),
-        'model_metric_non_monotonic_count': matching.get('model_metric_non_monotonic_count', 0),
         'model_inner_count': model_metric_trace.get('inner_count', 0),
         'data_inner_count': data_metric_trace.get('inner_count', 0),
         'data_points_total': matching.get('data_points_total', 0),
@@ -589,8 +584,8 @@ def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=
         operand=None,
     )
 
-
-def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=False):
+@jax.jit
+def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     """
     Extract model values corresponding to data positions using the distance metric from
     extract_streamline.get_distance_metric
@@ -602,149 +597,126 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, r
     4. Map data normalised positions to model normalised positions
     5. Interpolate model RA, Dec, and velocity at the mapped positions
 
-    Parameters
-    ----------
-    return_trace : bool
-        If True, also return a trace dictionary containing diagnostics
-
     Returns
     -------
     ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace
         where valid is a boolean mask with shape len(original data), marking
         retained data points
     """
-
     ra_model = to_float64(ra_model)
     dec_model = to_float64(dec_model)
     v_model = to_float64(v_model)
     ra_data = to_float64(ra_data)
     dec_data = to_float64(dec_data)
 
-    # Compute the streamline distance metric for model/data in float64.
-    if return_trace:
-        dmetric_model, dmetric_model_trace = extract_streamline.get_distance_metric(
-            ra_model, dec_model, return_trace=True)
-        dmetric_data, dmetric_data_trace = extract_streamline.get_distance_metric(
-            ra_data, dec_data, return_trace=True)
-    else:
-        dmetric_model = extract_streamline.get_distance_metric(
-            ra_model, dec_model)
-        dmetric_data = extract_streamline.get_distance_metric(
-            ra_data, dec_data) 
+    # get distance metrics
+    dmetric_model, _ = extract_streamline.get_distance_metric(ra_model, dec_model)
+    dmetric_data, _ = extract_streamline.get_distance_metric(ra_data, dec_data)
 
     # only finite values are valid
-    model_valid_mask = (
+    model_valid = (
         jnp.isfinite(ra_model)
         & jnp.isfinite(dec_model)
         & jnp.isfinite(v_model)
         & jnp.isfinite(dmetric_model)
     )
-    data_valid_mask = (
+
+    data_valid = (
         jnp.isfinite(ra_data)
         & jnp.isfinite(dec_data)
         & jnp.isfinite(dmetric_data)
     )
 
-    d_model_f = dmetric_model[model_valid_mask]
-    ra_model_f = ra_model[model_valid_mask]
-    dec_model_f = dec_model[model_valid_mask]
-    v_model_f = v_model[model_valid_mask]
-    d_data_f = dmetric_data[data_valid_mask]
-
-    # filter model to keep only model points with dmetric >= minimum of data dmetric
+    # we also filter model to keep only model points with dmetric >= minimum of data dmetric
     # this is becuase the model shouldn't go further in than the innermost data point
     # as this is where we no longer observe the streamer
-    dmetric_min_data = jnp.min(d_data_f)
-    model_keep_mask = d_model_f >= dmetric_min_data
+    d_data_valid = jnp.where(data_valid, dmetric_data, jnp.inf)
+    data_min = jnp.min(d_data_valid)
 
-    d_model_f = d_model_f[model_keep_mask]
-    ra_model_f = ra_model_f[model_keep_mask]
-    dec_model_f = dec_model_f[model_keep_mask]
-    v_model_f = v_model_f[model_keep_mask]
+    # enforce both constraints on model
+    model_keep = model_valid & (dmetric_model >= data_min)
 
-    model_points_total = ra_model.size
-    data_points_total = ra_data.size
-    model_nan_count = model_points_total - jnp.sum(model_valid_mask)
-    data_nan_count = data_points_total - jnp.sum(data_valid_mask)
+    # weights: 0 = ignore, 1 = use. This is for jax/jit compatibility
+    w_model = model_keep.astype(jnp.float64)
+    w_data = data_valid.astype(jnp.float64)
 
+    d_model = jnp.where(model_keep, dmetric_model, 0.0)
+    d_data  = jnp.where(data_valid, dmetric_data, 0.0)
 
+    ra = ra_model
+    dec = dec_model
+    v = v_model
 
-    # check there are enough points for matching
-    model_valid_points = d_model_f.size
-    data_valid_points = d_data_f.size
-    model_has_enough = model_valid_points >= 2
-    data_has_any = data_valid_points >= 1
+    # ---- sort ONLY MODEL using metric + weight penalty ----
+    model_sort_key = d_model + (1.0 - w_model) * BIG
+    model_idx = jnp.argsort(model_sort_key)
 
+    d_model_s = d_model[model_idx]
+    ra_s = ra[model_idx]
+    dec_s = dec[model_idx]
+    v_s = v[model_idx]
+    w_model_s = w_model[model_idx]
 
-    d_model_sorted, ra_sorted, dec_sorted, v_sorted = order_model_by_metric(
-        d_model_f,
-        ra_model_f,
-        dec_model_f,
-        v_model_f,
-    )
+    # stats for trace and interpolation domain
+    data_min_eff = jnp.min(jnp.where(data_valid, d_data, jnp.inf))
+    data_max_eff = jnp.max(jnp.where(data_valid, d_data, -jnp.inf))
 
-    # model diffs and stats for trace
-    d_diff_mod = jnp.diff(d_model_sorted)
+    model_min = jnp.min(jnp.where(model_keep, d_model, jnp.inf))
+    model_max = jnp.max(jnp.where(model_keep, d_model, -jnp.inf))
 
-    model_metric_min_gap = jnp.where(d_diff_mod.size > 0, jnp.min(d_diff_mod), jnp.nan)
-    model_metric_near_tie_count = jnp.where(d_diff_mod.size > 0, jnp.sum(jnp.abs(d_diff_mod) <= 1e-8), 0)
-    model_metric_duplicate_count = jnp.where(d_diff_mod.size > 0, jnp.sum(d_diff_mod == 0.0), 0)
-    model_metric_non_monotonic_count = jnp.where(d_diff_mod.size > 0, jnp.sum(d_diff_mod < 0.0), 0)
-
-    # metric ranges
-    model_min = jnp.min(d_model_sorted)
-    model_max = jnp.max(d_model_sorted)
-    data_min = jnp.min(d_data_f)
-    data_max = jnp.max(d_data_f)
     model_span = model_max - model_min
-    data_span = data_max - data_min
+    data_span = data_max_eff - data_min_eff
     model_span_safe = jnp.where(model_span == 0.0, 1.0, model_span)
     data_span_safe = jnp.where(data_span == 0.0, 1.0, data_span)
 
-    # normalise to [0, 1] and map data metric to model metric space
-    d_data_norm = (d_data_f - data_min) / data_span_safe
-    d_model_goal = model_min + d_data_norm * model_span_safe
+    # normalise data metric
+    d_data_norm = (d_data - data_min_eff) / data_span
+    d_goal = model_min + d_data_norm * model_span
 
-    # interpolation to get model values at the exact goal positions
-    ra_model_interp = jnp.interp(d_model_goal, d_model_sorted, ra_sorted)
-    dec_model_interp = jnp.interp(d_model_goal, d_model_sorted, dec_sorted)
-    v_model_interp = jnp.interp(d_model_goal, d_model_sorted, v_sorted)
+    # interpolate model at data points, using weights to ignore invalid model points 
+    # by giving them huge distance values so they don't affect the interpolation
+    xp = jnp.where(w_model_s > 0, d_model_s, BIG)
 
-    valid = data_valid_mask
+    ra_interp = jnp.interp(d_goal, xp, ra_s)
+    dec_interp = jnp.interp(d_goal, xp, dec_s)
+    v_interp = jnp.interp(d_goal, xp, v_s)
 
+    # things for trace
+    valid = data_valid
 
-    if not return_trace:
-        return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model
-    
     matching_trace = {
-        "model_points_total": model_points_total,
-        "model_nan_count": model_nan_count,
-        "model_valid_points": model_valid_points,
-        "data_points_total": data_points_total,
-        "data_nan_count": data_nan_count,
-        "data_valid_points": data_valid_points,
-        "model_metric_min_gap": model_metric_min_gap,
-        "model_metric_near_tie_count": model_metric_near_tie_count,
-        "model_metric_duplicate_count": model_metric_duplicate_count,
-        "model_metric_non_monotonic_count": model_metric_non_monotonic_count,
-        "model_metric_min": model_min,
-        "model_metric_max": model_max,
-        "data_metric_min": data_min,
-        "data_metric_max": data_max,
-        "model_metric_span": model_span,
-        "data_metric_span": data_span,
-    }
+    "model_points_total": model_idx.size,
+    "model_nan_count": jnp.sum(jnp.isnan(d_model)),
+    "model_valid_points": model_valid.sum(),
+    "data_points_total": ra_data.size,
+    "data_nan_count": jnp.sum(jnp.isnan(d_data)),
+    "data_valid_points": data_valid.sum(),
+    "model_metric_min": model_min,
+    "model_metric_max": model_max,
+    "data_metric_min": data_min_eff,
+    "data_metric_max": data_max_eff,
+    "model_metric_span": model_span_safe,
+    "data_metric_span": data_span_safe}
 
-    return ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace
+    return ra_interp, dec_interp, v_interp, valid, dmetric_model, matching_trace
 
 
+
+checked_matching = checkify.checkify(match_model_to_data_curve)
+
+def checked_match_model_to_data_curve(*args, **kwargs):
+    """Wrapper around match_model_to_data_curve with checkify checks for errors (to remain jax compatible)"""
+    errors, result = checked_matching(*args, **kwargs)
+    errors.throw()
+    return result
+
+#@jax.jit(static_argnames=("loss_method"))
 def chi2_loss_raw(
     opt_params,
     fixed_params,
     distance_pc,
     prepared_data,
-    return_trace=False,
-    loss_method='radecvel',
+    loss_method=0,
 ):
     """Compute chi-squared loss and optionally return a diagnostic trace tree"""
 
@@ -762,11 +734,12 @@ def chi2_loss_raw(
 
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
 
-    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model = (
-        match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, _ = (
+        checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
     )
 
     dmetric_data = prepared_data.dmetric_data
+    valid = jnp.asarray(valid, dtype=bool)
 
     model_finite_mask = (
         jnp.isfinite(ra_model)
@@ -786,7 +759,7 @@ def chi2_loss_raw(
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
-    if loss_method == 'radecvel':
+    if loss_method == 0:
         chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
         chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
         chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
@@ -810,9 +783,6 @@ def chi2_loss_raw(
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
-
-    if not return_trace:
-        return chi2_total
 
     data_finite_mask = (
         jnp.isfinite(ra_data)
@@ -850,7 +820,7 @@ def chi2_loss_raw(
 
     model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
 
-    if loss_method == 'radecvel':
+    if loss_method == 0:
         chi2_components = {
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
@@ -901,19 +871,18 @@ def chi2_loss_raw(
     }
     return chi2_total, loss_trace
 
-
+#@jax.jit(static_argnames=("loss_method"))
 def chi2_loss(
     opt_params,
     fixed_params,
     distance_pc,
     prepared_data,
-    return_trace=False,
-    loss_method='radecvel',
+    loss_method=0,
 ):
     """
     Compute chi-squared loss between model and data using one of two modes:
-    - 'radecvel': RA, Dec, and LOS velocity residuals
-    - 'rthetavel': projected radial distance, polar angle, and LOS velocity residuals
+    - 0: RA, Dec, and LOS velocity residuals
+    - 1: projected radial distance, polar angle, and LOS velocity residuals
     
     Parameters:
     -----------
@@ -951,21 +920,10 @@ def chi2_loss(
     
 
     # Match model to data using arc-length parameterisation
-    if return_trace:
-        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace = (
-            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data, return_trace=True)
-        )
-    else:
-        ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model = (
-            match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
-        )
-
-    model_finite_mask = (
-        jnp.isfinite(ra_model)
-        & jnp.isfinite(dec_model)
-        & jnp.isfinite(v_model)
-        & jnp.isfinite(dmetric_model)
+    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace = (
+        checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
     )
+
 
     # penalties not used anymore
     # chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = coverage_penalties(
@@ -974,11 +932,12 @@ def chi2_loss(
     #     prepared_data.data_min,
     #     prepared_data.data_max,
     # )
-
+    # TODO: lauren you are here
+    valid = jnp.asarray(valid, dtype=bool)
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
-    if loss_method == 'radecvel':
+    if loss_method == 0:
         chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
         chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
         chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
@@ -1005,41 +964,37 @@ def chi2_loss(
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
 
-    if return_trace:
-        if loss_method == 'radecvel':
-            chi2_components = {
-                'chi2_ra': float(chi2_ra),
-                'chi2_dec': float(chi2_dec),
-                'chi2_v': float(chi2_v),
-                # 'chi2_penalty': float(chi2_penalty),
-                # 'low_shortfall_penalty': float(low_shortfall),
-                # 'low_excess_penalty': float(low_excess),
-                # 'high_shortfall_penalty': float(high_shortfall),
-                # 'high_excess_penalty': float(high_excess),
-                'chi2_total': float(chi2_total),
-            }
-        else:
-            chi2_components = {
-                'chi2_r': float(chi2_r),
-                'chi2_theta': float(chi2_theta),
-                'chi2_v': float(chi2_v),
-                # 'chi2_penalty': float(chi2_penalty),
-                # 'low_shortfall_penalty': float(low_shortfall),
-                # 'low_excess_penalty': float(low_excess),
-                # 'high_shortfall_penalty': float(high_shortfall),
-                # 'high_excess_penalty': float(high_excess),
-                'chi2_total': float(chi2_total),
-            }
-
-        loss_trace = {
-            'chi2_components': chi2_components,
-            'matching': matching_trace,
-            'loss_method': loss_method,
+    if loss_method == 0:
+        chi2_components = {
+            'chi2_ra': chi2_ra.astype(float),
+            'chi2_dec': chi2_dec.astype(float),
+            'chi2_v': chi2_v.astype(float),
+            # 'chi2_penalty': float(chi2_penalty),
+            # 'low_shortfall_penalty': float(low_shortfall),
+            # 'low_excess_penalty': float(low_excess),
+            # 'high_shortfall_penalty': float(high_shortfall),
+            # 'high_excess_penalty': float(high_excess),
+            'chi2_total': chi2_total.astype(float),
         }
-        return chi2_total, loss_trace
+    else:
+        chi2_components = {
+            'chi2_r': chi2_r.astype(float),
+            'chi2_theta': chi2_theta.astype(float),
+            'chi2_v': chi2_v.astype(float),
+            # 'chi2_penalty': float(chi2_penalty),
+            # 'low_shortfall_penalty': float(low_shortfall),
+            # 'low_excess_penalty': float(low_excess),
+            # 'high_shortfall_penalty': float(high_shortfall),
+            # 'high_excess_penalty': float(high_excess),
+            'chi2_total': chi2_total.astype(float),
+        }
 
-    return chi2_total
-
+    loss_trace = {
+        'chi2_components': chi2_components,
+        'matching': matching_trace,
+        'loss_method': loss_method,
+    }
+    return chi2_total, loss_trace
 
 def estimate_parameter_errors(
     best_opt_params,
@@ -1048,7 +1003,7 @@ def estimate_parameter_errors(
     uncertainties,
     distance_pc,
     prepared_data,
-    loss_method='radecvel',
+    loss_method=0,
     gradient_tol=1e-1,
     normalisation_spec=None,
 ):
@@ -1088,13 +1043,14 @@ def estimate_parameter_errors(
 
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
-        return chi2_loss(
+        chi2_total, _ = chi2_loss(
             params,
             fixed_params,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
         )
+        return chi2_total
 
     # Check gradient magnitude at best-fit parameters in normalised space.
     if gradient_tol is not None:
@@ -1118,13 +1074,14 @@ def estimate_parameter_errors(
             def norm_loss_vec(theta_norm_vec):
                 norm_params = vector_to_params_dict(theta_norm_vec, keys)
                 physical_params = denormalise_opt_params(norm_params, normalisation_spec)
-                return chi2_loss(
-                    physical_params,
+                chi2_total, _ = chi2_loss(
+                     physical_params,
                     fixed_params,
                     distance_pc,
                     prepared_data,
                     loss_method=loss_method,
                 )
+                return chi2_total
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
             norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
@@ -1159,8 +1116,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
                    gradient_tol=None, gradient_tol_epochs=1,
                    early_stopping_patience=50,
-                   log_file=None, trace_file=None, trace_every=1,
-                   loss_method='radecvel',
+                   log_file=None, trace_file=None,
+                   loss_method=0, # 0: radecvel, 1: rthetavel
                    output_uncertainties=False,
                    ):
     """
@@ -1211,13 +1168,10 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     trace_file : str or None
         If provided, log per-epoch matching diagnostics (theta_ref, NaN counts,
         metric gaps/ties) to this CSV file.
-    trace_every : int
-        Frequency (in epochs) for writing rows to trace_file.
-        Must be >= 1.
-    loss_method : str
+    loss_method : int
         Loss definition to use. Options:
-        - 'radecvel': optimise RA, Dec, and velocity residuals.
-        - 'rthetavel': optimise radial distance, polar angle, and velocity residuals.
+        - 0: radecvel: optimise RA, Dec, and velocity residuals.
+        - 1: rthetavel: optimise radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
     loss_threshold : float or None
         Optional absolute loss threshold for threshold-based stopping.
@@ -1305,7 +1259,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             fixed_params,
             distance_pc,
             prepared_data,
-            return_trace=True,
             loss_method=loss_method,
         )
 
@@ -1315,7 +1268,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     
     # Track loss history
     loss_history = []
-    initial_loss = float(loss_from_normalised(opt_params_norm))
+    initial_loss, _ = loss_from_normalised(opt_params_norm)
+    initial_loss = float(initial_loss)
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_epoch = 0
@@ -1324,8 +1278,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     gradient_tol_counter = 0
     ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
 
-    if trace_every < 1:
-        raise ValueError('trace_every must be >= 1')
     if loss_threshold is not None:
         loss_threshold = float(loss_threshold)
         if not math.isfinite(loss_threshold):
@@ -1413,7 +1365,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Compute loss and gradients at current (pre-update) normalised parameters.
             # At the START of iteration i, we're at state S(i-1).
             # The loss computed here is loss(S(i-1)), which is what we want to log for CSV epoch (i-1).
-            trace_requested = trace_csv_writer is not None and epoch % trace_every == 0
+            trace_requested = trace_csv_writer is not None
             loss_trace = None
             if trace_requested:
                 (loss_value, loss_trace_raw), norm_grads = loss_and_trace_fn(opt_params_norm)
@@ -1533,7 +1485,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         # At this point, opt_params contains the parameters from the end of the final iteration.
         # We need to compute the loss at these parameters to complete the CSV epoch logging.
         if csv_writer is not None:
-            loss_final = float(loss_from_normalised(opt_params_norm))
+            loss_final, _ = loss_from_normalised(opt_params_norm)
+            loss_final = loss_final.astype(float)
             # epoch is the last epoch number from the loop (either n_epochs or early stopping)
             row = {'epoch': epoch, 'loss': loss_final}
             for key in opt_param_keys:
@@ -1545,26 +1498,25 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
         # Optionally compute and log trace diagnostics at the best parameters found.
         # This is independent of the CSV epoch logging and serves as diagnostics for the best fit.
-        if trace_csv_writer is not None and best_epoch % trace_every != 0:
-            # best_epoch was not logged via regular trace_every sampling; compute and log now
-            best_loss_for_trace, best_trace = chi2_loss(
-                best_opt_params,
-                fixed_params,
-                distance_pc,
-                prepared_data,
-                return_trace=True,
-                loss_method=loss_method,
-            )
-            best_loss_for_trace = float(best_loss_for_trace)
+        # if trace_csv_writer is not None:
+        #     # compute and log now
+        #     best_loss_for_trace, best_trace = chi2_loss(
+        #         best_opt_params,
+        #         fixed_params,
+        #         distance_pc,
+        #         prepared_data,
+        #         loss_method=loss_method,
+        #     )
+        #     best_loss_for_trace = float(best_loss_for_trace)
             
-            # Compute best gradient norm for trace
-            best_norm_grads = loss_and_grad_fn(normalise_opt_params(best_opt_params, normalisation_spec))[1]
-            best_grad_norm = float(gradient_l2_norm(best_norm_grads))
+        #     # Compute best gradient norm for trace
+        #     _, best_norm_grads = loss_and_trace_fn(normalise_opt_params(best_opt_params, normalisation_spec))
+        #     best_grad_norm = float(gradient_l2_norm(best_norm_grads))
             
-            # Log trace row for best epoch
-            best_trace_row = build_trace_row(best_epoch, best_loss_for_trace, best_trace, best_grad_norm, loss_method)
-            trace_csv_writer.writerow(best_trace_row)
-            trace_csv_file.flush()
+        #     # Log trace row for best epoch
+        #     best_trace_row = build_trace_row(best_epoch, best_loss_for_trace, best_trace, best_grad_norm, loss_method)
+        #     trace_csv_writer.writerow(best_trace_row)
+        #     trace_csv_file.flush()
     
         # restore canonical parameter order before returning
         ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}

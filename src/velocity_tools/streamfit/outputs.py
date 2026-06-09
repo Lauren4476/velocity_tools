@@ -119,7 +119,7 @@ def plot_morphology_by_epoch(
         ra_model = ra_model[not_nan]
         dec_model = dec_model[not_nan]
 
-        (ra_model_interp, dec_model_interp, _, valid, *_) = gradient_descent.match_model_to_data_curve(
+        (ra_model_interp, dec_model_interp, _, valid, _, _) = gradient_descent.checked_match_model_to_data_curve(
             ra_model,
             dec_model,
             v_model[not_nan],
@@ -220,6 +220,8 @@ def plot_morphology(
 
 
     fig, ax = plt.subplots(figsize=(6.5, 7))
+    if valid is not None:
+        valid = np.asarray(valid, dtype=bool)
 
     # model curve if given
     if ra_model is not None and dec_model is not None:
@@ -362,8 +364,8 @@ def plot_ra_vel_by_epoch(
         ra_model = ra_model[mask]
         dec_model = dec_model[mask]
         v_model = v_model[mask]
-        ra_model_interp, _, v_model_interp, valid, *_ = (
-            gradient_descent.match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model_interp, _, v_model_interp, valid, _, _ = (
+            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
         )
 
         epoch_models.append({
@@ -441,8 +443,11 @@ def plot_ra_vel(
 ):
     ra_model = np.asarray(ra_model, dtype=float)
     v_model = np.asarray(v_model, dtype=float)
+    if valid is not None:
+        valid = np.asarray(valid, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    
 
     # point cloud (RA vs velocity)
     if pc_coords is not None:
@@ -523,8 +528,8 @@ def plot_dec_vel_by_epoch(
         ra_model = ra_model[mask]
         dec_model = dec_model[mask]
         v_model = v_model[mask]
-        ra_model_interp, dec_model_interp, v_model_interp, valid, *_ = (
-            gradient_descent.match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model_interp, dec_model_interp, v_model_interp, valid, _, _ = (
+            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
         )
 
         epoch_models.append({
@@ -604,6 +609,8 @@ def plot_dec_vel(
 ):
     dec_model = np.asarray(dec_model, dtype=float)
     v_model = np.asarray(v_model, dtype=float)
+    if valid is not None:
+        valid = np.asarray(valid, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(6, 5))
 
@@ -753,6 +760,8 @@ def plot_vel_radius(
     ra_model = np.asarray(ra_model, dtype=float)
     dec_model = np.asarray(dec_model, dtype=float)
     v_model = np.asarray(v_model, dtype=float)
+    if valid is not None:
+        valid = np.asarray(valid, dtype=bool)
 
     finite_model = np.isfinite(ra_model) & np.isfinite(dec_model) & np.isfinite(v_model)
     ra_model = ra_model[finite_model]
@@ -927,8 +936,8 @@ def plot_vel_radius_by_epoch(
         dec_model = dec_model[mask]
         v_model = v_model[mask]
 
-        ra_model_interp, dec_model_interp, v_model_interp, valid, *_ = (
-            gradient_descent.match_model_to_data_curve(
+        ra_model_interp, dec_model_interp, v_model_interp, valid, _, _ = (
+            gradient_descent.checked_match_model_to_data_curve(
                 ra_model,
                 dec_model,
                 v_model,
@@ -1205,10 +1214,8 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
         dec = dec[finite]
         vel = vel[finite]
 
-        dmetric = np.asarray(
-            extract_streamline.get_distance_metric(ra, dec),
-            dtype=float,
-        )
+        dmetric, trace = extract_streamline.get_distance_metric(ra, dec)
+        dmetric = np.asarray(dmetric, dtype=float)
 
         streamlines.append(
             {

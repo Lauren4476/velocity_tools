@@ -26,15 +26,27 @@ def wrap_to_pi(angle):
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 @jax.jit
-def circular_median(theta_vals):
-    '''Branch-cut-safe median angle. (unrwap, linear median, rewrap)'''
-    theta_anchor = jnp.arctan2(jnp.mean(jnp.sin(theta_vals)), jnp.mean(jnp.cos(theta_vals)))
+def circular_median(theta_vals, weights):
+    '''Branch-cut-safe median angle. (unrwap, linear median, rewrap)
+    theta values with weight = 0 are ignored in the median calculation'''
+    weights = weights / (jnp.sum(weights) + 1e-12) # normalize weights to sum to 1, add small value to avoid division by zero
+    theta_anchor = jnp.arctan2(
+        jnp.sum(weights * jnp.sin(theta_vals)),
+        jnp.sum(weights * jnp.cos(theta_vals))
+    )
     theta_delta = wrap_to_pi(theta_vals - theta_anchor)
     theta_unwrapped = theta_anchor + theta_delta
-    theta_ref = jnp.median(theta_unwrapped)
+    sort_idx = jnp.argsort(theta_unwrapped)
+    sorted_vals = theta_unwrapped[sort_idx]
+    sorted_weights = weights[sort_idx]
+    cumulative_weights = jnp.cumsum(sorted_weights)
+    cutoff = 0.5 * jnp.sum(sorted_weights)
+    median_idx = jnp.argmax(cumulative_weights >= cutoff)
+    theta_ref = sorted_vals[median_idx]
     return wrap_to_pi(theta_ref)
 
 
+@jax.jit
 def wrap_to_pi_numpy(angle):
     '''Wrap angles to [-pi, pi)'''
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
@@ -97,7 +109,7 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     pc_coords = np.array([pc_ra, pc_dec, pc_v]) # shape (3, n_points)   
 
     # compute partitions for binning the point cloud
-    distance_metric = get_distance_metric(pc_coords[0], pc_coords[1])
+    distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1])
     b_per = np.linspace(0, 100, n_elements+1) # percentiles to bin the pc into
     partitions = np.array([np.percentile(distance_metric, per) for per in b_per])
     print("Partition boundaries for projected distance metric:", np.round(partitions, 3))
@@ -121,8 +133,8 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     return pc_coords, pc_means, pc_stds
 
         
-
-def get_distance_metric(ra_coords, dec_coords, return_trace=False):
+@jax.jit
+def get_distance_metric(ra_coords, dec_coords):
     '''
     Compute radial + angular distance metric for point cloud binning
     Uses a circular angular deviation to avoid branch-cut artifacts.
@@ -130,55 +142,62 @@ def get_distance_metric(ra_coords, dec_coords, return_trace=False):
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
 
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
-    finite_r = pc_r[finite_mask]
-    finite_theta = pc_theta[finite_mask]
+    # finite_r = pc_r[finite_mask]
+    # finite_theta = pc_theta[finite_mask]
 
     # deal with if there are no valid points
-    if finite_r.size == 0:
-        if return_trace:
-            return pc_r, {
-                "n_points": int(pc_r.size),
-                "n_finite_points": 0,
-                "n_reference_points": 0,
-                "r_percentile_thresh": float("nan"),
-                "r_thresh": float("nan"),
-                "theta_ref": 0.0,
-                "theta_weight": 1.0,
-                "close_point_count": 0,
-            }
-        return pc_r
+    def empty_case(_):
 
-    theta_weight = 1.0 # maybe make this a tunable parameter
+        distance_metric = jnp.full_like(pc_r, jnp.nan)
+        trace = {
+            "n_points": pc_r.size,
+            "n_finite_points": 0,
+            "n_reference_points": 0,
+            "r_percentile_thresh": jnp.nan,
+            "r_thresh": jnp.nan,
+            "theta_ref": 0.0,
+            "theta_weight": 1.0,
+            "close_point_count": 0,
+        }
+        return distance_metric, trace
 
-    # reference theta is obtained from points within a radius threshold
-    n_ref = min(10, max(1, int(finite_r.size)))
-    percentile = 100.0 / n_ref
-    r_thresh = jnp.percentile(finite_r, percentile)
-    close_theta = finite_theta[finite_r <= r_thresh]
-    ref_theta_source = close_theta if close_theta.size else finite_theta
-    theta_ref = circular_median(ref_theta_source)
+    def notempty_case(_):
 
-    # cyclic angular deviation
-    theta_dev = jnp.pi - jnp.abs(
-        jnp.pi - jnp.abs(wrap_to_pi(pc_theta - theta_ref))
-    )
+        theta_weight = 1.0 # maybe make this a tunable parameter
+        finite_count = jnp.sum(finite_mask)
+        # reference theta is obtained from points within a radius threshold
+        n_ref = jnp.clip(finite_count, 1, 10)
+        percentile = 100.0 / n_ref
+        # jnp.percentile can deal with nans
+        r_thresh = jnp.percentile(
+            jnp.where(finite_mask, pc_r, jnp.nan),
+            percentile)
+        
+        close_mask = (finite_mask & (pc_r <= r_thresh)).astype(jnp.float64)
+        theta_ref = circular_median(pc_theta, weights=close_mask)
 
-    distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
-    distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
+        # cyclic angular deviation
+        theta_dev = jnp.pi - jnp.abs(
+            jnp.pi - jnp.abs(wrap_to_pi(pc_theta - theta_ref))
+        )
 
-    if return_trace:
-        return distance_metric, {
-            "n_points": int(pc_r.size),
-            "n_finite_points": int(finite_r.size),
+        distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
+        distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
+
+        trace = {
+            "n_points": pc_r.size,
+            "n_finite_points": finite_count,
             "n_reference_points": n_ref,
             "r_percentile_thresh": percentile,
-            "r_thresh": float(r_thresh),
-            "theta_ref": float(theta_ref),
+            "r_thresh": r_thresh,
+            "theta_ref": theta_ref,
             "theta_weight": theta_weight,
-            "close_point_count": int(close_theta.size),
+            "close_point_count": close_mask.size,
         }
 
-    return distance_metric
+        return distance_metric, trace
+    
+    return jax.lax.cond(finite_mask.any(), notempty_case, empty_case, operand=None)
 
 @jax.jit
 def cartesian_to_polar(x, y):
@@ -214,7 +233,8 @@ def get_metric_partitions(pc_coords, n_elements):
 
     ra_coords = pc_coords[0]
     dec_coords = pc_coords[1]
-    distance_metric = np.asarray(get_distance_metric(ra_coords, dec_coords))
+    distance_metric, _ = get_distance_metric(ra_coords, dec_coords)
+    distance_metric = np.asarray(distance_metric)
     finite_mask = np.isfinite(distance_metric)
     finite_metric = distance_metric[finite_mask]
 
@@ -229,7 +249,7 @@ def get_metric_reference_trace(pc_coords):
     '''get the metric reference angle and weight used for boundary sampling'''
     ra_coords = pc_coords[0]
     dec_coords = pc_coords[1]
-    _, trace = get_distance_metric(ra_coords, dec_coords, return_trace=True)
+    _, trace = get_distance_metric(ra_coords, dec_coords)
     theta_ref = float(trace.get('theta_ref', 0.0))
     theta_weight = float(trace.get('theta_weight', 1.0))
     return theta_ref, theta_weight
@@ -300,7 +320,7 @@ def prepare_data(data, uncertainties):
     dec_sigma_safe = jnp.maximum(dec_sigma, eps)
     v_sigma_safe = jnp.maximum(v_sigma, eps)
 
-    dmetric_data = get_distance_metric(ra_data, dec_data)
+    dmetric_data, _ = get_distance_metric(ra_data, dec_data)
     data_finite_mask = jnp.isfinite(ra_data) & jnp.isfinite(dec_data) & jnp.isfinite(dmetric_data)
 
     data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
