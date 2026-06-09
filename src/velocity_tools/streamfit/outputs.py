@@ -1248,6 +1248,7 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
         size=n_samples,
     )
     if param_bounds is not None:
+        param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
         for j, key in enumerate(opt_keys):
             if key in param_bounds:
                 low, high = param_bounds[key]

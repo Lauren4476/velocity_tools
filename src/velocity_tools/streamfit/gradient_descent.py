@@ -16,6 +16,7 @@ from . import stream_lines_grad
 from . import extract_streamline
 from . import outputs
 import csv
+import astropy.units as u
 import math
 
 jax.config.update("jax_enable_x64", True)
@@ -56,6 +57,59 @@ TRACE_COMMON_FIELDNAMES = [
     'overlap_metric_max',
 ]
 
+CANONICAL_UNITS = {
+    "r0": u.au,
+    "theta0": u.rad,
+    "phi0": u.rad,
+    "inc": u.rad,
+    "pa": u.rad,
+    "v_r0": u.km / u.s,
+    "omega": 1 / u.s,
+    "mass": u.Msun,
+    "rmin": u.au,
+    "deltar": u.au,
+    "v_lsr": u.km / u.s,
+}
+
+STREAMLINE_MODEL_PARAM_KEYS = (
+    'r0',
+    'theta0',
+    'phi0',
+    'log_omega',
+    'v_r0',
+    'mass',
+    'inc',
+    'pa',
+    'rmin',
+    'deltar',
+    'v_lsr',
+)
+
+def convert_and_strip_bound_units(bounds):
+    """
+    Convert bounds that are astropy quantitiesinto canonical units,
+    then strip the units.
+
+    If input is already plain numeric, assume it's already in canonical units.
+
+    Required as JAX optimiser works with unitless arrays.
+    """
+
+    output = {}
+
+    for key, val in bounds.items():
+        if isinstance(val, u.Quantity):
+            if key not in CANONICAL_UNITS:
+                raise ValueError(f"The parameter {key} doesn't have defined canonical units...")
+            bounds = val.to(CANONICAL_UNITS[key])
+            output[key] = (
+                float(bounds[0].value),
+                float(bounds[1].value),
+            )
+        else:
+            # already unitless
+            output[key] = tuple(float(v) for v in val)
+    return output
 
 def check_loss_method(loss_method):
     """Check that the selected loss method is valid and return it"""
@@ -71,21 +125,6 @@ def trace_fieldnames_for_loss_method(loss_method):
     """Return the trace csv headers for the chosen loss method"""
     loss_method = check_loss_method(loss_method)
     return ['epoch', 'loss', *LOSS_METHOD_COMPONENT_KEYS[loss_method], *TRACE_COMMON_FIELDNAMES[2:]]
-
-
-STREAMLINE_MODEL_PARAM_KEYS = (
-    'r0',
-    'theta0',
-    'phi0',
-    'log_omega',
-    'v_r0',
-    'mass',
-    'inc',
-    'pa',
-    'rmin',
-    'deltar',
-    'v_lsr',
-)
 
 
 def is_numeric_value(value):
@@ -140,10 +179,15 @@ def clean_model_param_dict(params, dict_name):
     if not isinstance(params, dict):
         raise TypeError(f"{dict_name} must be a dictionary, got {type(params).__name__}.")
 
-    if dict_name == 'initial_opt_params':
-        sanitized = make_opt_params_float64(params.copy())
-    else:
-        sanitized = make_fixed_params_float64(params.copy())
+    sanitized = {}
+
+    for key, val in params.items():
+        if isinstance(val, u.Quantity):
+            if key not in CANONICAL_UNITS:
+                raise ValueError(f"The parameter {key} doesn't have defined canonical units...")
+            val = val.to(CANONICAL_UNITS[key]).value
+        # if it's already a raw number, assume it's already correct
+        sanitized[key] = jnp.asarray(val, dtype=jnp.float64)
 
     if 'omega' in sanitized and 'log_omega' not in sanitized:
         sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
@@ -249,8 +293,8 @@ def standardise_param_bounds(param_bounds):
                 "Please provide only one of these."
             )
         omega_min, omega_max = standardised.pop('omega')
-        omega_min = float(omega_min)
-        omega_max = float(omega_max)
+        omega_min = float(omega_min.value)
+        omega_max = float(omega_max.value)
         if omega_min <= 0 or omega_max <= 0:
             raise ValueError("'omega' bounds must be positive")
         if omega_min >= omega_max:
@@ -496,7 +540,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - Dec offsets in arcsec
         - Line-of-sight velocities in km/s, relative to v_lsr
     """
-    model_params, _, _ = prepare_model_params(opt_params, fixed_params)
+    model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
     distance_pc = to_float64(distance_pc)
 
     omega = jnp.exp(model_params['log_omega'])
@@ -888,9 +932,9 @@ def chi2_loss(
     -----------
     opt_params : dict
         optimisable streamline model parameters (any subset of
-        STREAMLINE_MODEL_PARAM_KEYS).
+        STREAMLINE_MODEL_PARAM_KEYS). already unitless
     fixed_params : dict
-        Fixed streamline model parameters (complementary subset).
+        Fixed streamline model parameters (complementary subset). already unitless
     distance_pc : float
         Distance to source in parsecs
     prepared_data : PreparedData
@@ -924,15 +968,6 @@ def chi2_loss(
         checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
     )
 
-
-    # penalties not used anymore
-    # chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess = coverage_penalties(
-    #     dmetric_model,
-    #     model_finite_mask,
-    #     prepared_data.data_min,
-    #     prepared_data.data_max,
-    # )
-    # TODO: lauren you are here
     valid = jnp.asarray(valid, dtype=bool)
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
@@ -1213,11 +1248,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     """
     # Initialize parameters
     loss_method = check_loss_method(loss_method)
+
     opt_params, fixed_params = sanitize_param_partition(
         initial_opt_params,
         fixed_params,
         require_nonempty_opt=True,
     )
+
     opt_param_keys = list(opt_params.keys())
     data = make_data_tuple_float64(data)
     uncertainties = make_data_tuple_float64(uncertainties)
@@ -1228,6 +1265,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if not bool(learning_rate > 0):
         raise ValueError(f'learning_rate must be > 0. Got {float(learning_rate)}.')
     param_bounds = standardise_param_bounds(param_bounds)
+    param_bounds = convert_and_strip_bound_units(param_bounds)
     normalisation_spec = build_normalisation_spec(opt_params, param_bounds)
 
     # Keep optimisation variables in normalised coordinates; convert back to

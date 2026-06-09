@@ -297,9 +297,10 @@ def rotate_xyz(x, y, z, rotation_matrix):
 
 
 # Astropy wrapper - handles astropy units and calls jax-compatible maths
-def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
-               phi0=15*u.deg, omega=1e-14/u.s, v_r0=0*u.km/u.s,
-               inc=0*u.deg, pa=0*u.deg, rmin=None, deltar=1*u.au):
+# TODO: lauren you need to make this jax compatible
+def xyz_stream(mass=0.5, r0=1e4, theta0=30,
+               phi0=15, omega=1e-14, v_r0=0,
+               inc=0, pa=0, rmin=None, deltar=1):
     '''
     it gets xyz coordinates and velocities for a stream line.
     They are also rotated in PA and inclination along the line of sight.
@@ -309,17 +310,17 @@ def xyz_stream(mass=0.5*u.Msun, r0=1e4*u.au, theta0=30*u.deg,
     using:
     https://en.wikipedia.org/wiki/Vector_fields_in_cylindrical_and_spherical_coordinates
 
-    :param mass: Central mass, Msun
-    :param r0: Initial radius of streamline, au
-    :param theta0: Initial polar angle of streamline, degrees
-    :param phi0: Initial azimuthal angle of streamline, degrees
-    :param omega: Angular rotation. (defined positive), 1/s
-    :param v_r0: Initial radial velocity of the streamline, km/s
-    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk, degrees
-    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., degrees
-    :param rmin: smallest radius for calculation, au
-    :param deltar: spacing between two consecutive radii in the sampling of the streamer, in au
-    :return: x, y, z in au, v_x, v_y, v_z in km/s
+    :param mass: Central mass (Msun)
+    :param r0: Initial radius of streamline (au)
+    :param theta0: Initial polar angle of streamline (degrees)
+    :param phi0: Initial azimuthal angle of streamline (degrees)
+    :param omega: Angular rotation. (defined positive), (1/s)
+    :param v_r0: Initial radial velocity of the streamline, (km/s)
+    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (degrees)
+    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (degrees)
+    :param rmin: smallest radius for calculation, (au)
+    :param deltar: spacing between two consecutive radii in the sampling of the streamer, in (au)
+    :return: x, y, z in (au), v_x, v_y, v_z in (km/s)
     '''
 
     mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
