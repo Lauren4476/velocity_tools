@@ -20,6 +20,7 @@ import astropy.units as u
 import math
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_debug_nans", True)
 
 # settings and constants
 VR0_MIN = 1e-6
@@ -494,8 +495,8 @@ def coverage_penalties(dmetric_model, model_finite_mask, data_min, data_max):
     margin = to_float64(0.2 * (data_max - data_min))
     tau = 0.8 * margin
 
-    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, jnp.inf)
-    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, -jnp.inf)
+    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG))
+    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG_NEG))
     model_min = jnp.min(model_metric_for_min)
     model_max = jnp.max(model_metric_for_max)
 
@@ -517,9 +518,9 @@ def coverage_penalties(dmetric_model, model_finite_mask, data_min, data_max):
 
 
 
-def forward_model(opt_params, fixed_params, distance_pc):
+def forward_model(opt_params, fixed_params, distance_pc, npoints=10000):
     """
-    Run the forward model using stream_lines_grad.xyz_stream
+    Run the forward model using stream_lines_grad.checked_xyz_stream
     
     Parameters:
     -----------
@@ -532,6 +533,11 @@ def forward_model(opt_params, fixed_params, distance_pc):
         STREAMLINE_MODEL_PARAM_KEYS exactly once
     distance_pc : float
         Distance to source in parsecs
+    npoints : int
+        Number of points to sample along the streamer
+        This is just for jax/jit compatibility to have fixed-length arrays, but
+        the actual number of valid points is determined by r0, rmin, rc, deltar,
+        so some of the returned points may be NaN if npoints is larger than the number of valid points.
         
     Returns:
     --------
@@ -556,7 +562,10 @@ def forward_model(opt_params, fixed_params, distance_pc):
         )
 
     # Run the forward model - returns positions in au, velocities in km/s
-    (x, y, z), (vx, vy, vz) = stream_lines_grad.xyz_stream(
+    # valid_mask is a boolean array marking which points are valid in the returned arrays, 
+    # which can be used for masking in the loss function
+    # sense check: points not covered by valid_mask should be 0 here
+    err, ((x, y, z), (vx, vy, vz), valid_mask) = stream_lines_grad.checked_xyz_stream(
         mass=model_params['mass'],
         r0=model_params['r0'],
         theta0=model_params['theta0'],
@@ -566,9 +575,12 @@ def forward_model(opt_params, fixed_params, distance_pc):
         inc=model_params['inc'],
         pa=model_params['pa'],
         rmin=model_params['rmin'],
-        deltar=model_params['deltar']
+        deltar=model_params['deltar'],
+        npoints=npoints
     )
-     
+    err.throw()
+
+
     # Convert positions from au to arcsec offsets
     # x = RA offset (with negative for standard RA convention)
     # z = Dec offset
@@ -577,8 +589,13 @@ def forward_model(opt_params, fixed_params, distance_pc):
     dec_model = z / distance_pc  # arcsec
     # make velocity absolute by adding back v_lsr
     v_model = vy + model_params['v_lsr']  # km/s 
+    # make sure model points outside valid_mask are set to 0
+    ra_model = jnp.where(valid_mask, ra_model, 0.0)
+    dec_model = jnp.where(valid_mask, dec_model, 0.0)
+    v_model = jnp.where(valid_mask, v_model, 0.0)
 
-    return ra_model, dec_model, v_model
+
+    return ra_model, dec_model, v_model, valid_mask
 
 
 def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
@@ -629,7 +646,7 @@ def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=
     )
 
 @jax.jit
-def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
+def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data):
     """
     Extract model values corresponding to data positions using the distance metric from
     extract_streamline.get_distance_metric
@@ -655,15 +672,14 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
     # get distance metrics
     dmetric_model, _ = extract_streamline.get_distance_metric(ra_model, dec_model)
+    # jax.debug.print("dmetric_model: min={mn} max={mx} has_nan={n}",
+        # mn=jnp.min(dmetric_model), mx=jnp.max(dmetric_model),
+        # n=jnp.any(jnp.isnan(dmetric_model)))
     dmetric_data, _ = extract_streamline.get_distance_metric(ra_data, dec_data)
-
-    # only finite values are valid
-    model_valid = (
-        jnp.isfinite(ra_model)
-        & jnp.isfinite(dec_model)
-        & jnp.isfinite(v_model)
-        & jnp.isfinite(dmetric_model)
-    )
+    # jax.debug.print("dmetric_data: min={mn} max={mx} has_nan={n}",
+        # mn=jnp.min(dmetric_data), mx=jnp.max(dmetric_data),
+        # n=jnp.any(jnp.isnan(dmetric_data)))
+    model_valid = valid_mask_model
 
     data_valid = (
         jnp.isfinite(ra_data)
@@ -671,10 +687,10 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         & jnp.isfinite(dmetric_data)
     )
 
-    # we also filter model to keep only model points with dmetric >= minimum of data dmetric
+    # # we also filter model to keep only model points with dmetric >= minimum of data dmetric
     # this is becuase the model shouldn't go further in than the innermost data point
     # as this is where we no longer observe the streamer
-    d_data_valid = jnp.where(data_valid, dmetric_data, jnp.inf)
+    d_data_valid = jnp.where(data_valid, dmetric_data, to_float64(BIG))
     data_min = jnp.min(d_data_valid)
 
     # enforce both constraints on model
@@ -682,58 +698,77 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
     # weights: 0 = ignore, 1 = use. This is for jax/jit compatibility
     w_model = model_keep.astype(jnp.float64)
-    w_data = data_valid.astype(jnp.float64)
 
     d_model = jnp.where(model_keep, dmetric_model, 0.0)
     d_data  = jnp.where(data_valid, dmetric_data, 0.0)
 
-    ra = ra_model
-    dec = dec_model
-    v = v_model
 
-    # ---- sort ONLY MODEL using metric + weight penalty ----
-    model_sort_key = d_model + (1.0 - w_model) * BIG
+    # ---- sort model using metric + weight penalty (pushes invalid points to the end) ----
+    model_sort_key = d_model + (1.0 - w_model) * to_float64(BIG)
     model_idx = jnp.argsort(model_sort_key)
+    # jax.debug.print("Model sort key: {key}", key=model_sort_key)
 
     d_model_s = d_model[model_idx]
-    ra_s = ra[model_idx]
-    dec_s = dec[model_idx]
-    v_s = v[model_idx]
+    # jax.debug.print("Sorted model metric: {metric}", metric=d_model_s)
+    ra_s = ra_model[model_idx]
+    dec_s = dec_model[model_idx]
+    v_s = v_model[model_idx]
     w_model_s = w_model[model_idx]
 
     # stats for trace and interpolation domain
-    data_min_eff = jnp.min(jnp.where(data_valid, d_data, jnp.inf))
-    data_max_eff = jnp.max(jnp.where(data_valid, d_data, -jnp.inf))
+    data_min_eff = jnp.min(jnp.where(data_valid, dmetric_data, to_float64(BIG)))
+    data_max_eff = jnp.max(jnp.where(data_valid, dmetric_data, to_float64(BIG_NEG)))
+    model_min = jnp.min(jnp.where(model_keep, dmetric_model, to_float64(BIG)))
+    model_max = jnp.max(jnp.where(model_keep, dmetric_model, to_float64(BIG_NEG)))
+    # jax.debug.print("data_min_eff={a} data_max_eff={b} model_min={c} model_max={d}",
+    # a=data_min_eff, b=data_max_eff, c=model_min, d=model_max)
 
-    model_min = jnp.min(jnp.where(model_keep, d_model, jnp.inf))
-    model_max = jnp.max(jnp.where(model_keep, d_model, -jnp.inf))
 
     model_span = model_max - model_min
     data_span = data_max_eff - data_min_eff
-    model_span_safe = jnp.where(model_span == 0.0, 1.0, model_span)
-    data_span_safe = jnp.where(data_span == 0.0, 1.0, data_span)
+    model_span_safe = jnp.where(model_span > to_float64(0.0), model_span, to_float64(1.0))
+    data_span_safe  = jnp.where(data_span  > to_float64(0.0), data_span,  to_float64(1.0))
+    # jax.debug.print("data_span_safe={a} model_span_safe={b}",
+    # a=data_span_safe, b=model_span_safe)
 
+
+    data_has_valid  = data_min_eff < to_float64(BIG)
+    model_has_valid = model_min    < to_float64(BIG)
+    both_valid      = data_has_valid & model_has_valid
     # normalise data metric
-    d_data_norm = (d_data - data_min_eff) / data_span
-    d_goal = model_min + d_data_norm * model_span
+    d_data_norm = (d_data - data_min_eff) / data_span_safe
+    d_goal_raw = model_min + d_data_norm * model_span_safe
+    d_goal      = jnp.where(both_valid, d_goal_raw, to_float64(0.0))
+    # jax.debug.print("d_data: min={mn} max={mx} has_nan={n}",
+    # mn=jnp.min(d_data), mx=jnp.max(d_data),
+    # n=jnp.any(jnp.isnan(d_data)))
+    # jax.debug.print("d_goal_raw: min={mn} max={mx} has_nan={n}",
+    # mn=jnp.min(d_goal_raw), mx=jnp.max(d_goal_raw),
+    # n=jnp.any(jnp.isnan(d_goal_raw)))
+    # jax.debug.print("d_goal: min={mn} max={mx} has_nan={n}",
+    # mn=jnp.min(d_goal), mx=jnp.max(d_goal),
+    # n=jnp.any(jnp.isnan(d_goal)))
 
     # interpolate model at data points, using weights to ignore invalid model points 
     # by giving them huge distance values so they don't affect the interpolation
-    xp = jnp.where(w_model_s > 0, d_model_s, BIG)
+    xp = jnp.where(w_model_s > 0, d_model_s, to_float64(BIG))
 
     ra_interp = jnp.interp(d_goal, xp, ra_s)
     dec_interp = jnp.interp(d_goal, xp, dec_s)
     v_interp = jnp.interp(d_goal, xp, v_s)
+    # jax.debug.print("ra_interp has_nan={n}", n=jnp.any(jnp.isnan(ra_interp)))
+    # jax.debug.print("dec_interp has_nan={n}", n=jnp.any(jnp.isnan(dec_interp)))
+    # jax.debug.print("v_interp has_nan={n}", n=jnp.any(jnp.isnan(v_interp)))
 
     # things for trace
     valid = data_valid
 
     matching_trace = {
     "model_points_total": model_idx.size,
-    "model_nan_count": jnp.sum(jnp.isnan(d_model)),
+    "model_nan_count": jnp.sum(jnp.isnan(dmetric_model)),
     "model_valid_points": model_valid.sum(),
     "data_points_total": ra_data.size,
-    "data_nan_count": jnp.sum(jnp.isnan(d_data)),
+    "data_nan_count": jnp.sum(jnp.isnan(dmetric_data)),
     "data_valid_points": data_valid.sum(),
     "model_metric_min": model_min,
     "model_metric_max": model_max,
@@ -748,6 +783,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
 checked_matching = checkify.checkify(match_model_to_data_curve)
 
+@jax.jit
 def checked_match_model_to_data_curve(*args, **kwargs):
     """Wrapper around match_model_to_data_curve with checkify checks for errors (to remain jax compatible)"""
     errors, result = checked_matching(*args, **kwargs)
@@ -761,6 +797,7 @@ def chi2_loss_raw(
     distance_pc,
     prepared_data,
     loss_method=0,
+    npoints=10000,
 ):
     """Compute chi-squared loss and optionally return a diagnostic trace tree"""
 
@@ -776,10 +813,15 @@ def chi2_loss_raw(
     dec_sigma = prepared_data.dec_sigma_safe
     v_sigma = prepared_data.v_sigma_safe
 
-    ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
+    ra_model, dec_model, v_model, valid_mask_model = forward_model(opt_params, fixed_params, distance_pc, npoints=npoints)
+    valid_mask_model = valid_mask_model.astype(jnp.bool_)
+
+    # jax.debug.print("ra_model (raw): {x}", x=ra_model)
+    # jax.debug.print("dec_model (raw): {x}", x=dec_model)
+    # jax.debug.print("v_model (raw): {x}", x=v_model)
 
     ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, _ = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
     )
 
     dmetric_data = prepared_data.dmetric_data
@@ -792,14 +834,9 @@ def chi2_loss_raw(
         & jnp.isfinite(dmetric_model)
     )
 
-    # penalties not used anymore
-    # chi2_penalty, low_shortfall, low_excess, high_shortfall, high_excess  = coverage_penalties(
-    #     dmetric_model,
-    #     model_finite_mask,
-    #     prepared_data.data_min,
-    #     prepared_data.data_max,
-    # )
-
+    # jax.debug.print("ra_model_interp (valid): {x}", x=ra_model_interp[valid])
+    # jax.debug.print("dec_model_interp (valid): {x}", x=dec_model_interp[valid])
+    # jax.debug.print("v_model_interp (valid): {x}", x=v_model_interp[valid])
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
@@ -820,13 +857,15 @@ def chi2_loss_raw(
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
         r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
-
+        # jax.debug.print("sigma_r (valid): {x}", x=sigma_r[valid])
+        # jax.debug.print("sigma_theta (valid): {x}", x=sigma_theta[valid])
         # Only compute chi2 on valid/retained data points
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
+        # jax.debug.print("chi2: {x}", x=chi2_total)
 
     data_finite_mask = (
         jnp.isfinite(ra_data)
@@ -922,6 +961,7 @@ def chi2_loss(
     distance_pc,
     prepared_data,
     loss_method=0,
+    npoints=10000,
 ):
     """
     Compute chi-squared loss between model and data using one of two modes:
@@ -939,10 +979,10 @@ def chi2_loss(
         Distance to source in parsecs
     prepared_data : PreparedData
         Precomputed data-only quantities (distance metrics, bounds, polar coords).
-        Created via extract_streamline.prepare_data(data, uncertainties).
+        Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
 
         
-            Created via extract_streamline.prepare_data(data, uncertainties).
+            Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
     --------
     float: Chi-squared loss value
     """
@@ -960,15 +1000,22 @@ def chi2_loss(
     v_sigma = prepared_data.v_sigma_safe
 
     # Run forward model
-    ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
-    
+    ra_model, dec_model, v_model, valid_mask_model = forward_model(opt_params, fixed_params, distance_pc, npoints=npoints)
+    valid_mask_model = valid_mask_model.astype(jnp.bool_)
 
     # Match model to data using arc-length parameterisation
     ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
     )
 
     valid = jnp.asarray(valid, dtype=bool)
+    # jax.debug.print("ra_model_interp (valid): {x}", x=ra_model_interp[valid])
+    # jax.debug.print("ra_data (valid): {x}", x=ra_data[valid])
+    # get the distance metrics for model_interp (valid) and data (valid)
+    dmetric_data = prepared_data.dmetric_data
+    dmetric_model_interp, _ = extract_streamline.get_distance_metric(ra_model_interp, dec_model_interp)
+    # jax.debug.print("dmetric_model_interp (valid): {x}", x=dmetric_model_interp[valid])
+    # jax.debug.print("dmetric_data (valid): {x}", x=dmetric_data[valid])
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
@@ -1084,6 +1131,7 @@ def estimate_parameter_errors(
             distance_pc,
             prepared_data,
             loss_method=loss_method,
+            npoints=npoints
         )
         return chi2_total
 
@@ -1115,6 +1163,7 @@ def estimate_parameter_errors(
                     distance_pc,
                     prepared_data,
                     loss_method=loss_method,
+                    npoints=npoints
                 )
                 return chi2_total
 
@@ -1278,7 +1327,15 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     opt_state = solver.init(opt_params_norm)
 
     # Precompute data-only quantities once before optimisation loop
-    prepared_data = extract_streamline.prepare_data(data, uncertainties)
+    prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
+    # npoints for forward model evaluation: fixed large number set by max r0 bound and deltar
+    # this is necessary to ensure forward model has constant array lengths for jax/jit compatability
+    if 'r0' in param_bounds:
+        max_r0 = param_bounds['r0'][1]
+        deltar = fixed_params['deltar'] if 'deltar' in fixed_params else 1.0
+        npoints = max_r0 / deltar
+    else: 
+        npoints = 50000
 
     def loss_from_normalised(norm_opt_params):
         physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
@@ -1288,6 +1345,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             distance_pc,
             loss_method=loss_method,
             prepared_data=prepared_data,
+            npoints=npoints
         )
 
     def loss_from_normalised_with_trace(norm_opt_params):
@@ -1298,6 +1356,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             distance_pc,
             prepared_data,
             loss_method=loss_method,
+            npoints=npoints
         )
 
     # Create gradient functions in normalised space.
@@ -1412,6 +1471,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 loss_value, norm_grads = loss_and_grad_fn(opt_params_norm)
             loss_value = float(loss_value)
 
+            # jax.debug.print("norm_grads: {x}", x=norm_grads)
             # Compute gradient norm in normalised space for stopping criteria and logging.
             grad_norm = float(gradient_l2_norm(norm_grads))
 

@@ -1,7 +1,6 @@
 '''
 Contains all functions needed for a forward model of a streamline.
-All are fully differentiable using JAX, except for the astropy wrapper function (bottom), 
-which handles units and calls the jax-compatible functions
+All are fully differentiable using JAX
 
 Streamline implementation is based on Mendoza et al. (2009) doi:10.1111/j.1365-2966.2008.14210.x
 
@@ -14,20 +13,25 @@ The assumed input units are:
 - distance to source: pc
 '''
 
+#from dbm import _error
+
 import astropy.units as u
+from matplotlib.pyplot import rc
 from ..helper_functions import *
 import jax
 import jax.numpy as jnp
+from jax.experimental import checkify
 # from jax import lax
 # from jax import debug
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_debug_nans", False)
+jax.config.update("jax_debug_nans", True)
 from typing import NamedTuple
 
 
 ## constants 
 eps = 1e-8 # small value to avoid division by zero
 FLOAT_DTYPE = jnp.float64
+
 
 ## important streamline quantities (for easy reuse)
 class StreamState(NamedTuple):
@@ -77,16 +81,9 @@ def build_stream_quantities(mass, r0, theta0, omega, v_r0):
     precompute streamer quantities reused throughout file, and 
     store in class StreamState (near top)
     '''
-
-    mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
-    r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
-    theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
-    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
-    v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
-
     # Protect near-zero v_r0 from creating singularities in nu calculation
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
-    threshold = to_float64(1e-6)
+    threshold = to_float64(eps)
     v_r0 = jnp.where(
         jnp.isclose(v_r0, to_float64(0.0)),
         - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
@@ -152,7 +149,11 @@ def get_orb_ang(r_to_rc, theta0, ecc):
     :param ecc: eccentricity
     :return orb_ang: radians
     '''
-    cos_orb_ang = (1/ecc) * (1 - (jnp.power(jnp.sin(theta0), 2) / r_to_rc))
+    # valid points always have r_to_rc >= 0.5, so clamping at 0.1 never touches them
+    # this matches the sentinel used in stream_line so only affects already invalid points
+    # which will be masked out later in the final output anyway
+    r_to_rc_safe = jnp.maximum(r_to_rc, to_float64(0.1))
+    cos_orb_ang = (1/ecc) * (1 - (jnp.power(jnp.sin(theta0), 2) / r_to_rc_safe))
     orb_ang = safe_arccos(cos_orb_ang)
     return orb_ang
 
@@ -165,13 +166,20 @@ def get_dphi(theta, theta0=jnp.radians(30)):
     :param theta0: radians
     :return: difference in Phi angle, radians
     '''
-    arg = jnp.tan(theta0) / jnp.tan(theta)
+    tan_theta_safe = jnp.where(
+        jnp.abs(jnp.tan(theta)) > eps,
+        jnp.tan(theta),
+        jnp.sign(jnp.tan(theta)) * to_float64(eps),
+    )
+    # handle exact zero case
+    tan_theta_safe = jnp.where(tan_theta_safe == 0.0, to_float64(eps), tan_theta_safe)
+    arg = jnp.tan(theta0) / tan_theta_safe
     return safe_arccos(arg)
 
 
 
 @jax.jit
-def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
+def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     '''
     It calculates the stream line following Mendoza et al. (2009),
     only for r < r0. Point r = r0 is handled outside the function.
@@ -196,19 +204,31 @@ def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     # at initial position r_to_rc = r0/rc = 1/mu
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
 
-    # vectorised computation over array of r values
-    r_to_rc = r / rc
+    # compute r_to_rc for the full array
+    # for invalid points (r_mask=False) substitute a safe sentinel value of 0.6.
+    # 0.6 > 0.5 so it passes through get_orb_ang / get_dphi without triggering
+    # any near-zero divisions, and its gradient stays finite
+    # but we can still compute the full arrays for jax/jit compatibility
+
+    r_to_rc_raw = r / rc
+    r_to_rc = jnp.where(r_mask, r_to_rc_raw, to_float64(0.6))
+
     orb_ang = get_orb_ang(r_to_rc=r_to_rc, theta0=theta0, ecc=ecc)
     theta = get_theta(theta0, orb_ang, orb_ang0)
     phi = phi0 + get_dphi(theta, theta0=theta0)
 
     # remove values where r_to_rc < 0.5 (inside centrifugal radius)
-    mask = r_to_rc >= 0.5
-    orb_ang = jnp.where(mask, orb_ang, jnp.nan)
-    theta = jnp.where(mask, theta, jnp.nan)
-    phi = jnp.where(mask, phi, jnp.nan)
+    # this will include all the mask points, and also any points that are inside 0.5*rc
+    valid_mask = r_mask & (r_to_rc >= 0.5)
 
-    return orb_ang, theta, phi #in radians
+    # safe sentinel values for invalid points, to make sure gradients are finite
+    # will be masked out later in final output
+    orb_ang = jnp.where(valid_mask, orb_ang, jnp.pi/4)
+    theta_sentinel = jnp.minimum(theta0 + to_float64(0.1), to_float64(jnp.pi) - to_float64(eps))
+    theta = jnp.where(valid_mask, theta, theta_sentinel)
+    phi = jnp.where(valid_mask, phi, phi0)
+
+    return orb_ang, theta, phi, valid_mask #in radians
 
 
 @jax.jit
@@ -237,12 +257,19 @@ def stream_line_vel(
     rc = stream_state.rc
     ecc = stream_state.ecc
     vk0 = stream_state.vk0
-    r_to_rc = (r / rc)
+
+    r_to_rc = r / rc
     #
     v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(orb_ang) / r_to_rc /(1 - ecc*jnp.cos(orb_ang))
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
                   * jnp.sqrt(jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2))
     v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
+
+    # # turn nans to zeros for output to avoid nans in gradients.
+    # # they will be masked out later by valid_mask in the final output
+    # v_r_all = jnp.where(valid_mask, v_r_all, 0.0)
+    # v_theta_all = jnp.where(valid_mask, v_theta_all, 0.0)
+    # v_phi_all = jnp.where(valid_mask, v_phi_all, 0.0)
 
     return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
 
@@ -295,12 +322,24 @@ def rotate_xyz(x, y, z, rotation_matrix):
 
     return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
+def check_rc_r0(rc, r0):
+    '''check that centrifugal radius is smaller than initial radius of streamline, otherwise the model is not valid'''
+    checkify.check(
+        rc < r0,
+        "Centrifugal radius is larger than start of streamline. Model is not valid."
+    )
 
-# Astropy wrapper - handles astropy units and calls jax-compatible maths
-# TODO: lauren you need to make this jax compatible
-def xyz_stream(mass=0.5, r0=1e4, theta0=30,
-               phi0=15, omega=1e-14, v_r0=0,
-               inc=0, pa=0, rmin=None, deltar=1):
+def check_r_array(r, r_low):
+    '''check that radius array extends down to r_low, otherwise the model doesn't extend far enough for the given npoints and deltar'''
+    r_small = r <= r_low
+    checkify.check(
+        jnp.any(r_small),
+        "Radius points do not extend down to rlow. Increase npoints and/or deltar"
+    )
+
+def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
+               phi0=jnp.radians(15), omega=1e-14, v_r0=0,
+               inc=0, pa=0, rmin=None, deltar=1, npoints=10000):
     '''
     it gets xyz coordinates and velocities for a stream line.
     They are also rotated in PA and inclination along the line of sight.
@@ -310,16 +349,20 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
     using:
     https://en.wikipedia.org/wiki/Vector_fields_in_cylindrical_and_spherical_coordinates
 
-    :param mass: Central mass (Msun)
-    :param r0: Initial radius of streamline (au)
-    :param theta0: Initial polar angle of streamline (degrees)
-    :param phi0: Initial azimuthal angle of streamline (degrees)
-    :param omega: Angular rotation. (defined positive), (1/s)
+    :param mass: Central mass (unitless, Msun)
+    :param r0: Initial radius of streamline (unitless, au)
+    :param theta0: Initial polar angle of streamline (unitless, radians)
+    :param phi0: Initial azimuthal angle of streamline (unitless, radians)
+    :param omega: Angular rotation. (defined positive), (unitless,1/s)
     :param v_r0: Initial radial velocity of the streamline, (km/s)
-    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (degrees)
-    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (degrees)
-    :param rmin: smallest radius for calculation, (au)
-    :param deltar: spacing between two consecutive radii in the sampling of the streamer, in (au)
+    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (unitless, radians)
+    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (unitless, radians)
+    :param rmin: smallest radius for calculation, (unitless, au)
+    :param deltar: spacing between two consecutive radii in the sampling of the streamer, in (unitless, au)
+    :param npoints: number of points to sample along the streamer
+        This is just so that arrays are fixed length for jax/jit compatibility,
+        but the actual number of valid points is determined by r0, rmin, rc, deltar,
+        so some of the returned points may be NaN if npoints is larger than the number of valid points
     :return: x, y, z in (au), v_x, v_y, v_z in (km/s)
     '''
 
@@ -332,9 +375,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
     inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
     pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
     deltar = jnp.asarray(deltar, dtype=FLOAT_DTYPE)
-    if rmin is not None:
-        rmin = jnp.asarray(rmin, dtype=FLOAT_DTYPE)
-
     stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, omega=omega, v_r0=v_r0)
     rc = stream_state.rc
     mu = stream_state.mu
@@ -342,20 +382,37 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
 
     rotation_matrix = build_rotation_matrix(inc, pa)
 
-    if rc > r0:
-        # early stop if centrifugal radius is larger than r0
-        # TODO: ideally centrifugal radius should be fed in as the minimum of r0
-        raise ValueError('Centrifugal radius is larger than start of streamline')
-    r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
+    # jax.debug.print("-----------")
+    # jax.debug.print("mass: {}", mass)
+    # jax.debug.print("r0: {}", r0)
+    # jax.debug.print("theta0 (degrees): {}", jnp.degrees(theta0))
+    # jax.debug.print("phi0 (degrees): {}", jnp.degrees(phi0))
+    # jax.debug.print("omega: {}", omega)
+    # jax.debug.print("v_r0: {}", v_r0)
+
+    # check that centrifugal radius is smaller than initial radius of streamline, 
+    # otherwise the model is not valid
+    # jax.debug.print("rc: {}", rc)
+    # jax.debug.print("r0: {}", r0)
+    check_rc_r0(rc, r0)
+
+    # find the smallest radius for calculation
+    # this is the maximum between rmin and 0.5*rc
+    r_low = jnp.maximum(rmin, rc*0.5)
+
     # r is values internal to the initial radius r0 for computation
-    r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)
-    # print("r = {0}".format(r))
-
+    # r_mask is used to mask out points that are outside the valid range, but we still need to compute them for jax/jit compatibility
+    r = (r0 - deltar) - jnp.arange(npoints, dtype=FLOAT_DTYPE) * deltar
+    check_r_array(r, r_low)
+    r_mask = r > r_low
+    
     # calculate positions and velocities inside r0
-    orb_ang, theta, phi = stream_line(r, stream_state=stream_state, theta0=theta0, phi0=phi0)
+    # the valid_mask will later be used to mask out invalid points. currently these values are zero
+    orb_ang, theta, phi, valid_mask = stream_line(r, r_mask, stream_state=stream_state, theta0=theta0, phi0=phi0)
     v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0)
-
+    # jax.debug.print("valid_mask: {}", valid_mask)
     # prepend initial positions and velocities at r0
+    valid_mask_full = jnp.concatenate((jnp.asarray([True], dtype=bool), valid_mask))
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
     theta_full = jnp.concatenate((jnp.asarray([theta0], dtype=FLOAT_DTYPE), theta))
     phi_full = jnp.concatenate((jnp.asarray([phi0], dtype=FLOAT_DTYPE), phi))
@@ -367,6 +424,14 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
     v_phi0 = stream_state.vk0 * jnp.sin(theta0) * stream_state.mu
     v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
 
+    # use mask to convert nans to zeros 
+    # r_full = jnp.where(valid_mask_full, r_full, 0.0)
+    # theta_full = jnp.where(valid_mask_full, theta_full, 0.0)
+    # phi_full = jnp.where(valid_mask_full, phi_full, 0.0)
+    # orb_ang_full = jnp.where(valid_mask_full, orb_ang_full, 0.0)
+    # v_r_full = jnp.where(valid_mask_full, v_r_full, 0.0)
+    # v_theta_full = jnp.where(valid_mask_full, v_theta_full, 0.0)
+    # v_phi_full = jnp.where(valid_mask_full, v_phi_full, 0.0)
     # convert from spherical into cartesian coordinates
     v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \
           + v_theta_full * jnp.cos(theta_full) * jnp.cos(phi_full) \
@@ -379,19 +444,22 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
     x = r_full * jnp.sin(theta_full) * jnp.cos(phi_full)
     y = r_full * jnp.sin(theta_full) * jnp.sin(phi_full)
     z = r_full * jnp.cos(theta_full)
+    rotated_x, rotated_y, rotated_z = rotate_xyz(x, y, z, rotation_matrix=rotation_matrix)
+    rotated_v_x, rotated_v_y, rotated_v_z = rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
     # get mask from smallest radius for calculation
-    if rmin is None:
-        gd_rmin = jnp.ones_like(r, dtype=bool)
-    else:
-        gd_rmin = (r_full > rmin)
-    gd_rmin = gd_rmin.astype(x.dtype)
-    # apply mask before rotation
-    x = jnp.where(gd_rmin, x, jnp.nan)  
-    y = jnp.where(gd_rmin, y, jnp.nan)
-    z = jnp.where(gd_rmin, z, jnp.nan)
-    v_x = jnp.where(gd_rmin, v_x, jnp.nan)
-    v_y = jnp.where(gd_rmin, v_y, jnp.nan)
-    v_z = jnp.where(gd_rmin, v_z, jnp.nan)
-    # rotate
-    return rotate_xyz(x, y, z, rotation_matrix=rotation_matrix), \
-           rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
+    gd_rlow = (r_full > r_low)
+    gd_rlow = jnp.logical_or(gd_rlow, valid_mask_full)
+    gd_rlow = gd_rlow.astype(x.dtype)
+    # apply mask to set invalid points to zero
+    rotated_x = jnp.where(gd_rlow, rotated_x, 0.0)
+    rotated_y = jnp.where(gd_rlow, rotated_y, 0.0)
+    rotated_z = jnp.where(gd_rlow, rotated_z, 0.0)
+    rotated_v_x = jnp.where(gd_rlow, rotated_v_x, 0.0)
+    rotated_v_y = jnp.where(gd_rlow, rotated_v_y, 0.0)
+    rotated_v_z = jnp.where(gd_rlow, rotated_v_z, 0.0)
+    return (rotated_x, rotated_y, rotated_z), \
+           (rotated_v_x, rotated_v_y, rotated_v_z), \
+           gd_rlow
+
+
+checked_xyz_stream = checkify.checkify(xyz_stream)

@@ -10,6 +10,10 @@ from collections import namedtuple
 import jax.numpy as jnp
 import jax
 
+from velocity_tools.streamfit.gradient_descent import BIG
+from velocity_tools.streamfit.stream_lines_grad import to_float64
+jax.config.update("jax_debug_nans", True)
+
 
 PreparedData = namedtuple('PreparedData', [
     'ra_data', 'dec_data', 'v_data',
@@ -109,7 +113,7 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     pc_coords = np.array([pc_ra, pc_dec, pc_v]) # shape (3, n_points)   
 
     # compute partitions for binning the point cloud
-    distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1])
+    distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1], n_elements=n_elements)
     b_per = np.linspace(0, 100, n_elements+1) # percentiles to bin the pc into
     partitions = np.array([np.percentile(distance_metric, per) for per in b_per])
     print("Partition boundaries for projected distance metric:", np.round(partitions, 3))
@@ -132,32 +136,42 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     
     return pc_coords, pc_means, pc_stds
 
+@jax.jit
+def safe_percentile(values, percentile):
+    """
+    jax and jit-safe percentile ignoring invalid values, which does not change array shape
+    """
+    # mask is where values are finite
+    mask = jnp.isfinite(values)
+    # replace invalid values with big so they go to the end 
+    cleaned = jnp.where(mask, values, to_float64(BIG))
+    return jnp.percentile(cleaned, percentile)
+
         
 @jax.jit
-def get_distance_metric(ra_coords, dec_coords):
+def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     '''
     Compute radial + angular distance metric for point cloud binning
     Uses a circular angular deviation to avoid branch-cut artifacts.
     '''
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
+    pc_r = jnp.maximum(pc_r, to_float64(1e-30))
 
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
-    # finite_r = pc_r[finite_mask]
-    # finite_theta = pc_theta[finite_mask]
 
     # deal with if there are no valid points
     def empty_case(_):
 
-        distance_metric = jnp.full_like(pc_r, jnp.nan)
+        distance_metric = jnp.full_like(pc_r, to_float64(BIG))
         trace = {
-            "n_points": pc_r.size,
-            "n_finite_points": 0,
-            "n_reference_points": 0,
-            "r_percentile_thresh": jnp.nan,
-            "r_thresh": jnp.nan,
-            "theta_ref": 0.0,
-            "theta_weight": 1.0,
-            "close_point_count": 0,
+            "n_points":            jnp.array(pc_r.size,   dtype=jnp.int32),
+            "n_finite_points":     jnp.array(0,            dtype=jnp.int32),
+            "n_reference_points":  jnp.array(0,            dtype=jnp.int32),
+            "r_percentile_thresh": to_float64(0.0),
+            "r_thresh":            to_float64(BIG),
+            "theta_ref":           to_float64(0.0),
+            "theta_weight":        to_float64(1.0),
+            "close_point_count":   jnp.array(0,            dtype=jnp.int32),
         }
         return distance_metric, trace
 
@@ -165,16 +179,17 @@ def get_distance_metric(ra_coords, dec_coords):
 
         theta_weight = 1.0 # maybe make this a tunable parameter
         finite_count = jnp.sum(finite_mask)
-        # reference theta is obtained from points within a radius threshold
-        n_ref = jnp.clip(finite_count, 1, 10)
-        percentile = 100.0 / n_ref
-        # jnp.percentile can deal with nans
-        r_thresh = jnp.percentile(
-            jnp.where(finite_mask, pc_r, jnp.nan),
-            percentile)
-        
+
+        percentile = 100.0 / n_elements
+        r_thresh = safe_percentile(pc_r, percentile)
+        # close_mask gives 0s if point is not finite or outside the threshold, and 
+        # 1s if point is finite and within the threshold
+        small_enough_r = pc_r <= r_thresh
         close_mask = (finite_mask & (pc_r <= r_thresh)).astype(jnp.float64)
-        theta_ref = circular_median(pc_theta, weights=close_mask)
+        # circular median can not have nans passed in,
+        # so change nans to 0 (this is fine because they already have weight=0 in the median calculation)
+        pc_theta_no_nan = jnp.where(finite_mask, pc_theta, 0.0)
+        theta_ref = circular_median(pc_theta_no_nan, weights=close_mask)
 
         # cyclic angular deviation
         theta_dev = jnp.pi - jnp.abs(
@@ -182,17 +197,17 @@ def get_distance_metric(ra_coords, dec_coords):
         )
 
         distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
-        distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
+        distance_metric = jnp.where(finite_mask, distance_metric, to_float64(BIG))
 
         trace = {
-            "n_points": pc_r.size,
-            "n_finite_points": finite_count,
-            "n_reference_points": n_ref,
-            "r_percentile_thresh": percentile,
-            "r_thresh": r_thresh,
-            "theta_ref": theta_ref,
-            "theta_weight": theta_weight,
-            "close_point_count": close_mask.size,
+            "n_points":            jnp.array(pc_r.size,       dtype=jnp.int32),
+            "n_finite_points":     jnp.array(finite_count,    dtype=jnp.int32),
+            "n_reference_points":  jnp.array(jnp.sum(small_enough_r), dtype=jnp.int32),
+            "r_percentile_thresh": to_float64(percentile),
+            "r_thresh":            r_thresh,
+            "theta_ref":           theta_ref,
+            "theta_weight":        theta_weight,
+            "close_point_count":   jnp.array(close_mask.size, dtype=jnp.int32),
         }
 
         return distance_metric, trace
@@ -206,7 +221,7 @@ def cartesian_to_polar(x, y):
     e.g. inputs could be RA and Dec offsets
     Note theta is returned in radians
     '''
-    r = jnp.sqrt(x**2 + y**2)
+    r = jnp.sqrt(x**2 + y**2 + to_float64(1e-60)) # add small value for gradient stability
     theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 
     return (r, theta)
@@ -233,7 +248,7 @@ def get_metric_partitions(pc_coords, n_elements):
 
     ra_coords = pc_coords[0]
     dec_coords = pc_coords[1]
-    distance_metric, _ = get_distance_metric(ra_coords, dec_coords)
+    distance_metric, _ = get_distance_metric(ra_coords, dec_coords, n_elements=n_elements)
     distance_metric = np.asarray(distance_metric)
     finite_mask = np.isfinite(distance_metric)
     finite_metric = distance_metric[finite_mask]
@@ -245,11 +260,11 @@ def get_metric_partitions(pc_coords, n_elements):
     return np.asarray([np.percentile(finite_metric, per) for per in b_per], dtype=np.float64)
 
 
-def get_metric_reference_trace(pc_coords):
+def get_metric_reference_trace(pc_coords, n_elements=10):
     '''get the metric reference angle and weight used for boundary sampling'''
     ra_coords = pc_coords[0]
     dec_coords = pc_coords[1]
-    _, trace = get_distance_metric(ra_coords, dec_coords)
+    _, trace = get_distance_metric(ra_coords, dec_coords, n_elements=n_elements)
     theta_ref = float(trace.get('theta_ref', 0.0))
     theta_weight = float(trace.get('theta_weight', 1.0))
     return theta_ref, theta_weight
@@ -270,7 +285,7 @@ def sample_metric_boundary(partition_radius, theta_ref, theta_weight=1.0, n_samp
 
 def sample_metric_boundaries(pc_coords, partitions, n_samples=720):
     '''create all metric boundary curves for a point cloud and partition set'''
-    theta_ref, theta_weight = get_metric_reference_trace(pc_coords)
+    theta_ref, theta_weight = get_metric_reference_trace(pc_coords, n_elements=len(partitions)-1)
     curves = [
         sample_metric_boundary(partition_radius, theta_ref, theta_weight=theta_weight, n_samples=n_samples)
         for partition_radius in np.asarray(partitions)
@@ -290,7 +305,7 @@ def plot_metric_boundaries(ax, pc_coords, partitions, color='lightgrey', linewid
     return curves, trace
 
 
-def prepare_data(data, uncertainties):
+def prepare_data(data, uncertainties, n_elements):
     '''
     Precompute all the constant data-only quantities used by the gradient descent,
     to speed up later iterations
@@ -320,7 +335,7 @@ def prepare_data(data, uncertainties):
     dec_sigma_safe = jnp.maximum(dec_sigma, eps)
     v_sigma_safe = jnp.maximum(v_sigma, eps)
 
-    dmetric_data, _ = get_distance_metric(ra_data, dec_data)
+    dmetric_data, _ = get_distance_metric(ra_data, dec_data, n_elements=n_elements)
     data_finite_mask = jnp.isfinite(ra_data) & jnp.isfinite(dec_data) & jnp.isfinite(dmetric_data)
 
     data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
