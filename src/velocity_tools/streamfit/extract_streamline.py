@@ -139,8 +139,10 @@ def get_distance_metric(ra_coords, dec_coords):
     Compute radial + angular distance metric for point cloud binning
     Uses a circular angular deviation to avoid branch-cut artifacts.
     '''
+    jax.debug.print("getting distance metric for {n} points", n=ra_coords.size)
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
-
+    jax.debug.print("pc_r: {r}", r=pc_r)
+    jax.debug.print("pc_theta: {t}", t=pc_theta)
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
     # finite_r = pc_r[finite_mask]
     # finite_theta = pc_theta[finite_mask]
@@ -172,9 +174,10 @@ def get_distance_metric(ra_coords, dec_coords):
         r_thresh = jnp.percentile(
             jnp.where(finite_mask, pc_r, jnp.nan),
             percentile)
-        
+        jax.debug.print("r_thresh: {rt}", rt=r_thresh)
         close_mask = (finite_mask & (pc_r <= r_thresh)).astype(jnp.float64)
         theta_ref = circular_median(pc_theta, weights=close_mask)
+        jax.debug.print("theta_ref: {tr}", tr=theta_ref)
 
         # cyclic angular deviation
         theta_dev = jnp.pi - jnp.abs(
@@ -183,6 +186,7 @@ def get_distance_metric(ra_coords, dec_coords):
 
         distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
         distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
+        jax.debug.print("distance_metric: {dm}", dm=distance_metric)
 
         trace = {
             "n_points": pc_r.size,

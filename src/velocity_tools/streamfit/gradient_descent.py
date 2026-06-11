@@ -647,15 +647,19 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         where valid is a boolean mask with shape len(original data), marking
         retained data points
     """
+    jax.debug.print("starting match_model_to_data_curve")
     ra_model = to_float64(ra_model)
     dec_model = to_float64(dec_model)
     v_model = to_float64(v_model)
     ra_data = to_float64(ra_data)
     dec_data = to_float64(dec_data)
+    jax.debug.print("dec_model: {dec}", dec=dec_model)
 
     # get distance metrics
     dmetric_model, _ = extract_streamline.get_distance_metric(ra_model, dec_model)
+    jax.debug.print("dmetric_model: {dm}", dm=dmetric_model)
     dmetric_data, _ = extract_streamline.get_distance_metric(ra_data, dec_data)
+    jax.debug.print("dmetric_data: {dd}", dd=dmetric_data)
 
     # only finite values are valid
     model_valid = (
@@ -670,21 +674,26 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
         & jnp.isfinite(dec_data)
         & jnp.isfinite(dmetric_data)
     )
+    jax.debug.print("model_valid: {mv}", mv=model_valid)
 
     # we also filter model to keep only model points with dmetric >= minimum of data dmetric
     # this is becuase the model shouldn't go further in than the innermost data point
     # as this is where we no longer observe the streamer
     d_data_valid = jnp.where(data_valid, dmetric_data, jnp.inf)
     data_min = jnp.min(d_data_valid)
+    jax.debug.print("d_data_valid: {d}", d=d_data_valid)
+    jax.debug.print("data_min: {min}", min=data_min)
 
     # enforce both constraints on model
     model_keep = model_valid & (dmetric_model >= data_min)
+    jax.debug.print("model_keep: {mk}", mk=model_keep)
 
     # weights: 0 = ignore, 1 = use. This is for jax/jit compatibility
     w_model = model_keep.astype(jnp.float64)
     w_data = data_valid.astype(jnp.float64)
 
     d_model = jnp.where(model_keep, dmetric_model, 0.0)
+    jax.debug.print("d_model: {dm}", dm=d_model)
     d_data  = jnp.where(data_valid, dmetric_data, 0.0)
 
     ra = ra_model
@@ -700,6 +709,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     dec_s = dec[model_idx]
     v_s = v[model_idx]
     w_model_s = w_model[model_idx]
+    jax.debug.print("d_model_s: {dms}", dms=d_model_s)
 
     # stats for trace and interpolation domain
     data_min_eff = jnp.min(jnp.where(data_valid, d_data, jnp.inf))
@@ -717,13 +727,18 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     d_data_norm = (d_data - data_min_eff) / data_span
     d_goal = model_min + d_data_norm * model_span
 
+    jax.debug.print("d_data_norm: {dn}", dn=d_data_norm)
+    jax.debug.print("d_goal: {dg}", dg=d_goal)
+
     # interpolate model at data points, using weights to ignore invalid model points 
     # by giving them huge distance values so they don't affect the interpolation
     xp = jnp.where(w_model_s > 0, d_model_s, BIG)
+    jax.debug.print("xp: {xp}", xp=xp)
 
     ra_interp = jnp.interp(d_goal, xp, ra_s)
     dec_interp = jnp.interp(d_goal, xp, dec_s)
     v_interp = jnp.interp(d_goal, xp, v_s)
+    jax.debug.print("ra_interp: {ra}", ra=ra_interp)
 
     # things for trace
     valid = data_valid
@@ -777,6 +792,7 @@ def chi2_loss_raw(
     v_sigma = prepared_data.v_sigma_safe
 
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
+    jax.debug.print("dec_model: {dec}", dec=dec_model)
 
     ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, _ = (
         checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
@@ -961,6 +977,7 @@ def chi2_loss(
 
     # Run forward model
     ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
+    jax.debug.print("dec_model: {dec}", dec=dec_model)
     
 
     # Match model to data using arc-length parameterisation
