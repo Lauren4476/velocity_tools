@@ -136,16 +136,31 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     
     return pc_coords, pc_means, pc_stds
 
+
 @jax.jit
 def safe_percentile(values, percentile):
     """
     jax and jit-safe percentile ignoring invalid values, which does not change array shape
     """
-    # mask is where values are finite
     mask = jnp.isfinite(values)
-    # replace invalid values with big so they go to the end 
+    
+    # Sort valid values to the front by pushing invalid ones to BIG
     cleaned = jnp.where(mask, values, to_float64(BIG))
-    return jnp.percentile(cleaned, percentile)
+    sorted_vals = jnp.sort(cleaned)  # valid values are at the front
+
+    # make a new mask which is all the not BIG values 
+    percentile_mask = sorted_vals < to_float64(BIG)
+    # jax.debug.print("percentile_mask: {}", percentile_mask)
+    n_valid = jnp.sum(percentile_mask)
+    total_n = values.size
+    # jax.debug.print("n_valid: {}, total_n: {}", n_valid, total_n)
+    # Compute the index into only the valid portion
+    idx = jnp.clip(
+        jnp.floor(percentile / 100.0 * n_valid).astype(jnp.int32),
+        0,
+        jnp.maximum(n_valid - 1, 0)
+    )
+    return sorted_vals[idx]
 
         
 @jax.jit
@@ -154,8 +169,11 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     Compute radial + angular distance metric for point cloud binning
     Uses a circular angular deviation to avoid branch-cut artifacts.
     '''
+    # jax.debug.print("getting distance metric for {} points", ra_coords.size)
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
-    pc_r = jnp.maximum(pc_r, to_float64(1e-30))
+    pc_r = jnp.where(jnp.abs(pc_r) < 1e-12, to_float64(BIG), pc_r)
+    # jax.debug.print("pc_r: {}", pc_r)
+    # jax.debug.print("pc_theta: {}", pc_theta)
 
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
 
@@ -181,7 +199,9 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
         finite_count = jnp.sum(finite_mask)
 
         percentile = 100.0 / n_elements
+        # jax.debug.print("percentile for distance metric threshold: {}", percentile)
         r_thresh = safe_percentile(pc_r, percentile)
+        # jax.debug.print("r_thresh: {}", r_thresh)
         # close_mask gives 0s if point is not finite or outside the threshold, and 
         # 1s if point is finite and within the threshold
         small_enough_r = pc_r <= r_thresh
@@ -190,6 +210,7 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
         # so change nans to 0 (this is fine because they already have weight=0 in the median calculation)
         pc_theta_no_nan = jnp.where(finite_mask, pc_theta, 0.0)
         theta_ref = circular_median(pc_theta_no_nan, weights=close_mask)
+        # jax.debug.print("theta_ref: {}", theta_ref)
 
         # cyclic angular deviation
         theta_dev = jnp.pi - jnp.abs(
@@ -198,6 +219,7 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
 
         distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
         distance_metric = jnp.where(finite_mask, distance_metric, to_float64(BIG))
+        # jax.debug.print("distance_metric: {}", distance_metric)
 
         trace = {
             "n_points":            jnp.array(pc_r.size,       dtype=jnp.int32),
@@ -316,6 +338,8 @@ def prepare_data(data, uncertainties, n_elements):
         Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
     uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
         Uncertainties on the data
+    n_elements : int
+        Number of elements to reduce the cube to, used for computing the distance metric and its partitions
 
     Returns
     -------

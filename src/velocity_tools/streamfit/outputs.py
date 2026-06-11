@@ -114,15 +114,14 @@ def plot_morphology_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {param: float(row[param]) for param in param_names}
-        ra_model, dec_model, v_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
-        not_nan = (~jnp.isnan(ra_model) & ~jnp.isnan(dec_model) & ~jnp.isnan(v_model))
-        ra_model = ra_model[not_nan]
-        dec_model = dec_model[not_nan]
+        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        valid_mask_model = valid_mask_model.astype(bool)
 
-        (ra_model_interp, dec_model_interp, _, valid, _, _) = gradient_descent.checked_match_model_to_data_curve(
+        (ra_model_interp, dec_model_interp, _, valid, model_keep, dmetric_model, matching_trace) = gradient_descent.checked_match_model_to_data_curve(
             ra_model,
             dec_model,
-            v_model[not_nan],
+            v_model,
+            valid_mask_model,
             ra_data,
             dec_data,
         )
@@ -136,6 +135,7 @@ def plot_morphology_by_epoch(
                 ra_model_interp=ra_model_interp,
                 dec_model_interp=dec_model_interp,
                 valid=valid,
+                model_keep=model_keep,
             )
         )
 
@@ -181,6 +181,7 @@ def plot_morphology_by_epoch(
             ra_model_interp=model["ra_model_interp"],
             dec_model_interp=model["dec_model_interp"],
             valid=model["valid"],
+            model_keep=model["model_keep"],
             pc_coords=pc_coords,
             n_points=n_points,
             title=f"Epoch: {int(model['epoch'])}",
@@ -205,6 +206,7 @@ def plot_morphology(
     ra_model_interp=None,
     dec_model_interp=None,
     valid=None,
+    model_keep=None,
     by_eye=None,
     pc_coords=None,
     n_points=None,
@@ -225,17 +227,21 @@ def plot_morphology(
 
     # model curve if given
     if ra_model is not None and dec_model is not None:
-        ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='Best-fit', zorder=7)
+        if model_keep is not None:
+            ax.plot(ra_model[model_keep], dec_model[model_keep], color='blue', linewidth=2, label='Best-fit (kept)', zorder=7)
+        else:
+            ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='Best-fit', zorder=7)
 
     # model points if given
     if ra_model_interp is not None and dec_model_interp is not None and valid is not None:
-        ax.scatter(
-            np.asarray(ra_model_interp, dtype=float)[valid],
-            np.asarray(dec_model_interp, dtype=float)[valid],
-            s=25,
-            color='blue',
-            zorder=7,
-        )
+        if valid is not None:
+            ax.scatter(
+                np.asarray(ra_model_interp, dtype=float)[valid],
+                np.asarray(dec_model_interp, dtype=float)[valid],
+                s=25,
+                color='blue',
+                zorder=7,
+            )
 
     # by eye model if given
     if by_eye is not None:
@@ -359,13 +365,10 @@ def plot_ra_vel_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
-        mask = (~jnp.isnan(ra_model) & ~jnp.isnan(dec_model) & ~jnp.isnan(v_model))
-        ra_model = ra_model[mask]
-        dec_model = dec_model[mask]
-        v_model = v_model[mask]
-        ra_model_interp, _, v_model_interp, valid, _, _ = (
-            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        valid_mask_model = valid_mask_model.astype(bool)
+        ra_model_interp, _, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
         )
 
         epoch_models.append({
@@ -375,6 +378,7 @@ def plot_ra_vel_by_epoch(
             "ra_model_interp": ra_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
+            "model_keep": model_keep,
         })
 
     # global velocity limits
@@ -407,6 +411,7 @@ def plot_ra_vel_by_epoch(
             ra_model_interp=model["ra_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
+            model_keep=model["model_keep"],
             pc_coords=pc_coords,
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
@@ -433,6 +438,7 @@ def plot_ra_vel(
     ra_model_interp=None,
     v_model_interp=None,
     valid=None,
+    model_keep=None,
     pc_coords=None,
     title=None,
     vlim=None,
@@ -445,7 +451,8 @@ def plot_ra_vel(
     v_model = np.asarray(v_model, dtype=float)
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
-
+    if model_keep is not None:
+        model_keep = np.asarray(model_keep, dtype=bool)
     fig, ax = plt.subplots(figsize=(6, 5))
     
 
@@ -461,7 +468,10 @@ def plot_ra_vel(
             ax.plot(ra_data, v_data, 'o', color='red', label='Data')
 
     # model curve
-    ax.plot(ra_model, v_model, color='blue', linewidth=2, label='Model Streamline')
+    if model_keep is not None:
+        ax.plot(ra_model[model_keep], v_model[model_keep], color='blue', linewidth=2, label='Model Streamline (kept)', zorder=7)
+    else:
+        ax.plot(ra_model, v_model, color='blue', linewidth=2, label='Model Streamline', zorder=7)
 
     # interpolated points
     if ra_model_interp is not None and v_model_interp is not None and valid is not None:
@@ -523,13 +533,10 @@ def plot_dec_vel_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
-        mask = (~jnp.isnan(ra_model) & ~jnp.isnan(dec_model) & ~jnp.isnan(v_model))
-        ra_model = ra_model[mask]
-        dec_model = dec_model[mask]
-        v_model = v_model[mask]
-        ra_model_interp, dec_model_interp, v_model_interp, valid, _, _ = (
-            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
+        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        valid_mask_model = valid_mask_model.astype(bool)
+        ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+            gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
         )
 
         epoch_models.append({
@@ -541,6 +548,7 @@ def plot_dec_vel_by_epoch(
             "dec_model_interp": dec_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
+            "model_keep": model_keep,
         })
 
     # global velocity limits
@@ -573,6 +581,7 @@ def plot_dec_vel_by_epoch(
             dec_model_interp=model["dec_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
+            model_keep=model["model_keep"],
             pc_coords=pc_coords,
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
@@ -599,6 +608,7 @@ def plot_dec_vel(
     dec_model_interp=None,
     v_model_interp=None,
     valid=None,
+    model_keep=None,
     pc_coords=None,
     title=None,
     vlim=None,
@@ -611,6 +621,8 @@ def plot_dec_vel(
     v_model = np.asarray(v_model, dtype=float)
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
+    if model_keep is not None:
+        model_keep = np.asarray(model_keep, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(6, 5))
 
@@ -627,7 +639,10 @@ def plot_dec_vel(
             ax.plot(dec_data, v_data, 'o', color='red', label='Data')
 
     # model curve
-    ax.plot(dec_model, v_model, color='blue', linewidth=2, label='Model Streamline')
+    if model_keep is not None:
+        ax.plot(dec_model[model_keep], v_model[model_keep], color='blue', linewidth=2, label='Model Streamline (kept)', zorder=7)
+    else:
+        ax.plot(dec_model, v_model, color='blue', linewidth=2, label='Model Streamline')
 
     # interpolated points
     if dec_model_interp is not None and v_model_interp is not None and valid is not None:
@@ -747,6 +762,7 @@ def plot_vel_radius(
     dec_model_interp=None,
     v_model_interp=None,
     valid=None,
+    model_keep=None,
     kde_background=None,
     velocity_reference=None,
     title=None,
@@ -762,11 +778,11 @@ def plot_vel_radius(
     v_model = np.asarray(v_model, dtype=float)
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
-
-    finite_model = np.isfinite(ra_model) & np.isfinite(dec_model) & np.isfinite(v_model)
-    ra_model = ra_model[finite_model]
-    dec_model = dec_model[finite_model]
-    v_model = v_model[finite_model]
+    if model_keep is not None:
+        model_keep = np.asarray(model_keep, dtype=bool)
+        ra_model = ra_model[model_keep]
+        dec_model = dec_model[model_keep]
+        v_model = v_model[model_keep]
 
     rproj_model = np.sqrt(ra_model**2 + dec_model**2)
     order_model = np.argsort(rproj_model)
@@ -925,26 +941,27 @@ def plot_vel_radius_by_epoch(
     for idx, epoch in enumerate(epochs):
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model = gradient_descent.forward_model(
+        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(
             opt_params_epoch,
             fixed_params,
             distance,
         )
 
-        mask = (~jnp.isnan(ra_model) & ~jnp.isnan(dec_model) & ~jnp.isnan(v_model))
-        ra_model = ra_model[mask]
-        dec_model = dec_model[mask]
-        v_model = v_model[mask]
+        valid_mask_model = valid_mask_model.astype(bool)
 
-        ra_model_interp, dec_model_interp, v_model_interp, valid, _, _ = (
+        ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(
                 ra_model,
                 dec_model,
                 v_model,
+                valid_mask_model,
                 ra_data,
                 dec_data,
             )
         )
+
+        if model_keep is not None:
+            model_keep = model_keep.astype(bool)
 
         epoch_models.append({
             "epoch": epoch,
@@ -955,6 +972,7 @@ def plot_vel_radius_by_epoch(
             "dec_model_interp": dec_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
+            "model_keep": model_keep,
         })
 
     # Set consistent axis limits across epochs
@@ -992,6 +1010,7 @@ def plot_vel_radius_by_epoch(
             dec_model_interp=model["dec_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
+            model_keep=model["model_keep"],
             kde_background=kde_background,
             velocity_reference=velocity_reference,
             title=f"Epoch: {int(model['epoch'])}",
@@ -1136,10 +1155,14 @@ def plot_streamline_covariance_samples(streamline_samples,
         ax_v.plot(rproj[order], vel[order], color='tab:blue', alpha=0.1, lw=1)
 
     # plot best fit streamline
-    ra_best, dec_best, v_best = gradient_descent.forward_model(best_opt_params, fixed_params, distance)
+    ra_best, dec_best, v_best, valid_mask_best = gradient_descent.forward_model(best_opt_params, fixed_params, distance)
     ra_best = np.asarray(ra_best, dtype=float)
     dec_best = np.asarray(dec_best, dtype=float)
     v_best = np.asarray(v_best, dtype=float)
+    valid_mask_best = valid_mask_best.astype(bool)
+    ra_best = ra_best[valid_mask_best]
+    dec_best = dec_best[valid_mask_best]
+    v_best = v_best[valid_mask_best]
     rproj_best = np.sqrt(ra_best**2 + dec_best**2)
     order_best = np.argsort(rproj_best)
     ax_sky.plot(ra_best, dec_best, color='blue', lw=2, label='Best-fit')
@@ -1203,16 +1226,14 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
             key: float(value)
             for key, value in zip(opt_keys, sample)
         }
-        ra, dec, vel = gradient_descent.forward_model(sample_params, fixed_params, distance)
+        ra, dec, vel, valid_mask = gradient_descent.forward_model(sample_params, fixed_params, distance)
         ra = np.asarray(ra, dtype=float)
         dec = np.asarray(dec, dtype=float)
         vel = np.asarray(vel, dtype=float)
-        finite = (np.isfinite(ra) & np.isfinite(dec) & np.isfinite(vel))
-        if np.sum(finite) < 3:
-            continue
-        ra = ra[finite]
-        dec = dec[finite]
-        vel = vel[finite]
+        valid_mask = valid_mask.astype(bool)
+        ra = ra[valid_mask]
+        dec = dec[valid_mask]
+        vel = vel[valid_mask]
 
         dmetric, trace = extract_streamline.get_distance_metric(ra, dec)
         dmetric = np.asarray(dmetric, dtype=float)
