@@ -24,12 +24,12 @@ PreparedData = namedtuple('PreparedData', [
 ])
 
 
-@jax.jit
+#@jax.jit
 def wrap_to_pi(angle):
     '''Wrap angles to [-pi, pi)'''
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-@jax.jit
+#@jax.jit
 def circular_median(theta_vals, weights):
     '''Branch-cut-safe median angle. (unrwap, linear median, rewrap)
     theta values with weight = 0 are ignored in the median calculation'''
@@ -50,7 +50,7 @@ def circular_median(theta_vals, weights):
     return wrap_to_pi(theta_ref)
 
 
-@jax.jit
+#@jax.jit
 def wrap_to_pi_numpy(angle):
     '''Wrap angles to [-pi, pi)'''
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
@@ -137,7 +137,7 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     return pc_coords, pc_means, pc_stds
 
 
-@jax.jit
+#@jax.jit
 def safe_percentile(values, percentile):
     """
     jax and jit-safe percentile ignoring invalid values, which does not change array shape
@@ -163,7 +163,7 @@ def safe_percentile(values, percentile):
     return sorted_vals[idx]
 
         
-@jax.jit
+#@jax.jit
 def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     '''
     Compute radial + angular distance metric for point cloud binning
@@ -236,7 +236,7 @@ def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     
     return jax.lax.cond(finite_mask.any(), notempty_case, empty_case, operand=None)
 
-@jax.jit
+#@jax.jit
 def cartesian_to_polar(x, y):
     '''
     Convert cartesian coordinates (x,y) to polar coordinates

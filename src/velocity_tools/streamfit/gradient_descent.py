@@ -15,6 +15,7 @@ import optax
 from . import stream_lines_grad
 from . import extract_streamline
 from . import outputs
+from . import errors
 import csv
 import astropy.units as u
 import math
@@ -138,7 +139,7 @@ def is_numeric_value(value):
         return False
     return bool(jnp.issubdtype(arr.dtype, jnp.number))
 
-
+@jax.jit
 def to_float64(value):
     """Convert a numeric value or array-like input to float64"""
     return jnp.asarray(value, dtype=jnp.float64)
@@ -480,44 +481,6 @@ def gradient_l2_norm(grad_tree):
         grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
     return jnp.sqrt(grad_sum_sq)
 
-@jax.jit
-# obsolete - penalties not used anymore
-def softplus_barrier(value, tau):
-    """Smooth approximation to max(0, value) with transition scale tau."""
-    tau = to_float64(tau)
-    return tau * jnp.logaddexp(to_float64(0.0), to_float64(value) / tau)
-
-@jax.jit
-# obsolete - penalties not used anymore
-def coverage_penalties(dmetric_model, model_finite_mask, data_min, data_max):
-    """Penalise differences between model and data coverage in distance metric,
-    using smooth barrier functions to keep differentiability"""
-    margin = to_float64(0.2 * (data_max - data_min))
-    tau = 0.8 * margin
-
-    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG))
-    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG_NEG))
-    model_min = jnp.min(model_metric_for_min)
-    model_max = jnp.max(model_metric_for_max)
-
-    #model starts too far out
-    low_shortfall = softplus_barrier(model_min - data_min + margin, tau)
-    #model starts too far in
-    low_excess = softplus_barrier(data_min - model_min - margin, tau)
-    #model ends too far in
-    high_shortfall = softplus_barrier(data_max - model_max + margin, tau)
-    #model ends too far out
-    high_excess = softplus_barrier(model_max - data_max - margin, tau)
-
-
-    low_penalty = ((low_shortfall / margin) ** 2 + (low_excess / margin) **2)
-    high_penalty = ((high_shortfall / margin) ** 2 + (high_excess / margin) ** 2)
-    total_penalty = (low_penalty + high_penalty)
-
-    return total_penalty, low_shortfall, low_excess, high_shortfall, high_excess
-
-
-
 def forward_model(opt_params, fixed_params, distance_pc, npoints=10000):
     """
     Run the forward model using stream_lines_grad.checked_xyz_stream
@@ -612,7 +575,7 @@ def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data
     overlap_max = jnp.minimum(model_max, data_max)
     return model_min, model_max, data_min, data_max, overlap_min, overlap_max
 
-@jax.jit
+#@jax.jit
 def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
     """Order finite model support by distance metric, skipping argsort when already monotonic."""
     dmetric_model = to_float64(dmetric_model)
@@ -645,7 +608,6 @@ def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=
         operand=None,
     )
 
-@jax.jit
 def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data):
     """
     Extract model values corresponding to data positions using the distance metric from
@@ -713,7 +675,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra
     # jax.debug.print("d_model: {d}", d=d_model)
     d_data  = jnp.where(data_valid, dmetric_data, 0.0)
 
-
+    0, 72, 0, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
     # ---- sort model using metric + weight penalty (pushes invalid points to the end) ----
     model_sort_key = d_model + (1.0 - w_model) * to_float64(BIG)
     model_idx = jnp.argsort(model_sort_key)
@@ -748,8 +710,7 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra
     both_valid      = data_has_valid & model_has_valid
     # normalise data metric
     d_data_norm = (d_data - data_min_eff) / data_span_safe
-    d_goal_raw = model_min + d_data_norm * model_span_safe
-    d_goal      = jnp.where(both_valid, d_goal_raw, to_float64(0.0))
+    d_goal = model_min + d_data_norm * model_span_safe
     # jax.debug.print("d_data_norm: {d}", d=d_data_norm)
     # jax.debug.print("d_goal: {d}", d=d_goal)
 
@@ -806,7 +767,7 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-#@jax.jit(static_argnames=("loss_method"))
+#@jax.jit(static_argnames=("loss_method", "npoints"))
 def chi2_loss_raw(
     opt_params,
     fixed_params,
@@ -840,6 +801,7 @@ def chi2_loss_raw(
 
     dmetric_data = prepared_data.dmetric_data
     valid = jnp.asarray(valid, dtype=bool)
+    valid_weights = valid.astype(jnp.float64)
 
     model_finite_mask = (
         jnp.isfinite(ra_model)
@@ -848,16 +810,15 @@ def chi2_loss_raw(
         & jnp.isfinite(dmetric_model)
     )
 
-    # jax.debug.print("ra_model_interp (valid): {x}", x=ra_model_interp[valid])
-    # jax.debug.print("dec_model_interp (valid): {x}", x=dec_model_interp[valid])
-    # jax.debug.print("v_model_interp (valid): {x}", x=v_model_interp[valid])
-    # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
-    chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
+
+    # Only compute chi2 on valid/retained data points 
+
+    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
 
     if loss_method == 0:
-        chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
-        chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
+        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
+        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
+        chi2_total = chi2_ra + chi2_dec + chi2_v
     else:
         r_proj_data = prepared_data.r_proj_data
         theta_proj_data = prepared_data.theta_proj_data
@@ -873,13 +834,11 @@ def chi2_loss_raw(
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
         sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
-        # jax.debug.print("sigma_r (valid): {x}", x=sigma_r[valid])
-        # jax.debug.print("sigma_theta (valid): {x}", x=sigma_theta[valid])
-        # Only compute chi2 on valid/retained data points
-        chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
-        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
-        # jax.debug.print("chi2: {x}", x=chi2_total)
+
+        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
+        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
+        chi2_total = chi2_r + chi2_theta + chi2_v
+
 
     data_finite_mask = (
         jnp.isfinite(ra_data)
@@ -922,11 +881,6 @@ def chi2_loss_raw(
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
             'chi2_v': chi2_v,
-            # 'chi2_penalty': chi2_penalty,
-            # 'low_shortfall_penalty': low_shortfall,
-            # 'low_excess_penalty': low_excess,
-            # 'high_shortfall_penalty': high_shortfall,
-            # 'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -935,11 +889,6 @@ def chi2_loss_raw(
             'chi2_r': chi2_r,
             'chi2_theta': chi2_theta,
             'chi2_v': chi2_v,
-            # 'chi2_penalty': chi2_penalty,
-            # 'low_shortfall_penalty': low_shortfall,
-            # 'low_excess_penalty': low_excess,
-            # 'high_shortfall_penalty': high_shortfall,
-            # 'high_excess_penalty': high_excess,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -968,7 +917,7 @@ def chi2_loss_raw(
     }
     return chi2_total, loss_trace
 
-#@jax.jit(static_argnames=("loss_method"))
+#@jax.jit(static_argnames=("loss_method", "npoints"))
 def chi2_loss(
     opt_params,
     fixed_params,
@@ -1024,23 +973,15 @@ def chi2_loss(
     )
 
     valid = jnp.asarray(valid, dtype=bool)
-    # jax.debug.print("ra_model_interp (valid): {x}", x=ra_model_interp[valid])
-    # jax.debug.print("ra_data (valid): {x}", x=ra_data[valid])
-    # get the distance metrics for model_interp (valid) and data (valid)
-    dmetric_data = prepared_data.dmetric_data
-    dmetric_model_interp, _ = extract_streamline.get_distance_metric(ra_model_interp, dec_model_interp)
-    # jax.debug.print("dmetric_model_interp (valid): {x}", x=dmetric_model_interp[valid])
-    # jax.debug.print("dmetric_data (valid): {x}", x=dmetric_data[valid])
-    # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
-    chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
+    valid_weights = valid.astype(jnp.float64)
+    # Only compute chi2 on valid/retained data points 
+    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
 
     if loss_method == 0:
-        chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
-        chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
+        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
+        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
+        chi2_total = chi2_ra + chi2_dec + chi2_v
     else:
-        # r/theta are defined on the projected plane of the sky from (RA, Dec).
-        # Use precomputed data coordinates
         r_proj_data = prepared_data.r_proj_data
         theta_proj_data = prepared_data.theta_proj_data
         r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
@@ -1056,21 +997,15 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        # Only compute chi2 on valid/retained data points
-        chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
-        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
+        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
+        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
+        chi2_total = chi2_r + chi2_theta + chi2_v
 
     if loss_method == 0:
         chi2_components = {
             'chi2_ra': chi2_ra.astype(float),
             'chi2_dec': chi2_dec.astype(float),
             'chi2_v': chi2_v.astype(float),
-            # 'chi2_penalty': float(chi2_penalty),
-            # 'low_shortfall_penalty': float(low_shortfall),
-            # 'low_excess_penalty': float(low_excess),
-            # 'high_shortfall_penalty': float(high_shortfall),
-            # 'high_excess_penalty': float(high_excess),
             'chi2_total': chi2_total.astype(float),
         }
     else:
@@ -1078,11 +1013,6 @@ def chi2_loss(
             'chi2_r': chi2_r.astype(float),
             'chi2_theta': chi2_theta.astype(float),
             'chi2_v': chi2_v.astype(float),
-            # 'chi2_penalty': float(chi2_penalty),
-            # 'low_shortfall_penalty': float(low_shortfall),
-            # 'low_excess_penalty': float(low_excess),
-            # 'high_shortfall_penalty': float(high_shortfall),
-            # 'high_excess_penalty': float(high_excess),
             'chi2_total': chi2_total.astype(float),
         }
 
@@ -1093,6 +1023,7 @@ def chi2_loss(
     }
     return chi2_total, loss_trace
 
+'''
 def estimate_parameter_errors(
     best_opt_params,
     fixed_params,
@@ -1142,10 +1073,12 @@ def estimate_parameter_errors(
     # convert dict -> vector
     params_vec, keys = params_dict_to_vector(best_opt_params)
     loss_method = check_loss_method(loss_method)
+    print("params vector for Hessian calculation:", params_vec)
+    print("keys for Hessian calculation:", keys)
 
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
-        chi2_total, _ = chi2_loss(
+        chi2_total, _ = chi2_loss_raw(
             params,
             fixed_params,
             distance_pc,
@@ -1153,6 +1086,7 @@ def estimate_parameter_errors(
             loss_method=loss_method,
             npoints=npoints
         )
+        print("loss_vec: chi2_total =", chi2_total)
         return chi2_total
 
     # Check gradient magnitude at best-fit parameters in normalised space.
@@ -1177,7 +1111,7 @@ def estimate_parameter_errors(
             def norm_loss_vec(theta_norm_vec):
                 norm_params = vector_to_params_dict(theta_norm_vec, keys)
                 physical_params = denormalise_opt_params(norm_params, normalisation_spec)
-                chi2_total, _ = chi2_loss(
+                chi2_total, _ = chi2_loss_raw(
                      physical_params,
                     fixed_params,
                     distance_pc,
@@ -1201,18 +1135,36 @@ def estimate_parameter_errors(
                 print("    - Reducing learning rate for finer convergence")
                 print("    - Reducing loss_threshold if used")
 
-    # compute Hessian
+    print("loss vec:", loss_vec(params_vec))
+
+    g = jax.grad(loss_vec)(params_vec)
+
+    print("gradient =", g)
+    print("gradient finite =", jnp.isfinite(g))
+
     H = jax.hessian(loss_vec)(params_vec)
 
-    # invert to get covariance
+    print(H)
+    print("NaN locations:")
+    print(jnp.argwhere(jnp.isnan(H)))
+
+    print("Any NaNs in H?", jnp.any(jnp.isnan(H)))
+    print("Any infs in H?", jnp.any(jnp.isinf(H)))
+
     cov = jnp.linalg.inv(H)
 
-    # parameter errors
-    errors = jnp.sqrt(jnp.diag(cov))
+    print("Any NaNs in cov?", jnp.any(jnp.isnan(cov)))
+    print("Any infs in cov?", jnp.any(jnp.isinf(cov)))
+
+    diag = jnp.diag(cov)
+    print("cov diag =", diag)
+
+    errors = jnp.sqrt(diag)
 
     error_dict = {k: float(errors[i]) for i, k in enumerate(keys)}
 
     return error_dict, cov
+'''
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, param_bounds=None, n_epochs=1000,
@@ -1353,7 +1305,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if 'r0' in param_bounds:
         max_r0 = param_bounds['r0'][1]
         deltar = fixed_params['deltar'] if 'deltar' in fixed_params else 1.0
-        npoints = max_r0 / deltar
+        npoints = int(jnp.ceil(max_r0 / deltar))
     else: 
         npoints = 50000
 
@@ -1657,14 +1609,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     # compute errors on best-fit parameters
     if output_uncertainties:
         print("\nEstimating parameter uncertainties from Hessian...")
-        param_errors, cov_matrix = estimate_parameter_errors(
+        param_errors, cov_matrix = errors.estimate_parameter_errors(
             ordered_best_opt_params,
             fixed_params,
             data,
             uncertainties,
             distance_pc,
             prepared_data,
-            npoints=npoints,
             loss_method=loss_method,
             gradient_tol=gradient_tol,
             normalisation_spec=normalisation_spec,

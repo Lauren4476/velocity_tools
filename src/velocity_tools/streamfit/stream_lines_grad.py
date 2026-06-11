@@ -43,6 +43,7 @@ class StreamState(NamedTuple):
     vk0: jnp.ndarray
 
 
+@jax.jit
 def to_float64(value):
     '''input must be a number or array-like'''
     return jnp.asarray(value, dtype=FLOAT_DTYPE)
@@ -462,4 +463,4 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
            gd_rlow
 
 
-checked_xyz_stream = checkify.checkify(xyz_stream)
+checked_xyz_stream = jax.jit(checkify.checkify(xyz_stream), static_argnames=['npoints'])

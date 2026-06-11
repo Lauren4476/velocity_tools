@@ -10,5 +10,6 @@ from .streamfit import stream_lines_grad
 from .streamfit import extract_streamline
 from .streamfit import gradient_descent
 from .streamfit import outputs
+from .streamfit import errors
 
 from ._version import __version__

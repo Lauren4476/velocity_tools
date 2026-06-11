@@ -227,10 +227,7 @@ def plot_morphology(
 
     # model curve if given
     if ra_model is not None and dec_model is not None:
-        if model_keep is not None:
-            ax.plot(ra_model[model_keep], dec_model[model_keep], color='blue', linewidth=2, label='Best-fit (kept)', zorder=7)
-        else:
-            ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='Best-fit', zorder=7)
+        ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='Best-fit', zorder=7)
 
     # model points if given
     if ra_model_interp is not None and dec_model_interp is not None and valid is not None:
@@ -468,9 +465,7 @@ def plot_ra_vel(
             ax.plot(ra_data, v_data, 'o', color='red', label='Data')
 
     # model curve
-    if model_keep is not None:
-        ax.plot(ra_model[model_keep], v_model[model_keep], color='blue', linewidth=2, label='Model Streamline (kept)', zorder=7)
-    else:
+    if ra_model is not None and v_model is not None:
         ax.plot(ra_model, v_model, color='blue', linewidth=2, label='Model Streamline', zorder=7)
 
     # interpolated points
@@ -639,9 +634,7 @@ def plot_dec_vel(
             ax.plot(dec_data, v_data, 'o', color='red', label='Data')
 
     # model curve
-    if model_keep is not None:
-        ax.plot(dec_model[model_keep], v_model[model_keep], color='blue', linewidth=2, label='Model Streamline (kept)', zorder=7)
-    else:
+    if dec_model is not None and v_model is not None:
         ax.plot(dec_model, v_model, color='blue', linewidth=2, label='Model Streamline')
 
     # interpolated points
