@@ -727,15 +727,15 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     return result
 
 @jax.jit(static_argnames=("loss_method", "npoints"))
-def _chi2_loss_raw_core(
+def chi2_loss_raw(
     model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
     npoints=10000,
 ):
-    """Jitted core of chi2_loss_raw. Returns (chi2_total, loss_trace, err) where
-    err is a checkify"""
+    """Generates model via forward model and calculates loss between data and model.
+    Returns (chi2_total, loss_trace, err) where err is a checkify"""
  
     loss_method = check_loss_method(loss_method)
  
@@ -871,45 +871,18 @@ def _chi2_loss_raw_core(
         'matching': matching_trace,
         'loss_method': loss_method,
     }
-    return chi2_total, loss_trace, err
- 
- 
-def chi2_loss_raw(
-    opt_params,
-    fixed_params,
-    distance_pc,
-    prepared_data,
-    loss_method=0,
-    npoints=10000,
-):
-    """Compute chi-squared loss and return a trace tree"""
- 
-    loss_method = check_loss_method(loss_method)
- 
-    model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
- 
-    chi2_total, loss_trace, err = _chi2_loss_raw_core(
-        model_params,
-        distance_pc,
-        prepared_data,
-        loss_method=loss_method,
-        npoints=npoints,
-    )
-    err.throw()
- 
     return chi2_total, loss_trace
 
-
 @jax.jit(static_argnames=("loss_method", "npoints"))
-def _chi2_loss_core(
+def chi2_loss(
     model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
     npoints=10000,
 ):
-    """Jitted core of chi2_loss. Returns (chi2_total, loss_trace, err) where
-    err is a checkify"""
+    """Generates model via forward model and calculates loss between data and model.
+    Returns (chi2_total, loss_trace, err) where err is a checkify"""
  
     loss_method = check_loss_method(loss_method)
     distance_pc = to_float64(distance_pc)
@@ -980,55 +953,9 @@ def _chi2_loss_core(
         'matching': matching_trace,
         'loss_method': loss_method,
     }
-    return chi2_total, loss_trace, err
- 
- 
-def chi2_loss(
-    opt_params,
-    fixed_params,
-    distance_pc,
-    prepared_data,
-    loss_method=0,
-    npoints=10000,
-):
-    """
-    Compute chi-squared loss between model and data using one of two modes:
-    - 0: RA, Dec, and LOS velocity residuals
-    - 1: projected radial distance, polar angle, and LOS velocity residuals
-    
-    Parameters:
-    -----------
-    opt_params : dict
-        optimisable streamline model parameters (any subset of
-        STREAMLINE_MODEL_PARAM_KEYS). already unitless
-    fixed_params : dict
-        Fixed streamline model parameters (complementary subset). already unitless
-    distance_pc : float
-        Distance to source in parsecs
-    prepared_data : PreparedData
-        Precomputed data-only quantities (distance metrics, bounds, polar coords).
-        Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
- 
-        
-            Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
-    --------
-    float: Chi-squared loss value
-    """
- 
-    loss_method = check_loss_method(loss_method)
- 
-    model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
- 
-    chi2_total, loss_trace, err = _chi2_loss_core(
-        model_params,
-        distance_pc,
-        prepared_data,
-        loss_method=loss_method,
-        npoints=npoints,
-    )
-    err.throw()
- 
     return chi2_total, loss_trace
+ 
+
 
 '''
 def estimate_parameter_errors(
@@ -1300,7 +1227,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     # physical/log units only when evaluating the forward model and diagnostics.
     opt_params_norm = normalise_opt_params(opt_params, normalisation_spec)
 
-    # Use one global learning rate on normalised parameters.
+    # Use one global learning rate on normalised parameters
     solver = optax.adam(learning_rate=learning_rate, b1=beta1, b2=beta2)
 
     opt_state = solver.init(opt_params_norm)
@@ -1316,30 +1243,37 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     else: 
         npoints = 50000
 
+    fixed_params_for_core = fixed_params
+
+    @jax.jit
     def loss_from_normalised(norm_opt_params):
         physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
-        return chi2_loss(
-            physical_opt_params,
-            fixed_params,
-            distance_pc,
-            loss_method=loss_method,
-            prepared_data=prepared_data,
-            npoints=npoints
-        )
-
-    def loss_from_normalised_with_trace(norm_opt_params):
-        physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
-        return chi2_loss_raw(
-            physical_opt_params,
-            fixed_params,
+        model_params = {**fixed_params_for_core, **physical_opt_params}
+        chi2_total, loss_trace = chi2_loss(
+            model_params,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
-            npoints=npoints
+            npoints=npoints,
         )
+        return chi2_total, loss_trace
+
+    @jax.jit
+    def loss_from_normalised_with_trace(norm_opt_params):
+        physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
+        model_params = {**fixed_params_for_core, **physical_opt_params}
+        chi2_total, loss_trace = chi2_loss_raw(
+            model_params,
+            distance_pc,
+            prepared_data,
+            loss_method=loss_method,
+            npoints=npoints,
+        )
+        return chi2_total, loss_trace
+
 
     # Create gradient functions in normalised space.
-    loss_and_grad_fn = value_and_grad(loss_from_normalised)
+    loss_and_grad_fn = value_and_grad(loss_from_normalised, has_aux=True)
     loss_and_trace_fn = value_and_grad(loss_from_normalised_with_trace, has_aux=True)
     
     # Track loss history
@@ -1447,7 +1381,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 (loss_value, loss_trace_raw), norm_grads = loss_and_trace_fn(opt_params_norm)
                 loss_trace = trace_tree_to_python(loss_trace_raw)
             else:
-                loss_value, norm_grads = loss_and_grad_fn(opt_params_norm)
+                (loss_value, _), norm_grads = loss_and_grad_fn(opt_params_norm)
             loss_value = float(loss_value)
 
             # jax.debug.print("norm_grads: {x}", x=norm_grads)
@@ -1562,7 +1496,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         # At this point, opt_params contains the parameters from the end of the final iteration.
         # We need to compute the loss at these parameters to complete the CSV epoch logging.
         if csv_writer is not None:
-            loss_final, _ = loss_from_normalised(opt_params_norm)
+            loss_final, _= loss_from_normalised(opt_params_norm)
             loss_final = loss_final.astype(float)
             # epoch is the last epoch number from the loop (either n_epochs or early stopping)
             row = {'epoch': epoch, 'loss': loss_final}
@@ -1573,28 +1507,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             csv_writer.writerow(row)
             csv_file.flush()
         
-        # Optionally compute and log trace diagnostics at the best parameters found.
-        # This is independent of the CSV epoch logging and serves as diagnostics for the best fit.
-        # if trace_csv_writer is not None:
-        #     # compute and log now
-        #     best_loss_for_trace, best_trace = chi2_loss(
-        #         best_opt_params,
-        #         fixed_params,
-        #         distance_pc,
-        #         prepared_data,
-        #         loss_method=loss_method,
-        #     )
-        #     best_loss_for_trace = float(best_loss_for_trace)
-            
-        #     # Compute best gradient norm for trace
-        #     _, best_norm_grads = loss_and_trace_fn(normalise_opt_params(best_opt_params, normalisation_spec))
-        #     best_grad_norm = float(gradient_l2_norm(best_norm_grads))
-            
-        #     # Log trace row for best epoch
-        #     best_trace_row = build_trace_row(best_epoch, best_loss_for_trace, best_trace, best_grad_norm, loss_method)
-        #     trace_csv_writer.writerow(best_trace_row)
-        #     trace_csv_file.flush()
-    
         # restore canonical parameter order before returning
         ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
 
