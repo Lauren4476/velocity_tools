@@ -12,8 +12,6 @@ import jax
 
 from velocity_tools.streamfit.gradient_descent import BIG
 from velocity_tools.streamfit.stream_lines_grad import to_float64
-jax.config.update("jax_debug_nans", True)
-
 
 PreparedData = namedtuple('PreparedData', [
     'ra_data', 'dec_data', 'v_data',

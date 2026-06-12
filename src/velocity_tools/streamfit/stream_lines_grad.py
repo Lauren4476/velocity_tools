@@ -24,7 +24,6 @@ from jax.experimental import checkify
 # from jax import lax
 # from jax import debug
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_debug_nans", True)
 from typing import NamedTuple
 
 

@@ -114,7 +114,8 @@ def plot_morphology_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {param: float(row[param]) for param in param_names}
-        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        opt_params_epoch_full, opt_params_epoch, fixed_params = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
         valid_mask_model = valid_mask_model.astype(bool)
 
         (ra_model_interp, dec_model_interp, _, valid, model_keep, dmetric_model, matching_trace) = gradient_descent.checked_match_model_to_data_curve(
@@ -362,7 +363,8 @@ def plot_ra_vel_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
         valid_mask_model = valid_mask_model.astype(bool)
         ra_model_interp, _, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
@@ -528,7 +530,8 @@ def plot_dec_vel_by_epoch(
 
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(opt_params_epoch, fixed_params, distance)
+        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
         valid_mask_model = valid_mask_model.astype(bool)
         ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
@@ -934,9 +937,9 @@ def plot_vel_radius_by_epoch(
     for idx, epoch in enumerate(epochs):
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {p: float(row[p]) for p in param_names}
-        ra_model, dec_model, v_model, valid_mask_model = gradient_descent.forward_model(
-            opt_params_epoch,
-            fixed_params,
+        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(
+            opt_params_epoch_full,
             distance,
         )
 
@@ -1148,7 +1151,8 @@ def plot_streamline_covariance_samples(streamline_samples,
         ax_v.plot(rproj[order], vel[order], color='tab:blue', alpha=0.1, lw=1)
 
     # plot best fit streamline
-    ra_best, dec_best, v_best, valid_mask_best = gradient_descent.forward_model(best_opt_params, fixed_params, distance)
+    best_opt_full_params, best_opt_params, fixed_params = gradient_descent.prepare_model_params(best_opt_params, fixed_params)
+    ra_best, dec_best, v_best, valid_mask_best, err = gradient_descent.forward_model(best_opt_full_params, distance)
     ra_best = np.asarray(ra_best, dtype=float)
     dec_best = np.asarray(dec_best, dtype=float)
     v_best = np.asarray(v_best, dtype=float)
@@ -1219,7 +1223,8 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
             key: float(value)
             for key, value in zip(opt_keys, sample)
         }
-        ra, dec, vel, valid_mask = gradient_descent.forward_model(sample_params, fixed_params, distance)
+        sample_params_full, sample_params, fixed_params = gradient_descent.prepare_model_params(sample_params, fixed_params)
+        ra, dec, vel, valid_mask, err = gradient_descent.forward_model(sample_params_full, distance)
         ra = np.asarray(ra, dtype=float)
         dec = np.asarray(dec, dtype=float)
         vel = np.asarray(vel, dtype=float)
