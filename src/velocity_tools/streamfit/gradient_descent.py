@@ -139,28 +139,7 @@ def to_float64(value):
     return jnp.asarray(value, dtype=jnp.float64)
 
 
-def make_opt_params_float64(opt_params):
-    """Return optimisation parameters as float64"""
-    coerced = {}
-    for key, value in opt_params.items():
-        if is_numeric_value(value):
-            coerced[key] = to_float64(value)
-        else:
-            coerced[key] = value
-    return coerced
 
-
-def make_fixed_params_float64(fixed_params):
-    """Return fixed-parameter dictionary with numeric values as float64"""
-    coerced = {}
-    for key, value in fixed_params.items():
-        if value is None or isinstance(value, bool):
-            coerced[key] = value
-        elif is_numeric_value(value):
-            coerced[key] = to_float64(value)
-        else:
-            coerced[key] = value
-    return coerced
 
 
 def make_data_tuple_float64(values):
@@ -386,16 +365,6 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     return denormalised
 
 
-def params_dict_to_vector(opt_params):
-    keys = list(opt_params.keys())
-    vec = jnp.array([opt_params[k] for k in keys], dtype=jnp.float64)
-    return vec, keys
-
-
-def vector_to_params_dict(vec, keys):
-    return {k: vec[i] for i, k in enumerate(keys)}
-
-
 def with_derived_omega(opt_params):
     """Return a copy of the opt params including omega, when it is available"""
     params_with_omega = opt_params.copy()
@@ -419,11 +388,6 @@ def build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
         row[component_key] = chi2_components.get(component_key, float('nan'))
 
     row.update({
-        # 'low_shortfall_penalty': chi2_components.get('low_shortfall_penalty', float('nan')),
-        # 'low_excess_penalty': chi2_components.get('low_excess_penalty', float('nan')),
-        # 'high_shortfall_penalty': chi2_components.get('high_shortfall_penalty', float('nan')),
-        # 'high_excess_penalty': chi2_components.get('high_excess_penalty', float('nan')),
-        # 'chi2_penalty': chi2_components.get('chi2_penalty', float('nan')),
         'chi2_total': chi2_components.get('chi2_total', float('nan')),
         'grad_norm': grad_norm,
         'model_points_total': matching.get('model_points_total', 0),
@@ -573,39 +537,6 @@ def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data
     overlap_max = jnp.minimum(model_max, data_max)
     return model_min, model_max, data_min, data_max, overlap_min, overlap_max
 
-#@jax.jit
-def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=1e-12):
-    """Order finite model support by distance metric, skipping argsort when already monotonic."""
-    dmetric_model = to_float64(dmetric_model)
-    ra_model = to_float64(ra_model)
-    dec_model = to_float64(dec_model)
-    v_model = to_float64(v_model)
-
-    if dmetric_model.size <= 1:
-        return dmetric_model, ra_model, dec_model, v_model
-
-    sort_tol = to_float64(sort_tol)
-    d_diff = jnp.diff(dmetric_model)
-    ascending = jnp.all(d_diff >= -sort_tol)
-    descending = jnp.all(d_diff <= sort_tol)
-
-    def keep_order(_):
-        return dmetric_model, ra_model, dec_model, v_model
-
-    def reverse_order(_):
-        return dmetric_model[::-1], ra_model[::-1], dec_model[::-1], v_model[::-1]
-
-    def sorted_order(_):
-        sort_idx = jnp.argsort(dmetric_model)
-        return (dmetric_model[sort_idx], ra_model[sort_idx], dec_model[sort_idx], v_model[sort_idx])
-
-    return lax.cond(
-        ascending,
-        keep_order,
-        lambda _: lax.cond(descending, reverse_order, sorted_order, operand=None),
-        operand=None,
-    )
-
 @jax.jit
 def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data):
     """
@@ -727,7 +658,7 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     return result
 
 @jax.jit(static_argnames=("loss_method", "npoints"))
-def chi2_loss_raw(
+def chi2_loss(
     model_params,
     distance_pc,
     prepared_data,
@@ -873,232 +804,7 @@ def chi2_loss_raw(
     }
     return chi2_total, loss_trace
 
-@jax.jit(static_argnames=("loss_method", "npoints"))
-def chi2_loss(
-    model_params,
-    distance_pc,
-    prepared_data,
-    loss_method=0,
-    npoints=10000,
-):
-    """Generates model via forward model and calculates loss between data and model.
-    Returns (chi2_total, loss_trace, err) where err is a checkify"""
- 
-    loss_method = check_loss_method(loss_method)
-    distance_pc = to_float64(distance_pc)
- 
-    ra_data = prepared_data.ra_data
-    dec_data = prepared_data.dec_data
-    v_data = prepared_data.v_data
-    ra_sigma = prepared_data.ra_sigma_safe
-    dec_sigma = prepared_data.dec_sigma_safe
-    v_sigma = prepared_data.v_sigma_safe
- 
-    # Run forward model
-    ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
-    # jax.debug.print("dec_model (raw): {x}", x=dec_model)
-    valid_mask_model = valid_mask_model.astype(jnp.bool_)
- 
-    # Match model to data using arc-length parameterisation
-    ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
-    )
- 
-    valid = jnp.asarray(valid, dtype=bool)
-    valid_weights = valid.astype(jnp.float64)
-    # Only compute chi2 on valid/retained data points 
-    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
- 
-    if loss_method == 0:
-        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
-        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v
-    else:
-        r_proj_data = prepared_data.r_proj_data
-        theta_proj_data = prepared_data.theta_proj_data
-        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
-            ra_model_interp,
-            dec_model_interp,
-        )
- 
-        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
- 
-        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = to_float64(1e-8)
-        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
-        sigma_theta = jnp.maximum(sigma_theta, r_eps)
- 
-        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
-        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v
- 
-    if loss_method == 0:
-        chi2_components = {
-            'chi2_ra': chi2_ra.astype(float),
-            'chi2_dec': chi2_dec.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
-    else:
-        chi2_components = {
-            'chi2_r': chi2_r.astype(float),
-            'chi2_theta': chi2_theta.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
- 
-    loss_trace = {
-        'chi2_components': chi2_components,
-        'matching': matching_trace,
-        'loss_method': loss_method,
-    }
-    return chi2_total, loss_trace
- 
 
-
-'''
-def estimate_parameter_errors(
-    best_opt_params,
-    fixed_params,
-    data,
-    uncertainties,
-    distance_pc,
-    prepared_data,
-    npoints=10000,
-    loss_method=0,
-    gradient_tol=1e-1,
-    normalisation_spec=None,
-):
-    """
-    Estimate parameter uncertainties using Hessian of chi2 loss.
-
-    Parameters
-    ----------
-    npoints: int
-        Number of points to sample along the streamer for loss and Hessian evaluation.
-        This is just for jax/jit compatibility to have fixed-length arrays
-    best_opt_params : dict
-    prepared_data : PreparedData
-        Precomputed data-only quantities (created via extract_streamline.prepare_data).
-    gradient_tol : float or None
-        Tolerance on gradient norm in normalised space. If provided and
-        normalised-space gradient norm > gradient_tol at best params, a
-        warning is issued because the quadratic approximation may not be valid.
-    normalisation_spec : dict or None
-        Bounds-derived normalisation metadata for optimised parameters.
-        Required to evaluate gradient_tol in normalised space.
-
-    Returns
-    -------
-    dict
-        1-sigma uncertainties for each optimisable parameter
-    array
-        covariance matrix
-    """
-
-    if gradient_tol is not None:
-        gradient_tol = float(gradient_tol)
-        if not math.isfinite(gradient_tol):
-            raise ValueError('gradient_tol must be finite when provided.')
-        if gradient_tol <= 0:
-            raise ValueError('gradient_tol must be positive when provided.')
-
-    # convert dict -> vector
-    params_vec, keys = params_dict_to_vector(best_opt_params)
-    loss_method = check_loss_method(loss_method)
-    print("params vector for Hessian calculation:", params_vec)
-    print("keys for Hessian calculation:", keys)
-
-    def loss_vec(theta_vec):
-        params = vector_to_params_dict(theta_vec, keys)
-        chi2_total, _ = chi2_loss_raw(
-            params,
-            fixed_params,
-            distance_pc,
-            prepared_data,
-            loss_method=loss_method,
-            npoints=npoints
-        )
-        print("loss_vec: chi2_total =", chi2_total)
-        return chi2_total
-
-    # Check gradient magnitude at best-fit parameters in normalised space.
-    if gradient_tol is not None:
-        if normalisation_spec is None:
-            print(
-                "WARNING: gradient_tol is interpreted in normalised space, but "
-                "normalisation_spec was not provided. Skipping gradient_tol check "
-                "for uncertainty estimation."
-            )
-        else:
-            missing_norm_keys = [key for key in keys if key not in normalisation_spec]
-            if missing_norm_keys:
-                raise ValueError(
-                    "normalisation_spec is missing optimised parameter keys required "
-                    f"for gradient_tol check: {missing_norm_keys}"
-                )
-
-            norm_opt_params = normalise_opt_params(best_opt_params, normalisation_spec)
-            norm_params_vec, _ = params_dict_to_vector(norm_opt_params)
-
-            def norm_loss_vec(theta_norm_vec):
-                norm_params = vector_to_params_dict(theta_norm_vec, keys)
-                physical_params = denormalise_opt_params(norm_params, normalisation_spec)
-                chi2_total, _ = chi2_loss_raw(
-                     physical_params,
-                    fixed_params,
-                    distance_pc,
-                    prepared_data,
-                    loss_method=loss_method,
-                    npoints=npoints
-                )
-                return chi2_total
-
-            norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-            norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
-
-            if norm_grad_norm > gradient_tol:
-                print(
-                    "WARNING: normalised-space gradient norm at best fit = "
-                    f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
-                )
-                print("optimisation may not have reached a minimum yet.")
-                print("Parameter uncertainties may be unreliable or incalculable. Consider:")
-                print("    - Increasing n_epochs")
-                print("    - Reducing learning rate for finer convergence")
-                print("    - Reducing loss_threshold if used")
-
-    print("loss vec:", loss_vec(params_vec))
-
-    g = jax.grad(loss_vec)(params_vec)
-
-    print("gradient =", g)
-    print("gradient finite =", jnp.isfinite(g))
-
-    H = jax.hessian(loss_vec)(params_vec)
-
-    print(H)
-    print("NaN locations:")
-    print(jnp.argwhere(jnp.isnan(H)))
-
-    print("Any NaNs in H?", jnp.any(jnp.isnan(H)))
-    print("Any infs in H?", jnp.any(jnp.isinf(H)))
-
-    cov = jnp.linalg.inv(H)
-
-    print("Any NaNs in cov?", jnp.any(jnp.isnan(cov)))
-    print("Any infs in cov?", jnp.any(jnp.isinf(cov)))
-
-    diag = jnp.diag(cov)
-    print("cov diag =", diag)
-
-    errors = jnp.sqrt(diag)
-
-    error_dict = {k: float(errors[i]) for i, k in enumerate(keys)}
-
-    return error_dict, cov
-'''
 
 def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
                    learning_rate=0.001, param_bounds=None, n_epochs=1000,
@@ -1258,23 +964,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         )
         return chi2_total, loss_trace
 
-    @jax.jit
-    def loss_from_normalised_with_trace(norm_opt_params):
-        physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
-        model_params = {**fixed_params_for_core, **physical_opt_params}
-        chi2_total, loss_trace = chi2_loss_raw(
-            model_params,
-            distance_pc,
-            prepared_data,
-            loss_method=loss_method,
-            npoints=npoints,
-        )
-        return chi2_total, loss_trace
-
 
     # Create gradient functions in normalised space.
     loss_and_grad_fn = value_and_grad(loss_from_normalised, has_aux=True)
-    loss_and_trace_fn = value_and_grad(loss_from_normalised_with_trace, has_aux=True)
     
     # Track loss history
     loss_history = []
@@ -1359,7 +1051,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     # Log epoch 0 trace if trace file is requested
     if trace_csv_writer is not None:
         # Compute initial loss and trace
-        (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_trace_fn(opt_params_norm)
+        (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_grad_fn(opt_params_norm)
         loss_trace = trace_tree_to_python(loss_trace_raw)
         grad_norm = float(gradient_l2_norm(norm_grads_trace))
         
@@ -1375,13 +1067,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Compute loss and gradients at current (pre-update) normalised parameters.
             # At the START of iteration i, we're at state S(i-1).
             # The loss computed here is loss(S(i-1)), which is what we want to log for CSV epoch (i-1).
-            trace_requested = trace_csv_writer is not None
             loss_trace = None
-            if trace_requested:
-                (loss_value, loss_trace_raw), norm_grads = loss_and_trace_fn(opt_params_norm)
-                loss_trace = trace_tree_to_python(loss_trace_raw)
-            else:
-                (loss_value, _), norm_grads = loss_and_grad_fn(opt_params_norm)
+            (loss_value, loss_trace_raw), norm_grads = loss_and_grad_fn(opt_params_norm)
+            loss_trace = trace_tree_to_python(loss_trace_raw)
             loss_value = float(loss_value)
 
             # jax.debug.print("norm_grads: {x}", x=norm_grads)
