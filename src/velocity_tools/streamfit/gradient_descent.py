@@ -556,15 +556,18 @@ def forward_model(model_params, distance_pc, npoints=10000):
     return ra_model, dec_model, v_model, valid_mask, err
 
 
+@jax.jit
 def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
     """Compute the overlapping range in the streamline distance metric between data and model"""
-    model_metric = dmetric_model[model_finite_mask]
-    data_metric = dmetric_data[data_finite_mask]
+    model_metric_for_min = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG))
+    model_metric_for_max = jnp.where(model_finite_mask, dmetric_model, to_float64(BIG_NEG))
+    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, to_float64(BIG))
+    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, to_float64(BIG_NEG))
 
-    model_min = jnp.min(model_metric)
-    model_max = jnp.max(model_metric)
-    data_min = jnp.min(data_metric)
-    data_max = jnp.max(data_metric)
+    model_min = jnp.min(model_metric_for_min)
+    model_max = jnp.max(model_metric_for_max)
+    data_min = jnp.min(data_metric_for_min)
+    data_max = jnp.max(data_metric_for_max)
 
     overlap_min = jnp.maximum(model_min, data_min)
     overlap_max = jnp.minimum(model_max, data_max)
@@ -603,6 +606,7 @@ def order_model_by_metric(dmetric_model, ra_model, dec_model, v_model, sort_tol=
         operand=None,
     )
 
+@jax.jit
 def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data):
     """
     Extract model values corresponding to data positions using the distance metric from
@@ -722,54 +726,51 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-#@jax.jit(static_argnames=("loss_method", "npoints"))
-def chi2_loss_raw(
-    opt_params,
-    fixed_params,
+@jax.jit(static_argnames=("loss_method", "npoints"))
+def _chi2_loss_raw_core(
+    model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
     npoints=10000,
 ):
-    """Compute chi-squared loss and optionally return a diagnostic trace tree"""
-
+    """Jitted core of chi2_loss_raw. Returns (chi2_total, loss_trace, err) where
+    err is a checkify"""
+ 
     loss_method = check_loss_method(loss_method)
-
-    model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
-
+ 
     distance_pc = to_float64(distance_pc)
-
+ 
     ra_data = prepared_data.ra_data
     dec_data = prepared_data.dec_data
     v_data = prepared_data.v_data
     ra_sigma = prepared_data.ra_sigma_safe
     dec_sigma = prepared_data.dec_sigma_safe
     v_sigma = prepared_data.v_sigma_safe
-
+ 
     ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
-    err.throw()
     valid_mask_model = valid_mask_model.astype(jnp.bool_)
-
+ 
     ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, _ = (
         checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
     )
-
+ 
     dmetric_data = prepared_data.dmetric_data
     valid = jnp.asarray(valid, dtype=bool)
     valid_weights = valid.astype(jnp.float64)
-
+ 
     model_finite_mask = (
         jnp.isfinite(ra_model)
         & jnp.isfinite(dec_model)
         & jnp.isfinite(v_model)
         & jnp.isfinite(dmetric_model)
     )
-
-
+ 
+ 
     # Only compute chi2 on valid/retained data points 
-
+ 
     chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
-
+ 
     if loss_method == 0:
         chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
         chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
@@ -781,40 +782,40 @@ def chi2_loss_raw(
             ra_model_interp,
             dec_model_interp,
         )
-
+ 
         dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
-
+ 
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
         r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
         sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
-
+ 
         chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
         chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v
-
-
+ 
+ 
     data_finite_mask = (
         jnp.isfinite(ra_data)
         & jnp.isfinite(dec_data)
         & jnp.isfinite(dmetric_data)
     )
-
+ 
     model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
         dmetric_model,
         model_finite_mask,
         dmetric_data,
         data_finite_mask,
     )
-
+ 
     model_nan_count = jnp.sum(~model_finite_mask)
     model_points_total = ra_model.size
     model_valid_points = model_points_total - model_nan_count
-
+ 
     data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
     model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
-
+ 
     sort_idx = jnp.argsort(dmetric_model)
     d_model_sorted = dmetric_model[sort_idx]
     d_diff = jnp.diff(d_model_sorted)
@@ -828,9 +829,9 @@ def chi2_loss_raw(
         model_metric_near_tie_count = to_float64(0.0)
         model_metric_duplicate_count = to_float64(0.0)
         model_metric_non_monotonic_count = to_float64(0.0)
-
+ 
     model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
-
+ 
     if loss_method == 0:
         chi2_components = {
             'chi2_ra': chi2_ra,
@@ -847,7 +848,7 @@ def chi2_loss_raw(
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
-
+ 
     matching_trace = {
         'model_points_total': model_points_total,
         'model_nan_count': model_nan_count,
@@ -864,15 +865,124 @@ def chi2_loss_raw(
         'model_metric_duplicate_count': model_metric_duplicate_count,
         'model_metric_non_monotonic_count': model_metric_non_monotonic_count,
     }
-
+ 
     loss_trace = {
         'chi2_components': chi2_components,
         'matching': matching_trace,
         'loss_method': loss_method,
     }
+    return chi2_total, loss_trace, err
+ 
+ 
+def chi2_loss_raw(
+    opt_params,
+    fixed_params,
+    distance_pc,
+    prepared_data,
+    loss_method=0,
+    npoints=10000,
+):
+    """Compute chi-squared loss and return a trace tree"""
+ 
+    loss_method = check_loss_method(loss_method)
+ 
+    model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
+ 
+    chi2_total, loss_trace, err = _chi2_loss_raw_core(
+        model_params,
+        distance_pc,
+        prepared_data,
+        loss_method=loss_method,
+        npoints=npoints,
+    )
+    err.throw()
+ 
     return chi2_total, loss_trace
 
-#@jax.jit(static_argnames=("loss_method", "npoints"))
+
+@jax.jit(static_argnames=("loss_method", "npoints"))
+def _chi2_loss_core(
+    model_params,
+    distance_pc,
+    prepared_data,
+    loss_method=0,
+    npoints=10000,
+):
+    """Jitted core of chi2_loss. Returns (chi2_total, loss_trace, err) where
+    err is a checkify"""
+ 
+    loss_method = check_loss_method(loss_method)
+    distance_pc = to_float64(distance_pc)
+ 
+    ra_data = prepared_data.ra_data
+    dec_data = prepared_data.dec_data
+    v_data = prepared_data.v_data
+    ra_sigma = prepared_data.ra_sigma_safe
+    dec_sigma = prepared_data.dec_sigma_safe
+    v_sigma = prepared_data.v_sigma_safe
+ 
+    # Run forward model
+    ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
+    # jax.debug.print("dec_model (raw): {x}", x=dec_model)
+    valid_mask_model = valid_mask_model.astype(jnp.bool_)
+ 
+    # Match model to data using arc-length parameterisation
+    ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
+    )
+ 
+    valid = jnp.asarray(valid, dtype=bool)
+    valid_weights = valid.astype(jnp.float64)
+    # Only compute chi2 on valid/retained data points 
+    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
+ 
+    if loss_method == 0:
+        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
+        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
+        chi2_total = chi2_ra + chi2_dec + chi2_v
+    else:
+        r_proj_data = prepared_data.r_proj_data
+        theta_proj_data = prepared_data.theta_proj_data
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
+            ra_model_interp,
+            dec_model_interp,
+        )
+ 
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+ 
+        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+        r_eps = to_float64(1e-8)
+        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+        sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.maximum(sigma_theta, r_eps)
+ 
+        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
+        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
+        chi2_total = chi2_r + chi2_theta + chi2_v
+ 
+    if loss_method == 0:
+        chi2_components = {
+            'chi2_ra': chi2_ra.astype(float),
+            'chi2_dec': chi2_dec.astype(float),
+            'chi2_v': chi2_v.astype(float),
+            'chi2_total': chi2_total.astype(float),
+        }
+    else:
+        chi2_components = {
+            'chi2_r': chi2_r.astype(float),
+            'chi2_theta': chi2_theta.astype(float),
+            'chi2_v': chi2_v.astype(float),
+            'chi2_total': chi2_total.astype(float),
+        }
+ 
+    loss_trace = {
+        'chi2_components': chi2_components,
+        'matching': matching_trace,
+        'loss_method': loss_method,
+    }
+    return chi2_total, loss_trace, err
+ 
+ 
 def chi2_loss(
     opt_params,
     fixed_params,
@@ -898,85 +1008,26 @@ def chi2_loss(
     prepared_data : PreparedData
         Precomputed data-only quantities (distance metrics, bounds, polar coords).
         Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
-
+ 
         
             Created via extract_streamline.prepare_data(data, uncertainties, n_elements).
     --------
     float: Chi-squared loss value
     """
-
+ 
     loss_method = check_loss_method(loss_method)
-
+ 
     model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
-    distance_pc = to_float64(distance_pc)
-
-    ra_data = prepared_data.ra_data
-    dec_data = prepared_data.dec_data
-    v_data = prepared_data.v_data
-    ra_sigma = prepared_data.ra_sigma_safe
-    dec_sigma = prepared_data.dec_sigma_safe
-    v_sigma = prepared_data.v_sigma_safe
-
-    # Run forward model
-    ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
-    err.throw()
-    # jax.debug.print("dec_model (raw): {x}", x=dec_model)
-    valid_mask_model = valid_mask_model.astype(jnp.bool_)
-
-    # Match model to data using arc-length parameterisation
-    ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
+ 
+    chi2_total, loss_trace, err = _chi2_loss_core(
+        model_params,
+        distance_pc,
+        prepared_data,
+        loss_method=loss_method,
+        npoints=npoints,
     )
-
-    valid = jnp.asarray(valid, dtype=bool)
-    valid_weights = valid.astype(jnp.float64)
-    # Only compute chi2 on valid/retained data points 
-    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
-
-    if loss_method == 0:
-        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
-        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v
-    else:
-        r_proj_data = prepared_data.r_proj_data
-        theta_proj_data = prepared_data.theta_proj_data
-        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
-            ra_model_interp,
-            dec_model_interp,
-        )
-
-        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
-
-        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = to_float64(1e-8)
-        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
-        sigma_theta = jnp.maximum(sigma_theta, r_eps)
-
-        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
-        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v
-
-    if loss_method == 0:
-        chi2_components = {
-            'chi2_ra': chi2_ra.astype(float),
-            'chi2_dec': chi2_dec.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
-    else:
-        chi2_components = {
-            'chi2_r': chi2_r.astype(float),
-            'chi2_theta': chi2_theta.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
-
-    loss_trace = {
-        'chi2_components': chi2_components,
-        'matching': matching_trace,
-        'loss_method': loss_method,
-    }
+    err.throw()
+ 
     return chi2_total, loss_trace
 
 '''
