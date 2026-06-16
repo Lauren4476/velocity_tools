@@ -170,6 +170,9 @@ def plot_morphology_by_epoch(
     # prepare clean output folder for epoch frames
     _ensure_clean_dir(output_dir)
 
+    partitions = extract_streamline.get_metric_partitions(pc_coords, n_points)
+    metric_boundaries, trace = extract_streamline.sample_metric_boundaries(pc_coords, partitions)
+
     # plot and save for each epoch
     for model in epoch_models:
         plot_morphology(
@@ -182,9 +185,8 @@ def plot_morphology_by_epoch(
             ra_model_interp=model["ra_model_interp"],
             dec_model_interp=model["dec_model_interp"],
             valid=model["valid"],
-            model_keep=model["model_keep"],
             pc_coords=pc_coords,
-            n_points=n_points,
+            metric_boundaries=metric_boundaries,
             title=f"Epoch: {int(model['epoch'])}",
             xlim=ra_lim,
             ylim=dec_lim,
@@ -207,10 +209,9 @@ def plot_morphology(
     ra_model_interp=None,
     dec_model_interp=None,
     valid=None,
-    model_keep=None,
     by_eye=None,
     pc_coords=None,
-    n_points=None,
+    metric_boundaries=None,
     title=None,
     xlim=None,
     ylim=None,
@@ -219,7 +220,7 @@ def plot_morphology(
     save_name='streamline_morphology',
     show=True,
 ):
-    '''Plot offsets in RA/Dec. Optionally include: model, model points, data points, best fit, background overlay.'''
+    '''Plot offsets in RA/Dec. Optionally include: model, model points, data points, best fit, background overlay, metric partitions.'''
 
 
     fig, ax = plt.subplots(figsize=(6.5, 7))
@@ -300,20 +301,19 @@ def plot_morphology(
             zorder=4,
         )
 
-        if n_points is not None:
+        if metric_boundaries is not None:
             # get current axes limits
             ax_limits = ax.get_xlim(), ax.get_ylim()
-            ax.set_facecolor('lightgrey')
-            partitions = extract_streamline.get_metric_partitions(pc_coords, n_points)
+            # ax.set_facecolor('lightgrey')
 
-            for partition_radius in partitions:
-                circle = plt.Circle((0, 0), partition_radius, facecolor='white', edgecolor='none', zorder=1)
-                ax.add_patch(circle)
+            # for partition_radius in partitions:
+            #     circle = plt.Circle((0, 0), partition_radius, facecolor='white', edgecolor='none', zorder=1)
+            #     ax.add_patch(circle)
 
             extract_streamline.plot_metric_boundaries(
                 ax,
                 pc_coords,
-                partitions,
+                metric_boundaries,
                 color='gray',
                 linewidth=1,
                 alpha=0.3,
@@ -669,7 +669,8 @@ def plot_dec_vel(
 
 
 def build_velocity_radius_kde(
-    rproj_data,
+    ra_data,
+    dec_data,
     vlos_data,
     xmin=None,
     xmax=None,
@@ -699,8 +700,9 @@ def build_velocity_radius_kde(
         Dictionary with keys: "xx", "yy", "zz", "levels", "xlim", "ylim".
     """
     from scipy import stats
-
-    rproj = np.asarray(rproj_data, dtype=float)
+    ra = np.asarray(ra_data)
+    dec = np.asarray(dec_data)
+    rproj = np.sqrt(ra**2 + dec**2)
     vlos = np.asarray(vlos_data, dtype=float)
     finite = np.isfinite(rproj) & np.isfinite(vlos)
     if np.sum(finite) < 3:
@@ -710,13 +712,13 @@ def build_velocity_radius_kde(
     vlos = vlos[finite]
 
     if xmin is None:
-        xmin = float(np.nanmin(rproj))
+        xmin = float(np.nanmin(rproj) - 1)
     if xmax is None:
-        xmax = float(np.nanmax(rproj))
+        xmax = float(np.nanmax(rproj) + 1)
     if ymin is None:
-        ymin = float(np.nanmin(vlos))
+        ymin = float(np.nanmin(vlos) - 1)
     if ymax is None:
-        ymax = float(np.nanmax(vlos))
+        ymax = float(np.nanmax(vlos) + 1)
 
     xx, yy = np.mgrid[xmin:xmax:complex(grid_size), ymin:ymax:complex(grid_size)]
     positions = np.vstack([xx.ravel(), yy.ravel()])

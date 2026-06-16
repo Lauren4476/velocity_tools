@@ -317,12 +317,11 @@ def sample_metric_boundaries(pc_coords, partitions, n_samples=720):
     return curves, trace
 
 
-def plot_metric_boundaries(ax, pc_coords, partitions, color='lightgrey', linewidth=1, alpha=0.5, n_samples=720, zorder=1):
+def plot_metric_boundaries(ax, pc_coords, curves, color='lightgrey', linewidth=1, alpha=0.5, n_samples=720, zorder=1):
     '''plot metric boundary curves on a RA/Dec axis'''
-    curves, trace = sample_metric_boundaries(pc_coords, partitions, n_samples=n_samples)
     for ra, dec in curves:
         ax.plot(ra, dec, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
-    return curves, trace
+    return curves
 
 
 def prepare_data(data, uncertainties, n_elements):
