@@ -306,9 +306,9 @@ def plot_morphology_by_epoch(
     and optionally compile into a video
     """
     try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+        optimisation_log = load_optimisation_log(save_folder)
     except FileNotFoundError:
-        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
 
     epochs = optimisation_log['epoch'].values
@@ -547,9 +547,9 @@ def plot_ra_vel_by_epoch(
     Create RA–velocity plots for every epoch
     """
     try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+        optimisation_log = load_optimisation_log(save_folder)
     except FileNotFoundError:
-        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
 
     epochs = optimisation_log['epoch'].values
@@ -714,9 +714,9 @@ def plot_dec_vel_by_epoch(
     Create DEC–velocity plots for every epoch
     """
     try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+        optimisation_log= load_optimisation_log(save_folder)
     except FileNotFoundError:
-        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
 
     epochs = optimisation_log['epoch'].values
@@ -1171,9 +1171,9 @@ def plot_vel_radius_by_epoch(
     """Create velocity vs projected radius plots for every epoch."""
 
     try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+        optimisation_log = load_optimisation_log(save_folder)
     except FileNotFoundError:
-        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
     
     epochs = optimisation_log['epoch'].values
@@ -1541,12 +1541,10 @@ def plot_param_optimisation_history(save_folder='sting_results'):
     and should contain "optimisation_log.csv" and optionally "optimisation_trace.csv"'''
     
     try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+        optimisation_log = load_optimisation_log(save_folder)
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
         return
-
-    trace_loss_method, trace_component_cols = detect_trace_loss_method(trace_log)
 
     epochs = optimisation_log["epoch"].values
     loss = optimisation_log["loss"].values
@@ -1556,17 +1554,11 @@ def plot_param_optimisation_history(save_folder='sting_results'):
         if c not in ("epoch", "loss"):
             param_names.append(c)
 
-    fig, axes = plt.subplots(len(param_names) + 1, 1, figsize=(8, 2 * (len(param_names) + 1)), sharex=True)
+    fig, axes = plt.subplots(len(param_names), 1, figsize=(8, 2 * (len(param_names) + 1)), sharex=True)
 
     plot_loss_panel(axes[0], epochs, loss)
 
-    for col in trace_component_cols:
-        axes[1].plot(epochs, trace_log[col].values, label=col)
-    axes[1].legend()
-    axes[1].set_yscale("log")
-    axes[1].grid(True)
-
-    for ax, param in zip(axes[2:], param_names):
+    for ax, param in zip(axes[1:], param_names):
         values = optimisation_log[param].values
         ax.plot(epochs, values)
         ax.set_ylabel(param)
@@ -1579,40 +1571,6 @@ def plot_param_optimisation_history(save_folder='sting_results'):
     else:
         plt.show()
 
-
-def plot_trace_diagnostics(save_folder='sting_results'):
-    '''Plot diagnostics from the optimisation trace log, if available. '''
-
-    try:
-        optimisation_log, trace_log = load_optimisation_logs(save_folder)
-    except FileNotFoundError:
-        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
-        return
-
-    epochs = optimisation_log["epoch"].values
-    loss = optimisation_log["loss"].values
-
-    trace_cols = []
-    for c in trace_log.columns:
-        if c not in ("epoch", "loss"):
-            trace_cols.append(c)
-
-    fig, axes = plt.subplots(len(trace_cols) + 1, 1, figsize=(8, 2 * (len(trace_cols) + 1)), sharex=True)
-
-    plot_loss_panel(axes[0], epochs, loss)
-
-    for ax, col in zip(axes[1:], trace_cols):
-        ax.plot(trace_log["epoch"], trace_log[col])
-        ax.set_ylabel(col)
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_folder is not None:
-        os.makedirs(save_folder, exist_ok=True)
-        plt.savefig(f'{save_folder}/trace_diagnostics.png', dpi=300, bbox_inches='tight')
-    else:
-        plt.show()
-
 def plot_loss_panel(ax, epochs, loss):
     lowest_loss = np.min(loss)
     best_idx = np.argmin(loss)
@@ -1620,34 +1578,14 @@ def plot_loss_panel(ax, epochs, loss):
     ax.plot(epochs, loss, color="black")
     ax.scatter(best_epoch, lowest_loss, color="green", label=f"Best Epoch: {best_epoch}")
     ax.set_yscale("log")
+    ax.set_ylabel("Loss")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-def detect_trace_loss_method(trace_log):
-    if trace_log is None:
-        return None, []
-    if {"chi2_ra", "chi2_dec", "chi2_v"}.issubset(trace_log.columns):
-        return "radecvel", ["chi2_ra", "chi2_dec", "chi2_v"]
-    if {"chi2_r", "chi2_theta", "chi2_v"}.issubset(trace_log.columns):
-        return "rthetavel", ["chi2_r", "chi2_theta", "chi2_v"]
-    return "unknown", []
 
-def load_optimisation_logs(logs_dir):
+def load_optimisation_log(logs_dir):
     log_path = os.path.join(logs_dir, "optimisation_log.csv")
     optimisation_log = pd.read_csv(log_path)
-    # trace only exists if trace_every != None
-    trace_path = os.path.join(logs_dir,"optimisation_trace.csv")
-    if os.path.exists(trace_path):
-        trace_log = pd.read_csv(trace_path)
-        print(f"Loaded tracer log: {trace_path} "
-              f"({len(trace_log)} rows)"
-        )
-    else:
-        trace_log = None
-        print(
-            f"Tracer log not found at {trace_path}. "
-            f"Re-run with trace_every != None to save tracer log. "
-        )
-    return optimisation_log, trace_log
+    return optimisation_log
 
 
