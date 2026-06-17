@@ -39,7 +39,6 @@ def estimate_parameter_errors(
     array
         covariance matrix
     """
-    print("Estimating parameter errors using the errors.py file!! :)")
     if gradient_tol is not None:
         gradient_tol = float(gradient_tol)
         if not math.isfinite(gradient_tol):
@@ -1017,7 +1016,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
     r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)
-    # print("r = {0}".format(r))
 
     # calculate positions and velocities inside r0
     orb_ang, theta, phi = stream_line(r, stream_state=stream_state, theta0=theta0, phi0=phi0)

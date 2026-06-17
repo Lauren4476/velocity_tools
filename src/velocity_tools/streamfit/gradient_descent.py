@@ -7,6 +7,8 @@ streamline model parameters to observed data by minimizing chi-squared loss.
 Last updated: 02-06-26
 '''
 
+import os
+
 import jax.numpy as jnp
 from jax import value_and_grad, lax
 import jax
@@ -66,6 +68,17 @@ CANONICAL_UNITS = {
     "deltar": u.au,
     "v_lsr": u.km / u.s,
 }
+
+ANGLE_KEYS = {'theta0', 'phi0', 'inc', 'pa'}
+DISPLAY_UNITS = {
+        'r0':      'au',
+        'v_r0':    'km/s',
+        'mass':    'M_sun',
+        'rmin':    'au',
+        'deltar':  'au',
+        'v_lsr':   'km/s',
+        'omega':   '1/s',
+    }
 
 STREAMLINE_MODEL_PARAM_KEYS = (
     'r0',
@@ -372,6 +385,27 @@ def with_derived_omega(opt_params):
         params_with_omega['omega'] = jnp.exp(params_with_omega['log_omega'])
     return params_with_omega
 
+
+def format_param(key, value):
+    """
+    Format parameter for display in output, with units. Notably:
+    - converts angles (theta0, phi0, inc, pa) from radians to degrees
+    - log_omega is displayed as omega in 1/s.
+    """
+    val = float(value)
+    if key in ANGLE_KEYS:
+        deg = math.degrees(val)
+        return f"{deg:.6g} deg"
+    if key == 'log_omega':
+        omega = math.exp(val)
+        return f"{omega:.6g} 1/s  (log_omega = {val:.6g})"
+    unit = DISPLAY_UNITS.get(key, '')
+    if unit:
+        suffix = f" {unit}"
+    else:
+        suffix = ""
+    return f"{val:.6g}{suffix}"
+
 def build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method):
     """Flatten trace dictionary into a csv row for output"""
     loss_method = check_loss_method(loss_method)
@@ -587,7 +621,6 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra
     w_model = model_keep.astype(jnp.float64)
 
     d_model = jnp.where(model_keep, dmetric_model, 0.0)
-    # jax.debug.print("d_model: {d}", d=d_model)
     d_data  = jnp.where(data_valid, dmetric_data, 0.0)
 
     # ---- sort model using metric + weight penalty (pushes invalid points to the end) ----
@@ -812,9 +845,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
                    gradient_tol=None, gradient_tol_epochs=1,
                    early_stopping_patience=50,
-                   log_file=None, trace_file=None,
+                   save_folder='sting_results',
                    loss_method=0, # 0: radecvel, 1: rthetavel
-                   output_uncertainties=False,
+                   pc_coords=None,
+                   v_lsr=None,
+                   show_plots=False
                    ):
     """
     Fit streamline model parameters to data using Adam optimiser.
@@ -858,17 +893,19 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Print loss every N epochs
     early_stopping_patience : int
         Stop if loss doesn't improve for N epochs
-    log_file : str or None
-        If provided, log epoch, loss, and parameter values to this CSV file.
-        File will be created/overwritten at start and updated after each epoch.
-    trace_file : str or None
-        If provided, log per-epoch matching diagnostics (theta_ref, NaN counts,
-        metric gaps/ties) to this CSV file.
+    save_folder : str
+        Folder to save output CSV and trace files, and figures. Created if it doesn't exist.
     loss_method : int
         Loss definition to use. Options:
         - 0: radecvel: optimise RA, Dec, and velocity residuals.
         - 1: rthetavel: optimise radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
+    pc_coords : array-like or None
+        Point cloud coordinates (3, N): [ra_offsets, dec_offsets, velocities].
+        When provided, used as a KDE background in the best-fit velocity-radius plot.
+    v_lsr : float or None
+        Systemic velocity (km/s). When provided, drawn as a reference line on the best-fit
+        velocity-radius plot
     loss_threshold : float or None
         Optional absolute loss threshold for threshold-based stopping.
         If provided, optimisation stops after loss is <= loss_threshold for
@@ -885,6 +922,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     gradient_tol_epochs : int
         Number of consecutive epochs with ||grad|| < gradient_tol required to
         trigger normalised-space gradient norm-based early stopping. Must be >= 1.
+    show_plots : bool
+        Whether to show diagnostic plots during optimisation
         
     **IMPORTANT: Epoch and Loss Semantics**
     
@@ -995,29 +1034,32 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         if gradient_tol_epochs < 1:
             raise ValueError('gradient_tol_epochs must be >= 1 when gradient_tol is provided.')
     
-    # Initialize CSV log file if requested
-    csv_file = None
-    csv_writer = None
-    if log_file is not None:
-        csv_file = open(log_file, 'w', newline='')
+    # initialise log and trace files if output_folder is provided
+    log_file = None
+    log_writer = None
+    trace_file = None
+    trace_writer = None
+    if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
+
+        log_file = os.path.join(save_folder, 'optimisation_log.csv')
+        log_file = open(log_file, 'w', newline='')
         # Create header: epoch, loss, then all optimisable params
         fieldnames = ['epoch', 'loss'] + opt_param_keys
         if 'log_omega' in opt_params and 'omega' not in fieldnames:
             fieldnames.append('omega')
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        csv_writer.writeheader()
-        csv_file.flush()
+        log_writer = csv.DictWriter(log_file, fieldnames=fieldnames)
+        log_writer.writeheader()
+        log_file.flush()
 
-    trace_csv_file = None
-    trace_csv_writer = None
-    if trace_file is not None:
-        trace_csv_file = open(trace_file, 'w', newline='')
-        trace_csv_writer = csv.DictWriter(
-            trace_csv_file,
+        trace_file = os.path.join(save_folder, 'optimisation_trace.csv')
+        trace_file = open(trace_file, 'w', newline='')
+        trace_writer = csv.DictWriter(
+            trace_file,
             fieldnames=trace_fieldnames_for_loss_method(loss_method),
         )
-        trace_csv_writer.writeheader()
-        trace_csv_file.flush()
+        trace_writer.writeheader()
+        trace_file.flush()
     
     print(f"Starting optimisation with {n_epochs} epochs...")
     print(f"Loss method: {loss_method}")
@@ -1035,21 +1077,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         )
     print(f"Initial optimisable values:")
     for key in opt_param_keys:
-        print(f"  {key}: {opt_params[key]:.3e}")
+        print(f"  {key}: {format_param(key, opt_params[key])}")
     
     # Log epoch 0: initial state (before any updates)
     initial_loss = float(initial_loss)
-    if csv_writer is not None:
+    if log_writer is not None:
         row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_param_keys:
             row[key] = float(opt_params[key])
         if 'log_omega' in opt_params:
             row['omega'] = float(jnp.exp(opt_params['log_omega']))
-        csv_writer.writerow(row)
-        csv_file.flush()
+        log_writer.writerow(row)
+        log_file.flush()
     
     # Log epoch 0 trace if trace file is requested
-    if trace_csv_writer is not None:
+    if trace_writer is not None:
         # Compute initial loss and trace
         (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_grad_fn(opt_params_norm)
         loss_trace = trace_tree_to_python(loss_trace_raw)
@@ -1057,8 +1099,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         
         # Build and write trace row for epoch 0
         trace_row = build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
-        trace_csv_writer.writerow(trace_row)
-        trace_csv_file.flush()
+        trace_writer.writerow(trace_row)
+        trace_file.flush()
     
     try:
         for epoch in range(1, n_epochs + 1):
@@ -1072,22 +1114,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             loss_trace = trace_tree_to_python(loss_trace_raw)
             loss_value = float(loss_value)
 
-            # jax.debug.print("norm_grads: {x}", x=norm_grads)
             # Compute gradient norm in normalised space for stopping criteria and logging.
             grad_norm = float(gradient_l2_norm(norm_grads))
 
             # LOG DEFERRED EPOCH: Log epoch (epoch - 1) using loss computed at current state (S(epoch-1))
             # (This is the loss AFTER applying update epoch-1, which is what we want for CSV epoch epoch-1)
             if epoch > 1:
-                if csv_writer is not None:
+                if log_writer is not None:
                     row = {'epoch': (epoch - 1), 'loss': loss_value}
                     # opt_params is still S(epoch-1) before this iteration's update
                     for key in opt_param_keys:
                         row[key] = float(opt_params[key])
                     if 'log_omega' in opt_params:
                         row['omega'] = float(jnp.exp(opt_params['log_omega']))
-                    csv_writer.writerow(row)
-                    csv_file.flush()
+                    log_writer.writerow(row)
+                    log_file.flush()
 
             # Perform Optax Adam step in normalised space (apply update).
             updates, opt_state = solver.update(norm_grads, opt_state, params=opt_params_norm)
@@ -1127,11 +1168,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Track loss (store the loss before the update for the loss_history)
             loss_history.append(loss_value)
 
-            if trace_csv_writer is not None and loss_trace is not None:
+            if trace_writer is not None and loss_trace is not None:
                 # Use the loss value from before the update for trace logging
                 trace_row = build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method)
-                trace_csv_writer.writerow(trace_row)
-                trace_csv_file.flush()
+                trace_writer.writerow(trace_row)
+                trace_file.flush()
         
             # Early stopping checks (use loss before update)
             if loss_value < best_loss:
@@ -1183,7 +1224,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         # After the loop, log the final epoch (epoch N or the epoch where we stopped)
         # At this point, opt_params contains the parameters from the end of the final iteration.
         # We need to compute the loss at these parameters to complete the CSV epoch logging.
-        if csv_writer is not None:
+        if log_writer is not None:
             loss_final, _= loss_from_normalised(opt_params_norm)
             loss_final = loss_final.astype(float)
             # epoch is the last epoch number from the loop (either n_epochs or early stopping)
@@ -1192,30 +1233,32 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 row[key] = float(opt_params[key])
             if 'log_omega' in opt_params:
                 row['omega'] = float(jnp.exp(opt_params['log_omega']))
-            csv_writer.writerow(row)
-            csv_file.flush()
+            log_writer.writerow(row)
+            log_file.flush()
         
         # restore canonical parameter order before returning
         ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
 
     finally:
         # Always close the CSV file if it was opened
-        if csv_file is not None:
-            csv_file.close()
+        if log_file is not None:
+            log_file.close()
             print(f"Optimisation log saved to: {log_file}")
-        if trace_csv_file is not None:
-            trace_csv_file.close()
+        if trace_file is not None:
+            trace_file.close()
             print(f"Matching trace log saved to: {trace_file}")
 
     print(f"Optimisation complete!")
     print(f"\nFinal loss: {best_loss:.6f}")
     print(f"Best-fit parameters found at epoch: {best_epoch}")
     for key in ordered_best_opt_params.keys():
-        print(f"  {key}: {ordered_best_opt_params[key]:.3e}")
+        print(f"  {key}: {format_param(key, ordered_best_opt_params[key])}")
 
     # compute errors on best-fit parameters
-    if output_uncertainties:
-        print("\nEstimating parameter uncertainties from Hessian...")
+    print("\nEstimating parameter uncertainties from Hessian...")
+    param_errors = None
+    cov_matrix = None
+    try:
         param_errors, cov_matrix = errors.estimate_parameter_errors(
             ordered_best_opt_params,
             fixed_params,
@@ -1228,10 +1271,34 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             normalisation_spec=normalisation_spec,
         )
         print("\nParameter uncertainties (1-sigma):")
-        for k, v in param_errors.items():
-            print(f"  {k}: {v}")
-    else:
-        param_errors = None
+        for key, value in param_errors.items():
+            print(f"  {key}: {format_param(key, value)}")
+    except Exception as e:
+        print(f"\nWarning: parameter uncertainty estimation failed: ({e}). Continuing without error estimates")
+
+    outputs.save_best_fit_params(ordered_best_opt_params, fixed_params, param_errors, save_folder=save_folder)
+
+    # now we will make some plots of the results
+    if save_folder is not None:
+        print("\nMaking diagnostic plots...")
+        outputs.plot_fitting_results(
+            ordered_best_opt_params,
+            opt_param_keys,
+            fixed_params,
+            data,
+            uncertainties,
+            distance_pc,
+            loss_history,
+            param_errors=param_errors,
+            cov_matrix=cov_matrix,
+            pc_coords=pc_coords,
+            v_lsr=v_lsr,
+            save_folder=save_folder,
+            show_plots=show_plots,
+        )
+
+
+
 
 
     return with_derived_omega(ordered_best_opt_params), loss_history, param_errors

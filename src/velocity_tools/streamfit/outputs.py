@@ -4,6 +4,9 @@ such as saving logs and plotting results.
 
 Last updated: 03-06-26
 '''
+import json
+import math
+from matplotlib.patches import Patch
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -14,6 +17,177 @@ import os
 
 from . import gradient_descent
 from . import extract_streamline
+
+def param_for_display(key, value):
+    """
+    Format parameter for display in output, with units. Notably:
+    - converts angles (theta0, phi0, inc, pa) from radians to degrees
+    - log_omega is displayed as omega in 1/s.
+    Returns (display_key, display_value, unit_str)
+    """
+    if key in gradient_descent.ANGLE_KEYS:
+        return key, math.degrees(float(value)), 'deg'
+    if key == 'log_omega':
+        return 'omega', math.exp(float(value)), '1/s'
+    unit = gradient_descent.DISPLAY_UNITS.get(key, '')
+    return key, float(value), unit
+
+
+def plot_fitting_results(
+    ordered_best_opt_params,
+    opt_param_keys,
+    fixed_params,
+    data,
+    uncertainties,
+    distance_pc,
+    loss_history,
+    param_errors,
+    cov_matrix,
+    pc_coords,
+    v_lsr,
+    save_folder,
+    show_plots=False
+):
+    """
+    Generate and save the followingbest-fit diagnostic plots to save_folderafter optimisation:
+    - loss_history.png          : loss vs epoch
+    - best_fit_morphology.png   : RA/Dec best fit
+    - best_fit_vel_radius.png   : velocity-radius best fit
+    - parameter_uncertainties.png  : sizes of error bars for each optimised param (if param_errors given)
+    - parameter_correlation_matrix.png : parameter correlation heatmap (if cov_matrix given)
+ 
+    Parameters
+    ----------
+    ordered_best_opt_params : dict, best-fit optimised parameters
+    opt_param_keys : list of str, list of optimised parameter names
+    fixed_params : dict, fixed model parameters.
+    data : tuple of arrays (ra_data, dec_data, v_data)
+    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
+    distance_pc : float
+    loss_history : list of float, loss value at each epoch.
+    param_errors : dict or None, 1-sigma parameter uncertainties keyed by parameter name, or None if uncertainty estimation failed
+    cov_matrix : array or None, parameter covariance matrix, or None if uncertainty estimation failed.
+    pc_coords : array-like or None, point cloud coordinates (3, N): [ra, dec, velocity]. Used as background
+    v_lsr : float or None, km/s
+    save_folder : str, directory to write figures into (created if absent).
+    show_plots : bool, whether to display plots (in addition to saving). Default False
+    """
+ 
+    ra_data, dec_data, v_data = data
+    ra_sigma, dec_sigma, v_sigma = uncertainties
+ 
+    # Loss
+    plot_loss(loss_history, save_folder=save_folder)
+ 
+    # Best-fit morphology and velocity-radius
+    best_opt_full_params, _, _ = gradient_descent.prepare_model_params(ordered_best_opt_params, fixed_params)
+    ra_best, dec_best, v_best, valid_mask_best, _err = gradient_descent.forward_model(best_opt_full_params, distance_pc)
+    valid_mask_best = valid_mask_best.astype(bool)
+ 
+    ra_best_interp, dec_best_interp, v_best_interp, valid_interp, model_keep, dmetric, _ = (
+        gradient_descent.checked_match_model_to_data_curve(
+            ra_best, dec_best, v_best, valid_mask_best,
+            jnp.asarray(ra_data, dtype=jnp.float64),
+            jnp.asarray(dec_data, dtype=jnp.float64),
+        )
+    )
+ 
+    plot_morphology(
+        ra_model=ra_best,
+        dec_model=dec_best,
+        ra_data=ra_data,
+        dec_data=dec_data,
+        ra_sigma=ra_sigma,
+        dec_sigma=dec_sigma,
+        ra_model_interp=ra_best_interp,
+        dec_model_interp=dec_best_interp,
+        valid=valid_interp,
+        pc_coords=pc_coords,
+        save_folder=save_folder,
+        save_name='best_fit_morphology',
+        show=show_plots,
+    )
+ 
+    plot_vel_radius(
+        ra_model=ra_best,
+        dec_model=dec_best,
+        v_model=v_best,
+        ra_data=ra_data,
+        dec_data=dec_data,
+        v_data=v_data,
+        ra_sigma=ra_sigma,
+        dec_sigma=dec_sigma,
+        v_sigma=v_sigma,
+        ra_model_interp=ra_best_interp,
+        dec_model_interp=dec_best_interp,
+        v_model_interp=v_best_interp,
+        valid=valid_interp,
+        pc_coords=pc_coords,
+        velocity_reference=v_lsr,
+        save_folder=save_folder,
+        save_name='best_fit_vel_radius',
+        show=show_plots,
+    )
+ 
+    # Uncertainty plots (only if error estimation succeeeded)
+    if param_errors is not None and cov_matrix is not None:
+        param_vals = np.array([float(ordered_best_opt_params[k]) for k in opt_param_keys], dtype=float)
+        param_errs = np.array([float(param_errors[k]) for k in opt_param_keys], dtype=float)
+        plot_param_uncertainties(opt_param_keys, param_vals, param_errs, save_folder=save_folder, show=show_plots)
+        plot_param_correlations(opt_param_keys, cov_matrix, save_folder=save_folder, show=show_plots)
+
+
+def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folder='sting_results'):
+    """
+    saves parameters from the best-fit epoch (lowest loss) and their uncertainties 
+    (when available, fixed params will not have uncertainties) to a JSON
+    """
+    output_path = os.path.join(save_folder, 'best_fit_params.json')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+ 
+    # parameters that were optimised
+    optimised_section = {}
+    for raw_key, raw_val in best_opt_params.items():
+        display_key, display_val, unit = param_for_display(raw_key, raw_val)
+        entry = {
+            'value': display_val,
+            'unit': unit,
+        }
+        if param_errors is not None and raw_key in param_errors:
+            # same conversions for the errors as for the values
+            # for log_omega: propagate via omega * sigma_log_omega).
+            raw_err = float(param_errors[raw_key])
+            if raw_key in gradient_descent.ANGLE_KEYS:
+                display_err = math.degrees(raw_err)
+            elif raw_key == 'log_omega':
+                # sigma_omega = omega * sigma_log_omega
+                display_err = display_val * raw_err
+            else:
+                display_err = raw_err
+            entry['sigma'] = display_err
+        optimised_section[display_key] = entry
+ 
+    # parameters that were fixed (no uncertainties)
+    fixed_section = {}
+    for raw_key, raw_val in fixed_params.items():
+        if raw_val is None:
+            fixed_section[raw_key] = {
+                'value': None, 
+                'unit': gradient_descent.DISPLAY_UNITS.get(raw_key, '')}
+            continue
+        display_key, display_val, unit = param_for_display(raw_key, raw_val)
+        fixed_section[display_key] = {
+            'value': display_val,
+            'unit': unit,
+        }
+ 
+    output = {
+        'optimised_parameters': optimised_section,
+        'fixed_parameters': fixed_section,
+    }
+ 
+    with open(output_path, 'w') as file:
+        json.dump(output, file, indent=4)
 
 
 def _ensure_clean_dir(path):
@@ -31,17 +205,17 @@ def _ensure_clean_dir(path):
                 pass
 
 
-def _create_video_from_images(output_dir, input_pattern, output_name, fps=5):
+def create_video_from_images(save_folder, input_pattern, output_name, fps=5):
     """Call ffmpeg to make a video from numbered image frames.
-
-    This function is tolerant of missing ffmpeg and surfaces a readable message.
+    If you don't have ffmpeg, will print an error message instead of crashing
     """
     import subprocess
 
-    output_video = os.path.join(output_dir, output_name)
+    output_video = os.path.join(save_folder, output_name)
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
+        "-loglevel", "error",
         "-framerate", str(fps),
         "-i", input_pattern,
         "-vf",
@@ -55,10 +229,13 @@ def _create_video_from_images(output_dir, input_pattern, output_name, fps=5):
     except subprocess.CalledProcessError as e:
         print(f"Error creating video: {e}")
     except FileNotFoundError:
-        print("ffmpeg not found. Please install ffmpeg to create the video.")
+        print(
+            "ffmpeg not found. Please install ffmpeg to create the video.\n"
+            "To install ffmpeg: https://ffmpeg.org/download.html "
+            "or (on Mac) `brew install ffmpeg`"
+        )
 
-
-def plot_loss(loss_history, save_folder=None):
+def plot_loss(loss_history, save_folder='sting_results'):
     '''Plot loss as a function of epochs'''
     # plot loss vs epoch nicely
     # matplotlib serif font
@@ -75,20 +252,42 @@ def plot_loss(loss_history, save_folder=None):
     plt.yscale('log')
     plt.grid(True, alpha=0.5)
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/loss_history.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
 
-def find_spikes(loss, threshold=0.1):
-    '''Identify epochs where the loss increases by more than a certain percentage compared to adjacent epochs.'''
-    spikes = []
-    for i in range(1, len(loss) - 1):
-        if loss[i] > loss[i - 1] * (1 + threshold) and loss[i] > loss[i + 1] * (1 + threshold):
-            spikes.append(i)
-    return spikes
+
+def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, figsize=(6.5, 7)):
+    """
+    Pre-make the background image of the point cloud and metric boundaries for the morphology plots.
+    This function is caleld by plot_morphology_by_epoch
+ 
+    Returns
+    -------
+    bg_rgba : ndarray, shape (H, W, 4)
+        RGBA image of the background at the target figure resolution.
+    extent : list [left, right, bottom, top]
+        Data-space extent to pass to ax.imshow so the image aligns correctly.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    pc_coords_np = np.asarray(pc_coords, dtype=float)
+    ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color='gray', alpha=0.3)
+    if metric_boundaries is not None:
+        extract_streamline.plot_metric_boundaries(ax, pc_coords_np, metric_boundaries,
+                                                  color='gray', linewidth=1, alpha=0.3)
+    ax.set_xlim(ra_lim)
+    ax.set_ylim(dec_lim)
+    ax.axis('off')
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    fig.canvas.draw()
+    buffer = fig.canvas.buffer_rgba()
+    bg_rgba = np.asarray(buffer).copy()
+    plt.close(fig)
+    extent = [ra_lim[0], ra_lim[1], dec_lim[0], dec_lim[1]]
+    return bg_rgba, extent
 
 def plot_morphology_by_epoch(
-    optimisation_log,
     param_names,
     gradient_descent,
     fixed_params,
@@ -99,12 +298,18 @@ def plot_morphology_by_epoch(
     dec_sigma=None,
     pc_coords=None,
     n_points=None,
-    output_dir="streamfit_test_output/morphology_epochs",
+    save_folder="sting_results",
     make_video=False
 ):
     """
-    Create and save one streamline morphology plot per optimisation epoch, in output_dir
+    Create and save one streamline morphology plot per optimisation epoch, in save_folder/epochs/morphology,
+    and optionally compile into a video
     """
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
 
     epochs = optimisation_log['epoch'].values
 
@@ -131,33 +336,27 @@ def plot_morphology_by_epoch(
             dict(
                 epoch=epoch,
                 opt_params_epoch=opt_params_epoch,
-                ra_model=ra_model,
-                dec_model=dec_model,
-                ra_model_interp=ra_model_interp,
-                dec_model_interp=dec_model_interp,
-                valid=valid,
-                model_keep=model_keep,
+                ra_model=np.asarray(ra_model),
+                dec_model=np.asarray(dec_model),
+                ra_model_interp=np.asarray(ra_model_interp),
+                dec_model_interp=np.asarray(dec_model_interp),
+                valid=np.asarray(valid),
+                model_keep=np.asarray(model_keep),
             )
         )
 
-    # get constant axis limits from the whole collection of epochs
-    all_ra = []
-    all_dec = []
-
-    for epoch_data in epoch_models:
-        all_ra.extend(epoch_data['ra_model'])
-        all_dec.extend(epoch_data['dec_model'])
-
-    # include observational data
-    all_ra.extend(ra_data)
-    all_dec.extend(dec_data)
-    # include point cloud
-    all_ra.extend(pc_coords[0])
-    all_dec.extend(pc_coords[1])
-
-    all_ra = jnp.array(all_ra)
-    all_dec = jnp.array(all_dec)
-    mask = ~jnp.isnan(all_ra) & ~jnp.isnan(all_dec)
+    # get constant axis limits
+    all_ra = np.concatenate([
+        *[e['ra_model'] for e in epoch_models],
+        np.asarray(ra_data),
+        np.asarray(pc_coords[0]),
+    ])
+    all_dec = np.concatenate([
+        *[e['dec_model'] for e in epoch_models],
+        np.asarray(dec_data),
+        np.asarray(pc_coords[1]),
+    ])
+    mask = np.isfinite(all_ra) & np.isfinite(all_dec)
     all_ra = all_ra[mask]
     all_dec = all_dec[mask]
 
@@ -168,10 +367,14 @@ def plot_morphology_by_epoch(
     dec_lim = (all_dec.min() - pad_dec, all_dec.max() + pad_dec)
 
     # prepare clean output folder for epoch frames
+    output_dir = os.path.join(save_folder, "epochs", "morphology")
     _ensure_clean_dir(output_dir)
 
     partitions = extract_streamline.get_metric_partitions(pc_coords, n_points)
     metric_boundaries, trace = extract_streamline.sample_metric_boundaries(pc_coords, partitions)
+
+    # pre-make the background image (point cloud and metric boundaries)
+    bg_rgba, bg_extent = make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim)
 
     # plot and save for each epoch
     for model in epoch_models:
@@ -185,8 +388,8 @@ def plot_morphology_by_epoch(
             ra_model_interp=model["ra_model_interp"],
             dec_model_interp=model["dec_model_interp"],
             valid=model["valid"],
-            pc_coords=pc_coords,
-            metric_boundaries=metric_boundaries,
+            bg_rgba=bg_rgba,
+            bg_extent=bg_extent,
             title=f"Epoch: {int(model['epoch'])}",
             xlim=ra_lim,
             ylim=dec_lim,
@@ -197,7 +400,7 @@ def plot_morphology_by_epoch(
 
     if make_video:
         input_pattern = os.path.join(output_dir, "morphology_epoch_%03d.png")
-        _create_video_from_images(output_dir, input_pattern, "streamline_morphology_evolution.mp4", fps=5)
+        create_video_from_images(output_dir, input_pattern, "streamline_morphology_evolution.mp4", fps=5)
 
 def plot_morphology(
     ra_model=None,
@@ -212,31 +415,59 @@ def plot_morphology(
     by_eye=None,
     pc_coords=None,
     metric_boundaries=None,
+    bg_rgba=None,
+    bg_extent=None,
     title=None,
     xlim=None,
     ylim=None,
     legend_loc='lower right',
-    save_folder=None,
+    save_folder='sting_results',
     save_name='streamline_morphology',
     show=True,
 ):
-    '''Plot offsets in RA/Dec. Optionally include: model, model points, data points, best fit, background overlay, metric partitions.'''
+    '''Plot offsets in RA/Dec. Optionally include: model, model points, data points, best fit, background overlay, metric partitions.
+    
+    For a single plot, pass pc_corords and metric_boundaries directly. For per-epoch plotting use plot_morphology_by_epoch, 
+    which will call this function and pass pre-rendered background images for speed.'''
 
 
     fig, ax = plt.subplots(figsize=(6.5, 7))
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
 
+        # Static background: prefer pre-rendered image, fall back to live drawing
+    if bg_rgba is not None and bg_extent is not None:
+        ax.imshow(
+            bg_rgba,
+            extent=bg_extent,
+            aspect='auto',
+            origin='upper',
+            zorder=1,
+        )
+    elif pc_coords is not None:
+        pc_coords_np = np.asarray(pc_coords, dtype=float)
+        ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color='gray',
+                   alpha=0.3, label='Point cloud', zorder=4)
+        if metric_boundaries is not None:
+            ax_limits = ax.get_xlim(), ax.get_ylim()
+            extract_streamline.plot_metric_boundaries(
+                ax, pc_coords_np, metric_boundaries,
+                color='gray', linewidth=1, alpha=0.3,
+            )
+            ax.set_xlim(ax_limits[0])
+            ax.set_ylim(ax_limits[1])
+ 
+
     # model curve if given
     if ra_model is not None and dec_model is not None:
-        ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='Best-fit', zorder=7)
+        ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='STING', zorder=7)
 
     # model points if given
     if ra_model_interp is not None and dec_model_interp is not None and valid is not None:
         if valid is not None:
             ax.scatter(
-                np.asarray(ra_model_interp, dtype=float)[valid],
-                np.asarray(dec_model_interp, dtype=float)[valid],
+                ra_model_interp[valid],
+                dec_model_interp[valid],
                 s=25,
                 color='blue',
                 zorder=7,
@@ -256,14 +487,12 @@ def plot_morphology(
 
     # data points streamline if given
     if ra_data is not None and dec_data is not None:
-        ra_data = np.asarray(ra_data, dtype=float)
-        dec_data = np.asarray(dec_data, dtype=float)
         if ra_sigma is not None and dec_sigma is not None:
             ax.errorbar(
                 ra_data,
                 dec_data,
-                xerr=np.asarray(ra_sigma, dtype=float),
-                yerr=np.asarray(dec_sigma, dtype=float),
+                xerr=ra_sigma,
+                yerr=dec_sigma,
                 fmt='o-',
                 label='Extracted 1D Streamline',
                 color='red',
@@ -278,49 +507,11 @@ def plot_morphology(
                 color='red',
                 zorder=5,
             )
-        if valid is not None:
-            ax.scatter(
-                ra_data[valid], dec_data[valid],
-                s=45, facecolor='none', edgecolor='cyan', linewidth=1.2, zorder=6,
-                label='Retained data',
-            )
+
 
     ax.scatter(0, 0, marker='*', s=100, color='yellow', edgecolor='black', zorder=10)
     ax.set_xlabel('RA Offset (arcsec)')
     ax.set_ylabel('Dec Offset (arcsec)')
-
-    if pc_coords is not None:
-        pc_coords = np.asarray(pc_coords, dtype=float)
-        ax.scatter(
-            pc_coords[0],
-            pc_coords[1],
-            s=1,
-            color='gray',
-            alpha=0.3,
-            label='Point cloud',
-            zorder=4,
-        )
-
-        if metric_boundaries is not None:
-            # get current axes limits
-            ax_limits = ax.get_xlim(), ax.get_ylim()
-            # ax.set_facecolor('lightgrey')
-
-            # for partition_radius in partitions:
-            #     circle = plt.Circle((0, 0), partition_radius, facecolor='white', edgecolor='none', zorder=1)
-            #     ax.add_patch(circle)
-
-            extract_streamline.plot_metric_boundaries(
-                ax,
-                pc_coords,
-                metric_boundaries,
-                color='gray',
-                linewidth=1,
-                alpha=0.3,
-            )
-            # restore axes limits
-            ax.set_xlim(ax_limits[0])
-            ax.set_ylim(ax_limits[1])
 
     if xlim is not None:
         ax.set_xlim(xlim)
@@ -330,13 +521,15 @@ def plot_morphology(
     ax.set_title(title)
     ax.legend(loc=legend_loc)
     if save_folder is not None:
+        # make dir if it doesn't exist
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    elif show is not False:
+    if show:
         plt.show()
+    else:
+        plt.close(fig)
 
 def plot_ra_vel_by_epoch(
-    optimisation_log,
     param_names,
     gradient_descent,
     fixed_params,
@@ -347,12 +540,17 @@ def plot_ra_vel_by_epoch(
     ra_sigma=None,
     v_sigma=None,
     pc_coords=None,
-    output_dir="streamfit_test_output/ra_vel_epochs",
+    save_folder="sting_results",
     make_video=False,
 ):
     """
     Create RA–velocity plots for every epoch
     """
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
 
     epochs = optimisation_log['epoch'].values
 
@@ -395,6 +593,7 @@ def plot_ra_vel_by_epoch(
     ralim = (np.nanmin(all_ra), np.nanmax(all_ra))
 
     # make clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "ra_vel")
     _ensure_clean_dir(output_dir)
 
 
@@ -415,15 +614,13 @@ def plot_ra_vel_by_epoch(
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
             ralim=ralim,
-            save_path=os.path.join(
-                output_dir,
-                f"ra_vel_epoch_{int(model['epoch']):03d}.png"
-            ),
+            save_folder=output_dir,
+            save_name=f"ra_vel_epoch_{int(model['epoch']):03d}",
         )
 
     if make_video:
         input_pattern = os.path.join(output_dir, "ra_vel_epoch_%03d.png")
-        _create_video_from_images(output_dir, input_pattern, "streamline_ra_vel_evolution.mp4", fps=5)
+        create_video_from_images(output_dir, input_pattern, "streamline_ra_vel_evolution.mp4", fps=5)
         
 
 def plot_ra_vel(
@@ -443,7 +640,8 @@ def plot_ra_vel(
     vlim=None,
     ralim=None,
     legend_loc='lower right',
-    save_path=None,
+    save_folder='sting_results',
+    save_name='streamline_ra_vel',
     show=False,
 ):
     ra_model = np.asarray(ra_model, dtype=float)
@@ -474,10 +672,6 @@ def plot_ra_vel(
     if ra_model_interp is not None and v_model_interp is not None and valid is not None:
         ax.scatter(np.asarray(ra_model_interp)[valid], np.asarray(v_model_interp)[valid], s=25, color='blue', zorder=5, label='Model at data positions')
 
-    # selected data points
-    if ra_data is not None and v_data is not None and valid is not None:
-        ax.scatter(np.asarray(ra_data)[valid], np.asarray(v_data)[valid], s=45, facecolor='none', edgecolor='cyan', linewidth=1.2, zorder=6, label='Retained data')
-
     ax.set_xlabel("RA Offset (arcsec)")
     ax.set_ylabel("Velocity (km/s)")
     ax.set_title(title or "RA vs Velocity")
@@ -491,11 +685,11 @@ def plot_ra_vel(
     ax.invert_xaxis()
 
     ax.legend(loc=legend_loc)
-
-    if save_path is not None:
+    if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = os.path.join(save_folder, f"{save_name}.png")
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
-        plt.close(fig)
-    elif show:
+    if show:
         plt.show()
     else:
         plt.close(fig)
@@ -503,7 +697,6 @@ def plot_ra_vel(
 
 #########
 def plot_dec_vel_by_epoch(
-    optimisation_log,
     param_names,
     gradient_descent,
     fixed_params,
@@ -514,12 +707,17 @@ def plot_dec_vel_by_epoch(
     dec_sigma=None,
     v_sigma=None,
     pc_coords=None,
-    output_dir="streamfit_test_output/dec_vel_epochs",
+    save_folder="sting_results",
     make_video=False,
 ):
     """
     Create DEC–velocity plots for every epoch
     """
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
 
     epochs = optimisation_log['epoch'].values
 
@@ -564,6 +762,7 @@ def plot_dec_vel_by_epoch(
     declim = (np.nanmin(all_dec), np.nanmax(all_dec))
 
     # make clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "dec_vel")
     _ensure_clean_dir(output_dir)
 
 
@@ -584,15 +783,13 @@ def plot_dec_vel_by_epoch(
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
             declim=declim,
-            save_path=os.path.join(
-                output_dir,
-                f"dec_vel_epoch_{int(model['epoch']):03d}.png"
-            ),
+            save_folder = output_dir,
+            save_name = f"dec_vel_epoch_{int(model['epoch']):03d}",
         )
 
     if make_video:
         input_pattern = os.path.join(output_dir, "dec_vel_epoch_%03d.png")
-        _create_video_from_images(output_dir, input_pattern, "streamline_dec_vel_evolution.mp4", fps=5)
+        create_video_from_images(output_dir, input_pattern, "streamline_dec_vel_evolution.mp4", fps=5)
         
 
 def plot_dec_vel(
@@ -612,7 +809,8 @@ def plot_dec_vel(
     vlim=None,
     declim=None,
     legend_loc='lower right',
-    save_path=None,
+    save_folder='sting_results',
+    save_name='streamline_dec_vel',
     show=False,
 ):
     dec_model = np.asarray(dec_model, dtype=float)
@@ -644,10 +842,6 @@ def plot_dec_vel(
     if dec_model_interp is not None and v_model_interp is not None and valid is not None:
         ax.scatter(np.asarray(dec_model_interp)[valid], np.asarray(v_model_interp)[valid], s=25, color='blue', zorder=5, label='Model at data positions')
 
-    # selected data points
-    if dec_data is not None and v_data is not None and valid is not None:
-        ax.scatter(np.asarray(dec_data)[valid], np.asarray(v_data)[valid], s=45, facecolor='none', edgecolor='cyan', linewidth=1.2, zorder=6, label='Retained data')
-
     ax.set_xlabel("DEC Offset (arcsec)")
     ax.set_ylabel("Velocity (km/s)")
     ax.set_title(title or "DEC vs Velocity")
@@ -659,7 +853,9 @@ def plot_dec_vel(
 
     ax.legend(loc=legend_loc)
 
-    if save_path is not None:
+    if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = os.path.join(save_folder, f"{save_name}.png")
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
         plt.close(fig)
     elif show:
@@ -720,6 +916,7 @@ def build_velocity_radius_kde(
     if ymax is None:
         ymax = float(np.nanmax(vlos) + 1)
 
+
     xx, yy = np.mgrid[xmin:xmax:complex(grid_size), ymin:ymax:complex(grid_size)]
     positions = np.vstack([xx.ravel(), yy.ravel()])
     values = np.vstack([rproj, vlos])
@@ -734,6 +931,7 @@ def build_velocity_radius_kde(
         sigma_levels = np.arange(1.0, 2.1, 0.5)
     sigma_levels = np.asarray(sigma_levels, dtype=float)
     levels = np.append(np.exp(-0.5 * sigma_levels**2)[::-1], [1.0])
+    kde_levels = np.append(np.exp(-0.5 * np.arange(1.0, 2.1, 0.5)**2)[::-1], [1.0])
 
     return {
         "xx": xx,
@@ -760,6 +958,8 @@ def plot_vel_radius(
     dec_model_interp=None,
     v_model_interp=None,
     valid=None,
+    pc_coords=None,
+    by_eye=None,
     model_keep=None,
     kde_background=None,
     velocity_reference=None,
@@ -767,7 +967,8 @@ def plot_vel_radius(
     xlim=None,
     ylim=None,
     legend_loc='lower right',
-    save_path=None,
+    save_folder='sting_results',
+    save_name=None,
     show=False,
 ):
     """Plot velocity vs projected radius for one model (optionally with KDE background)."""
@@ -786,6 +987,18 @@ def plot_vel_radius(
     order_model = np.argsort(rproj_model)
 
     fig, ax = plt.subplots(figsize=(6.5 * 1.3, 4 * 1.3))
+    data_handle = None
+    model_handle = None
+    background_handle = None
+    by_eye_handle = None
+
+    if kde_background is None and pc_coords is not None:
+        # make the kde background
+        kde_background = build_velocity_radius_kde(
+            ra_data=ra_data,
+            dec_data=dec_data,
+            vlos_data=v_data,
+        )
 
     if kde_background is not None:
         ax.contourf(
@@ -797,6 +1010,12 @@ def plot_vel_radius(
             vmin=0,
             vmax=1.2,
             zorder=1,
+        )
+
+        background_handle = Patch(
+            facecolor='lightgray',
+            edgecolor='none',
+            label='Data KDE',
         )
 
     # Central source marker in this projection (r=0, v=v_lsr)
@@ -812,7 +1031,6 @@ def plot_vel_radius(
             label='Central Source',
         )
 
-    data_handle = None
     if ra_data is not None and dec_data is not None and v_data is not None:
         ra_data = np.asarray(ra_data, dtype=float)
         dec_data = np.asarray(dec_data, dtype=float)
@@ -853,7 +1071,7 @@ def plot_vel_radius(
         v_model[order_model],
         color='blue',
         linewidth=2,
-        label='Model Streamline',
+        label='STING',
         zorder=7,
     )
 
@@ -886,6 +1104,21 @@ def plot_vel_radius(
             zorder=4,
         )
 
+    if by_eye is not None:
+        ra_by_eye, dec_by_eye, v_by_eye = by_eye
+        ra_by_eye = np.asarray(ra_by_eye, dtype=float)
+        dec_by_eye = np.asarray(dec_by_eye, dtype=float)
+        v_by_eye = np.asarray(v_by_eye, dtype=float)
+        rproj_by_eye = np.sqrt(ra_by_eye**2 + dec_by_eye**2)
+        by_eye_handle, = ax.plot(
+            rproj_by_eye,
+            v_by_eye,
+            color='tab:green',
+            linewidth=2,
+            label='By-eye',
+            zorder=9,
+        )
+
     ax.set_xlabel('Projected Distance from Source (arcsec)')
     ax.set_ylabel('Velocity (km/s)')
     ax.set_title(title or 'Velocity vs Projected Radius')
@@ -900,22 +1133,23 @@ def plot_vel_radius(
     elif kde_background is not None:
         ax.set_ylim(kde_background["ylim"])
 
-    if data_handle is not None:
-        ax.legend(handles=[data_handle, model_handle], loc=legend_loc)
+    all_handles = [data_handle, model_handle, by_eye_handle, background_handle]
+    handles = [h for h in all_handles if h is not None]
+    if handles:
+        ax.legend(handles=handles, loc=legend_loc)
     else:
         ax.legend(loc=legend_loc)
 
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches='tight', dpi=300)
-        plt.close(fig)
-    elif show:
+    if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
+        plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
+    if show:
         plt.show()
     else:
         plt.close(fig)
 
 
 def plot_vel_radius_by_epoch(
-    optimisation_log,
     param_names,
     gradient_descent,
     fixed_params,
@@ -927,14 +1161,33 @@ def plot_vel_radius_by_epoch(
     ra_sigma=None,
     dec_sigma=None,
     v_sigma=None,
-    kde_background=None,
+    pc_coords=None,
+    grid_size=100,
+    levels=None,
     velocity_reference=None,
-    output_dir="streamfit_test_output/vel_radius_epochs",
+    save_folder="sting_results",
     make_video=False,
 ):
     """Create velocity vs projected radius plots for every epoch."""
+
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
+    
     epochs = optimisation_log['epoch'].values
     epoch_models = []
+
+    kde_background = None
+    if pc_coords is not None:
+        kde_background = build_velocity_radius_kde(
+            ra_data=ra_data,
+            dec_data=dec_data,
+            vlos_data=v_data,
+            grid_size=grid_size,
+            sigma_levels=levels,
+        )
 
     for idx, epoch in enumerate(epochs):
         row = optimisation_log.iloc[idx]
@@ -991,6 +1244,8 @@ def plot_vel_radius_by_epoch(
     xlim = (np.nanmin(all_rproj), np.nanmax(all_rproj))
     ylim = (np.nanmin(all_v), np.nanmax(all_v))
 
+    # make or clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "vel_radius")
     _ensure_clean_dir(output_dir)
 
     for model in epoch_models:
@@ -1014,24 +1269,21 @@ def plot_vel_radius_by_epoch(
             title=f"Epoch: {int(model['epoch'])}",
             xlim=xlim,
             ylim=ylim,
-            save_path=os.path.join(
-                output_dir,
-                f"vel_radius_epoch_{int(model['epoch']):03d}.png",
-            ),
+            save_folder=output_dir,
+            save_name=f"vel_radius_epoch_{int(model['epoch']):03d}",
         )
 
     if make_video:
         input_pattern = os.path.join(output_dir, "vel_radius_epoch_%03d.png")
-        _create_video_from_images(
+        create_video_from_images(
             output_dir,
             input_pattern,
             "streamline_vel_radius_evolution.mp4",
             fps=5,
         )
 
-    return epoch_models
 
-def plot_param_uncertainties(opt_keys, opt_params, opt_sigmas, save_folder=None):
+def plot_param_uncertainties(opt_keys, opt_params, opt_sigmas, save_folder=None, show=False):
     eps = 1e-12
     norm_errs = np.abs(opt_sigmas / (opt_params + eps))
     
@@ -1050,11 +1302,14 @@ def plot_param_uncertainties(opt_keys, opt_params, opt_sigmas, save_folder=None)
     ax.grid(True, alpha=0.25)
     plt.tight_layout()
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/parameter_uncertainties.png', dpi=300, bbox_inches='tight')
-    else:
+    if show:
         plt.show()
+    else:
+        plt.close(fig)
 
-def plot_param_correlations(param_names, covariance, annotate=True, save_folder=None):
+def plot_param_correlations(param_names, covariance, annotate=True, save_folder=None, show=False):
     '''
     Plot a parameter correlation matrix derived from the covariance matrix, as a heatmpa.
     
@@ -1104,10 +1359,12 @@ def plot_param_correlations(param_names, covariance, annotate=True, save_folder=
 
     plt.tight_layout()
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/parameter_correlation_matrix.png', dpi=300, bbox_inches='tight')
-    else:
+    if show:
         plt.show()
-
+    else:
+        plt.close(fig)
 
 def plot_streamline_covariance_samples(streamline_samples,
                                       best_opt_params,
@@ -1200,6 +1457,7 @@ def plot_streamline_covariance_samples(streamline_samples,
     plt.tight_layout()
 
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/streamline_covariance_samples.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
@@ -1277,13 +1535,19 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
 
     return samples
 
-def plot_param_optimisation_history(
-    optimisation_log,
-    trace_log,
-    trace_component_cols,
-    spikes,
-    save_folder=None
-):
+def plot_param_optimisation_history(save_folder='sting_results'):
+    '''Plot the history of parameter optimisation from logs saved during optimisation.
+    save_folder should be the same as the one used during optimisation, 
+    and should contain "optimisation_log.csv" and optionally "optimisation_trace.csv"'''
+    
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
+
+    trace_loss_method, trace_component_cols = detect_trace_loss_method(trace_log)
+
     epochs = optimisation_log["epoch"].values
     loss = optimisation_log["loss"].values
 
@@ -1292,9 +1556,9 @@ def plot_param_optimisation_history(
         if c not in ("epoch", "loss"):
             param_names.append(c)
 
-    fig, axes = plt.subplots(len(param_names) + 2, 1, figsize=(8, 3 * (len(param_names) + 1)), sharex=True)
+    fig, axes = plt.subplots(len(param_names) + 1, 1, figsize=(8, 2 * (len(param_names) + 1)), sharex=True)
 
-    plot_loss_panel(axes[0], epochs, loss, spikes)
+    plot_loss_panel(axes[0], epochs, loss)
 
     for col in trace_component_cols:
         axes[1].plot(epochs, trace_log[col].values, label=col)
@@ -1305,18 +1569,26 @@ def plot_param_optimisation_history(
     for ax, param in zip(axes[2:], param_names):
         values = optimisation_log[param].values
         ax.plot(epochs, values)
-        ax.scatter(epochs[spikes], values[spikes], color="orange")
         ax.set_ylabel(param)
         ax.grid(True)
 
     plt.tight_layout()
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/parameter_optimisation_history.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
 
 
-def plot_trace_diagnostics(optimisation_log, trace_log, spikes, save_folder=None):
+def plot_trace_diagnostics(save_folder='sting_results'):
+    '''Plot diagnostics from the optimisation trace log, if available. '''
+
+    try:
+        optimisation_log, trace_log = load_optimisation_logs(save_folder)
+    except FileNotFoundError:
+        print(f"Error: Could not find 'optimisation_log.csv' and/or 'optimisation_trace.csv' in {save_folder}")
+        return
+
     epochs = optimisation_log["epoch"].values
     loss = optimisation_log["loss"].values
 
@@ -1325,32 +1597,28 @@ def plot_trace_diagnostics(optimisation_log, trace_log, spikes, save_folder=None
         if c not in ("epoch", "loss"):
             trace_cols.append(c)
 
-    fig, axes = plt.subplots(len(trace_cols) + 1, 1, figsize=(10, 2.5 * (len(trace_cols) + 1)), sharex=True)
+    fig, axes = plt.subplots(len(trace_cols) + 1, 1, figsize=(8, 2 * (len(trace_cols) + 1)), sharex=True)
 
-    plot_loss_panel(axes[0], epochs, loss, spikes)
-
-    spike_epochs = epochs[spikes]
+    plot_loss_panel(axes[0], epochs, loss)
 
     for ax, col in zip(axes[1:], trace_cols):
         ax.plot(trace_log["epoch"], trace_log[col])
-        mask = (trace_log["epoch"].astype(int).isin(spike_epochs))
-        ax.scatter(trace_log.loc[mask, "epoch"], trace_log.loc[mask, col], color="orange")
         ax.set_ylabel(col)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     if save_folder is not None:
+        os.makedirs(save_folder, exist_ok=True)
         plt.savefig(f'{save_folder}/trace_diagnostics.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
 
-def plot_loss_panel(ax, epochs, loss, spikes):
+def plot_loss_panel(ax, epochs, loss):
     lowest_loss = np.min(loss)
     best_idx = np.argmin(loss)
     best_epoch = epochs[best_idx]
     ax.plot(epochs, loss, color="black")
     ax.scatter(best_epoch, lowest_loss, color="green", label=f"Best Epoch: {best_epoch}")
-    ax.scatter(epochs[spikes], loss[spikes], color="orange", label="Spikes")
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
     ax.legend()

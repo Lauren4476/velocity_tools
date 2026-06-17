@@ -382,18 +382,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
 
     rotation_matrix = build_rotation_matrix(inc, pa)
 
-    # jax.debug.print("-----------")
-    # jax.debug.print("mass: {}", mass)
-    # jax.debug.print("r0: {}", r0)
-    # jax.debug.print("theta0 (degrees): {}", jnp.degrees(theta0))
-    # jax.debug.print("phi0 (degrees): {}", jnp.degrees(phi0))
-    # jax.debug.print("omega: {}", omega)
-    # jax.debug.print("v_r0: {}", v_r0)
-
-    # check that centrifugal radius is smaller than initial radius of streamline, 
-    # otherwise the model is not valid
-    # jax.debug.print("rc: {}", rc)
-    # jax.debug.print("r0: {}", r0)
     check_rc_r0(rc, r0)
 
     # find the smallest radius for calculation
@@ -410,7 +398,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     # the valid_mask will later be used to mask out invalid points. currently these values are zero
     orb_ang, theta, phi, valid_mask = stream_line(r, r_mask, stream_state=stream_state, theta0=theta0, phi0=phi0)
     v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0)
-    # jax.debug.print("valid_mask: {}", valid_mask)
     # prepend initial positions and velocities at r0
     valid_mask_full = jnp.concatenate((jnp.asarray([True], dtype=bool), valid_mask))
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
