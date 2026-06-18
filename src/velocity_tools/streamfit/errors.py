@@ -5,7 +5,6 @@
 
 # So we put the old (non-jit) versions of the relevant functions here, and use them in the uncertainty estimation.
 
-
 def estimate_parameter_errors(
     best_opt_params,
     fixed_params,
@@ -61,6 +60,7 @@ def estimate_parameter_errors(
         )
         return chi2_total
 
+    
     # Check gradient magnitude at best-fit parameters in normalised space.
     if gradient_tol is not None:
         if normalisation_spec is None:
@@ -963,8 +963,6 @@ def rotate_xyz(x, y, z, rotation_matrix):
     return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
 
-# Astropy wrapper - handles astropy units and calls jax-compatible maths
-# TODO: lauren you need to make this jax compatible
 def xyz_stream(mass=0.5, r0=1e4, theta0=30,
                phi0=15, omega=1e-14, v_r0=0,
                inc=0, pa=0, rmin=None, deltar=1):
@@ -1009,10 +1007,9 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
 
     rotation_matrix = build_rotation_matrix(inc, pa)
 
-    if rc > r0:
-        # early stop if centrifugal radius is larger than r0
-        # TODO: ideally centrifugal radius should be fed in as the minimum of r0
-        raise ValueError('Centrifugal radius is larger than start of streamline')
+
+    # checkify.check(rc <= r0, "Centrifugal radius is larger that start of streamline.")
+
     r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
     # r is values internal to the initial radius r0 for computation
     r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)

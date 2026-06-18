@@ -152,8 +152,16 @@ def to_float64(value):
     return jnp.asarray(value, dtype=jnp.float64)
 
 
-
-
+def get_checkify_error_message(err):
+    """Extract human-readable error message from a checkify.Error if possible,
+    or None if it doesn't contain anything"""
+    if hasattr(err, 'get'):
+        return err.get()
+    try:
+        err.throw()
+    except Exception as e:
+        return str(e)
+    return None
 
 def make_data_tuple_float64(values):
     """Convert tuple/list of arrays to float64 arrays"""
@@ -835,7 +843,7 @@ def chi2_loss(
         'matching': matching_trace,
         'loss_method': loss_method,
     }
-    return chi2_total, loss_trace
+    return chi2_total, loss_trace, err
 
 
 
@@ -983,22 +991,33 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     def loss_from_normalised(norm_opt_params):
         physical_opt_params = denormalise_opt_params(norm_opt_params, normalisation_spec)
         model_params = {**fixed_params_for_core, **physical_opt_params}
-        chi2_total, loss_trace = chi2_loss(
+        chi2_total, loss_trace, err = chi2_loss(
             model_params,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
             npoints=npoints,
         )
-        return chi2_total, loss_trace
+        return chi2_total, (loss_trace, err)
 
 
     # Create gradient functions in normalised space.
     loss_and_grad_fn = value_and_grad(loss_from_normalised, has_aux=True)
+
     
     # Track loss history
     loss_history = []
-    initial_loss, _ = loss_from_normalised(opt_params_norm)
+    initial_loss, (_, initial_err) = loss_from_normalised(opt_params_norm)
+
+    # raise any initial errors
+    initial_error_message = get_checkify_error_message(initial_err)
+    if initial_error_message is not None:
+        raise ValueError(
+            f"Initial loss computation failed with error: {initial_error_message}. "
+            "Adjust initial parameter guess or bounds such that the centrifugal radius "
+            "is smaller than r0 before starting the optimisation."
+        )
+    
     initial_loss = float(initial_loss)
     loss_history.append(initial_loss) # 'epoch 0' loss (initial state, before any updates)
     best_loss = initial_loss
@@ -1084,7 +1103,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     # Log epoch 0 trace if trace file is requested
     if trace_writer is not None:
         # Compute initial loss and trace
-        (loss_value_trace, loss_trace_raw), norm_grads_trace = loss_and_grad_fn(opt_params_norm)
+        (loss_value_trace, (loss_trace_raw, _)), norm_grads_trace = loss_and_grad_fn(opt_params_norm)
         loss_trace = trace_tree_to_python(loss_trace_raw)
         grad_norm = float(gradient_l2_norm(norm_grads_trace))
         
@@ -1140,9 +1159,21 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             opt_params = denormalise_opt_params(opt_params_norm, normalisation_spec)
 
             # Compute loss at the post-update state S(epoch) for logging 
-            (loss_value, loss_trace_raw), _ = loss_and_grad_fn(opt_params_norm)
+            (loss_value, (loss_trace_raw, err)), _ = loss_and_grad_fn(opt_params_norm)
+
+            # raise any errors
+            error_message = get_checkify_error_message(err)
+            if error_message is not None:
+                print(
+                    f"\nStopping at epoch {epoch}: {error_message} "
+                    "This probably means that the current parameters have become unphysical (e.g. centrifugal radius larger than r0). "
+                    "Consider tightening bounds on mass/r0/omega to avoid this region."
+                )
+
+
             loss_trace = trace_tree_to_python(loss_trace_raw)
             loss_value = float(loss_value)
+
 
             # Log post-update state for this epoch
             if log_writer is not None:
