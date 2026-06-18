@@ -854,7 +854,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     """
     Fit streamline model parameters to data using Adam optimiser.
     Any supported streamline parameter can be optimised or fixed.
-    Parameters are split by dictionary membership:
+    Parameters are split by dictionary:
     - keys in initial_opt_params are optimised
     - keys in fixed_params are held fixed
     The union must contain each key in STREAMLINE_MODEL_PARAM_KEYS exactly once.
@@ -925,21 +925,10 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     show_plots : bool
         Whether to show diagnostic plots during optimisation
         
-    **IMPORTANT: Epoch and Loss Semantics**
-    
-    CSV and trace logging includes epochs 0 through N:
-    - Epoch 0: loss and parameters at INITIAL state (before any updates)
-    - Epoch i (1 <= i <= N): loss and parameters AFTER applying update i
-    
-    This means:
-    - Loss at epoch i = loss evaluated at the state after i updates have been applied
-    - Parameters at epoch i = parameters after i updates have been applied
-    - epoch 0 loss = initial loss (loss before epoch 1 update)
-    - epoch N loss = final loss (after epoch N update)
-    
-    Loss history is 0-indexed and aligned with epoch numbers:
-    loss_history[i] = loss logged for CSV epoch i
-        
+    Epoch 0: initial state before any updates, with initial_opt_params
+    Epoch n (n>=1): state after applying parameter update n
+    Tracking and checks are all performed at the end of each epoch. So e.g. loss n = loss after applying update n, using the updated parameters
+
     Returns:
     --------   
     dict: optimised parameters (same keys as initial_opt_params), including
@@ -1011,6 +1000,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     loss_history = []
     initial_loss, _ = loss_from_normalised(opt_params_norm)
     initial_loss = float(initial_loss)
+    loss_history.append(initial_loss) # 'epoch 0' loss (initial state, before any updates)
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_epoch = 0
@@ -1078,6 +1068,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     print(f"Initial optimisable values:")
     for key in opt_param_keys:
         print(f"  {key}: {format_param(key, opt_params[key])}")
+    print(f"Initial loss: {initial_loss:.6g}")
     
     # Log epoch 0: initial state (before any updates)
     initial_loss = float(initial_loss)
@@ -1101,34 +1092,17 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         trace_row = build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
         trace_writer.writerow(trace_row)
         trace_file.flush()
+
     
     try:
         for epoch in range(1, n_epochs + 1):
             if epoch % info_every == 0:
                 print(f"\n Starting Epoch {epoch} -------------------------")
-            # Compute loss and gradients at current (pre-update) normalised parameters.
-            # At the START of iteration i, we're at state S(i-1).
-            # The loss computed here is loss(S(i-1)), which is what we want to log for CSV epoch (i-1).
+            # Compute loss and gradients at pre-update normalised parameters.
             loss_trace = None
-            (loss_value, loss_trace_raw), norm_grads = loss_and_grad_fn(opt_params_norm)
-            loss_trace = trace_tree_to_python(loss_trace_raw)
-            loss_value = float(loss_value)
-
-            # Compute gradient norm in normalised space for stopping criteria and logging.
+            (loss_before, _), norm_grads = loss_and_grad_fn(opt_params_norm)
             grad_norm = float(gradient_l2_norm(norm_grads))
 
-            # LOG DEFERRED EPOCH: Log epoch (epoch - 1) using loss computed at current state (S(epoch-1))
-            # (This is the loss AFTER applying update epoch-1, which is what we want for CSV epoch epoch-1)
-            if epoch > 1:
-                if log_writer is not None:
-                    row = {'epoch': (epoch - 1), 'loss': loss_value}
-                    # opt_params is still S(epoch-1) before this iteration's update
-                    for key in opt_param_keys:
-                        row[key] = float(opt_params[key])
-                    if 'log_omega' in opt_params:
-                        row['omega'] = float(jnp.exp(opt_params['log_omega']))
-                    log_writer.writerow(row)
-                    log_file.flush()
 
             # Perform Optax Adam step in normalised space (apply update).
             updates, opt_state = solver.update(norm_grads, opt_state, params=opt_params_norm)
@@ -1164,17 +1138,32 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Now materialize physical parameters from the (possibly clamped)
             # normalised parameters.
             opt_params = denormalise_opt_params(opt_params_norm, normalisation_spec)
+
+            # Compute loss at the post-update state S(epoch) for logging 
+            (loss_value, loss_trace_raw), _ = loss_and_grad_fn(opt_params_norm)
+            loss_trace = trace_tree_to_python(loss_trace_raw)
+            loss_value = float(loss_value)
+
+            # Log post-update state for this epoch
+            if log_writer is not None:
+                row = {'epoch': epoch, 'loss': loss_value}
+                for key in opt_param_keys:
+                    row[key] = float(opt_params[key])
+                if 'log_omega' in opt_params:
+                    row['omega'] = float(jnp.exp(opt_params['log_omega']))
+                log_writer.writerow(row)
+                log_file.flush()
         
-            # Track loss (store the loss before the update for the loss_history)
+            # Track loss (store the loss for the loss_history)
             loss_history.append(loss_value)
 
             if trace_writer is not None and loss_trace is not None:
-                # Use the loss value from before the update for trace logging
+                # Use the post-update loss value for trace logging
                 trace_row = build_trace_row(epoch, loss_value, loss_trace, grad_norm, loss_method)
                 trace_writer.writerow(trace_row)
                 trace_file.flush()
         
-            # Early stopping checks (use loss before update)
+            # Early stopping checks (use post-update loss)
             if loss_value < best_loss:
                 best_loss = loss_value
                 best_opt_params = opt_params.copy()
@@ -1221,20 +1210,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 print(f"\nEarly stopping at epoch {epoch}: no improvement for {early_stopping_patience} epochs")
                 break
     
-        # After the loop, log the final epoch (epoch N or the epoch where we stopped)
-        # At this point, opt_params contains the parameters from the end of the final iteration.
-        # We need to compute the loss at these parameters to complete the CSV epoch logging.
-        if log_writer is not None:
-            loss_final, _= loss_from_normalised(opt_params_norm)
-            loss_final = loss_final.astype(float)
-            # epoch is the last epoch number from the loop (either n_epochs or early stopping)
-            row = {'epoch': epoch, 'loss': loss_final}
-            for key in opt_param_keys:
-                row[key] = float(opt_params[key])
-            if 'log_omega' in opt_params:
-                row['omega'] = float(jnp.exp(opt_params['log_omega']))
-            log_writer.writerow(row)
-            log_file.flush()
         
         # restore canonical parameter order before returning
         ordered_best_opt_params = {k: best_opt_params[k] for k in opt_param_keys}
