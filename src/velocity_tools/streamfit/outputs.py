@@ -10,6 +10,8 @@ from matplotlib.patches import Patch
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+mpl.rcParams["font.family"] = "serif"
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pandas as pd
 import os
@@ -435,7 +437,7 @@ def plot_morphology(
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
 
-        # Static background: prefer pre-rendered image, fall back to live drawing
+    # Static background: prefer pre-rendered image, fall back to live drawing
     if bg_rgba is not None and bg_extent is not None:
         ax.imshow(
             bg_rgba,
@@ -508,15 +510,26 @@ def plot_morphology(
                 zorder=5,
             )
 
-
-    ax.scatter(0, 0, marker='*', s=100, color='yellow', edgecolor='black', zorder=10)
+    star_ra = 0
+    star_dec = 0
+    ax.scatter(star_ra, star_dec, marker='*', s=100, color='yellow', edgecolor='black', zorder=10)
     ax.set_xlabel('RA Offset (arcsec)')
     ax.set_ylabel('Dec Offset (arcsec)')
 
     if xlim is not None:
         ax.set_xlim(xlim)
+    else:
+        all_ra = np.concatenate([*[e for e in [ra_model, ra_data, pc_coords[0], np.array([star_ra])] if e is not None]])
+        pad_ra = 0.05 * (all_ra.max() - all_ra.min())
+        ra_lim = (all_ra.min() - pad_ra, all_ra.max() + pad_ra)
+        ax.set_xlim(ra_lim)
     if ylim is not None:
         ax.set_ylim(ylim)
+    else:
+        all_dec = np.concatenate([*[e for e in [dec_model, dec_data, pc_coords[1], np.array([star_dec])] if e is not None]])
+        pad_dec = 0.05 * (all_dec.max() - all_dec.min())
+        dec_lim = (all_dec.min() - pad_dec, all_dec.max() + pad_dec)
+        ax.set_ylim(dec_lim)
     ax.invert_xaxis()
     ax.set_title(title)
     ax.legend(loc=legend_loc)
