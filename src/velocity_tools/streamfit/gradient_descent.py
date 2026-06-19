@@ -67,6 +67,7 @@ CANONICAL_UNITS = {
     "deltar": u.au,
     "v_lsr": u.km / u.s,
     "rc": u.au,
+    "omega": 1 / u.s,
     # mu = rc/r0 is dimensionless, so no units
 }
 
@@ -79,6 +80,7 @@ DISPLAY_UNITS = {
         'deltar':  'au',
         'v_lsr':   'km/s',
         'rc':      'au',
+        'omega':   '1/s',
         # mu is dimensionless
     }
 
@@ -87,6 +89,7 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'theta0',
     'phi0',
     'rc',
+    'omega',
     'mu',
     'v_r0',
     'mass',
@@ -244,7 +247,8 @@ def check_param_types(opt_params, fixed_params):
 
 
 def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
-    """Sanitize and validate opt/fixed parameter partition for streamline modeling"""
+    """Sanitize and validate opt/fixed parameter partition for streamline modeling.
+    Note: exactly one of 'rc' or 'omega' must be present across initial_opt_params and fixed_params, to determine mu=rc/r0."""
     opt_params = clean_model_param_dict(initial_opt_params, 'initial_opt_params')
     fixed_params = clean_model_param_dict(fixed_params, 'fixed_params')
 
@@ -253,17 +257,32 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
         raise KeyError(
             f"Parameters cannot be present in both initial_opt_params and fixed_params! Overlap: {overlap}"
         )
+    
+    all_params = set(opt_params) | set(fixed_params)
 
+    # check that exactly one of rc or omega is supplied
+    has_rc = 'rc' in all_params
+    has_omega = 'omega' in all_params
+    if has_rc and has_omega:
+        raise KeyError(
+            "Both 'rc' and 'omega' are present in parameters." 
+            "Please only provide one of them, not both, because they are degenerate (mu=rc/r0=GM/omega^2/r0^3)"
+        )
+    if not has_rc and not has_omega:
+        raise KeyError(
+            "Missing: Either 'rc' or 'omega' must be provided in parameters. You have input neither"
+        )
+    
+    # check all other required parameters are present (except mu, rc, omega which we already dealt with)
+    already_dealt_with = {'rc', 'omega', 'mu'}
     missing = []
     for key in STREAMLINE_MODEL_PARAM_KEYS:
-        if key not in opt_params and key not in fixed_params:
-            # append if it's not mu
-            if key != 'mu':
-                missing.append(key)
+        if key not in all_params and key not in already_dealt_with:
+            missing.append(key)
     if missing:
         raise KeyError(
             "Missing required streamline parameters across initial_opt_params and fixed_params: "
-            f"{missing}. The list of parameters is: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+            f"{missing}."
         )
 
     if require_nonempty_opt and len(opt_params) == 0:
@@ -290,20 +309,6 @@ def standardise_param_bounds(param_bounds):
         return None
 
     standardised = dict(param_bounds)
-    # if 'omega' in standardised:
-    #     if 'log_omega' in standardised:
-    #         raise KeyError(
-    #             "param_bounds contains both 'omega' and 'log_omega'. "
-    #             "Please provide only one of these."
-    #         )
-    #     omega_min, omega_max = standardised.pop('omega')
-    #     omega_min = float(omega_min.value)
-    #     omega_max = float(omega_max.value)
-    #     if omega_min <= 0 or omega_max <= 0:
-    #         raise ValueError("'omega' bounds must be positive")
-    #     if omega_min >= omega_max:
-    #         raise ValueError("'omega' bounds must satisfy omega_min < omega_max")
-    #     standardised['log_omega'] = (math.log(omega_min), math.log(omega_max))
 
     unknown = sorted(key for key in standardised if key not in STREAMLINE_MODEL_PARAM_KEYS)
     if unknown:
@@ -391,12 +396,25 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     return denormalised
 
 
-def with_derived_omega(opt_params):
-    """Return a copy of the opt params including derived omega, when mu/mass/r0 are preesent"""
-    params_with_omega = opt_params.copy()
-    if 'mu' in params_with_omega and 'omega' not in params_with_omega:
-        if 'mass' in params_with_omega and 'r0' in params_with_omega:
-            params_with_omega['omega'] = stream_lines_grad.omega_from_mu(mu=params_with_omega['mu'], mass=params_with_omega['mass'], r0=params_with_omega['r0'])
+def with_derived_omega(opt_params, fixed_params=None):
+    """Return a copy of the opt params including derived omega.
+    If omega is already present, does nothing.
+    If rc is present instead, derive and append omega."""
+    all_params = dict(opt_params)
+    if fixed_params is not None:
+        all_params.update(fixed_params)
+    
+    params_with_omega = dict(opt_params)
+    if 'omega' in params_with_omega:
+        return params_with_omega
+    
+    if 'rc' in all_params and 'mass' in all_params and 'r0' in all_params:
+        rc = all_params['rc']
+        mass = all_params['mass']
+        r0 = all_params['r0']
+        mu = rc / r0
+        params_with_omega['omega'] = stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
+
     return params_with_omega
 
 def format_param(key, value):
@@ -410,6 +428,8 @@ def format_param(key, value):
         return f"{deg:.6g} deg"
     if key == 'mu':
         return f"{val:.6g} (rc/r0)"
+    if key == 'omega':
+        return f"{val:.6g} 1/s"
     unit = DISPLAY_UNITS.get(key, '')
     if unit:
         suffix = f" {unit}"
@@ -529,10 +549,15 @@ def forward_model(model_params, distance_pc, npoints=10000):
     rmin = model_params['rmin']
     if rmin is None:
         rmin = to_float64(0.0)  # rc*0.5 will always dominate in jnp.maximum
-    # calculate mu and add to model_params if not already present, as it's needed for the forward model
-    if 'mu' not in model_params:
+    # derive mu from rc or omega (whicever is provided)
+    if 'rc' in model_params:
         mu = model_params['rc'] / model_params['r0']
-        model_params['mu'] = mu
+    elif 'omega' in model_params:
+        mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    else:
+        raise ValueError("model_params must contain either 'rc' or 'omega' to derive mu=rc/r0.")
+    model_params = dict(model_params)
+    model_params['mu'] = mu
     err, ((x, y, z), (vx, vy, vz), valid_mask) = stream_lines_grad.checked_xyz_stream(
         mass=model_params['mass'],
         r0=model_params['r0'],
@@ -1059,9 +1084,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         log_file = open(log_file, 'w', newline='')
         # Create header: epoch, loss, then all optimisable params
         fieldnames = ['epoch', 'loss'] + opt_param_keys
-        if 'mu' in opt_params and 'omega' not in fieldnames:
-            # also log derived omega alonside mu for convenience in comparing to old models
+        all_param_keys = set(opt_param_keys) | set(fixed_params.keys())
+        if 'rc' in all_param_keys and 'omega' not in fieldnames:
+            # also log derived omega alonside rc for convenience in comparing to old models
             fieldnames.append('omega')
+        elif 'omega' in all_param_keys and 'rc' not in fieldnames:
+            # similar
+            fieldnames.append('rc')
         log_writer = csv.DictWriter(log_file, fieldnames=fieldnames)
         log_writer.writeheader()
         log_file.flush()
@@ -1100,13 +1129,25 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_param_keys:
             row[key] = float(opt_params[key])
-        if 'mu' in opt_params:
-            # derive omega from mu, mass, r0 for logging convenience
+        if 'rc' in all_param_keys and 'omega' not in opt_param_keys:
+            # also log derived omega alonside rc for convenience in comparing to old codes
             mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
             r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
-            if mass_val is not None and r0_val is not None:
-                omega_val = stream_lines_grad.omega_from_mu(mu=opt_params['mu'], mass=mass_val, r0=r0_val)
+            rc_val = opt_params['rc'] if 'rc' in opt_params else fixed_params.get('rc', None)
+            if mass_val is not None and r0_val is not None and rc_val is not None:
+                mu_val = rc_val / r0_val
+                omega_val = stream_lines_grad.omega_from_mu(mu=mu_val, mass=mass_val, r0=r0_val)
                 row['omega'] = float(omega_val)
+        elif 'omega' in all_param_keys and 'rc' not in opt_param_keys:
+            # same
+            mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
+            r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
+            omega_val = opt_params['omega'] if 'omega' in opt_params else fixed_params.get('omega', None)
+            if mass_val is not None and r0_val is not None and omega_val is not None:
+                mu_val = stream_lines_grad.mu_from_omega(omega=omega_val, mass=mass_val, r0=r0_val)
+                rc_val = mu_val * r0_val
+                row['rc'] = float(rc_val)
+        
         log_writer.writerow(row)
         log_file.flush()
     
@@ -1141,8 +1182,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 if key == 'phi0':
                     # phi0 is a cyclic parameter; wrap to [0, 1) in normalised space to enforce bounds
                     opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0) 
-                elif key == 'mu':
-                    # mu = rc/r0 must be strictly positive, as mu=0 causes rc=0 which is problematic
+                elif key == 'rc':
+                    # must be positive >0
+                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
+                elif key == 'omega':
+                    # must be positive >0
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
                 else:
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
@@ -1196,12 +1240,25 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 row = {'epoch': epoch, 'loss': loss_value}
                 for key in opt_param_keys:
                     row[key] = float(opt_params[key])
-                if 'mu' in opt_params:
+                if 'rc' in all_param_keys and 'omega' not in opt_param_keys:
+                    # also log derived omega alonside rc for convenience in comparing to old codes
                     mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
                     r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
-                    if mass_val is not None and r0_val is not None:
-                        omega_val = stream_lines_grad.omega_from_mu(mu=opt_params['mu'], mass=mass_val, r0=r0_val)
+                    rc_val = opt_params['rc'] if 'rc' in opt_params else fixed_params.get('rc', None)
+                    if mass_val is not None and r0_val is not None and rc_val is not None:
+                        mu_val = rc_val / r0_val
+                        omega_val = stream_lines_grad.omega_from_mu(mu=mu_val, mass=mass_val, r0=r0_val)
                         row['omega'] = float(omega_val)
+                elif 'omega' in all_param_keys and 'rc' not in opt_param_keys:
+                    # same
+                    mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
+                    r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
+                    omega_val = opt_params['omega'] if 'omega' in opt_params else fixed_params.get('omega', None)
+                    if mass_val is not None and r0_val is not None and omega_val is not None:
+                        mu_val = stream_lines_grad.mu_from_omega(omega=omega_val, mass=mass_val, r0=r0_val)
+                        rc_val = mu_val * r0_val
+                        row['rc'] = float(rc_val)
+                        
                 log_writer.writerow(row)
                 log_file.flush()
         
@@ -1329,4 +1386,4 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
 
 
-    return with_derived_omega(ordered_best_opt_params), loss_history, param_errors
+    return with_derived_omega(ordered_best_opt_params, fixed_params), loss_history, param_errors

@@ -9,8 +9,8 @@ The assumed input units are:
 - velocity: km/s
 - mass: solar masses
 - angles (PA, i, theta, phi...): radians
-- mu (rc/r0): dimensionless, in (0, 1)
-- Omega (angular velocity): 1/s, only used when converting to/from mu
+- rc (centrifugal radius): au (alternative to omega - either can be used to calculate mu=rc/r0)
+- Omega (angular velocity): 1/ (alternative to rc - either can be used to calculate mu=rc/r0)
 - distance to source: pc
 
 Last updated: 19-06-2026
@@ -18,7 +18,6 @@ Last updated: 19-06-2026
 
 
 import astropy.units as u
-from matplotlib.pyplot import rc
 from ..helper_functions import *
 import jax
 import jax.numpy as jnp

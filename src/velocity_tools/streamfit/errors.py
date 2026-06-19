@@ -173,6 +173,8 @@ from jax.experimental import checkify
 import astropy.units as u
 import math
 
+from velocity_tools.streamfit import stream_lines_grad
+
 # settings and constants
 
 BIG = 1e30
@@ -193,6 +195,7 @@ CANONICAL_UNITS = {
     "deltar": u.au,
     "v_lsr": u.km / u.s,
     "rc": u.au, 
+    "omega": 1/u.s,
     # mu = rc/r0 is dimensionless, so no units
 }
 
@@ -201,6 +204,7 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'theta0',
     'phi0',
     'rc',
+    'omega',
     'mu',
     'v_r0',
     'mass',
@@ -313,7 +317,8 @@ def check_param_types(opt_params, fixed_params):
 
 
 def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
-    """Sanitize and validate opt/fixed parameter partition for streamline modeling"""
+    """Sanitize and validate opt/fixed parameter partition for streamline modeling.
+    Note: exactly one of 'rc' or 'omega' must be prsent across initial_opt_params and fixed_params, to determine mu=rc/r0"""
     opt_params = clean_model_param_dict(initial_opt_params, 'initial_opt_params')
     fixed_params = clean_model_param_dict(fixed_params, 'fixed_params')
 
@@ -323,16 +328,31 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
             f"Parameters cannot be present in both initial_opt_params and fixed_params! Overlap: {overlap}"
         )
 
+    all_params = set(opt_params) | set(fixed_params)
+
+    # check that exactly one of 'rc' or 'omega' is provided
+    has_rc = 'rc' in all_params
+    has_omega = 'omega' in all_params
+    if has_rc and has_omega:
+        raise KeyError(
+            "Both 'rc' and 'omega' are present in parameters."
+            "Please provide only one of them, not both, because they are degenerate (mu=rc/r0=GM/omega^2/r0^3)."
+        )
+    if not has_rc and not has_omega:
+        raise KeyError(
+            "Missing: Either 'rc' or 'omega' must be provided in parameters. You have input neither"
+            )
+    
+    # now check all other required parameters are present (except mu, rc, omega, which are already dealt with)
+    already_dealt_with = {'rc', 'omega', 'mu'}
     missing = []
     for key in STREAMLINE_MODEL_PARAM_KEYS:
-        if key not in opt_params and key not in fixed_params:
-            # append if it's not mu
-            if key != 'mu':
-                missing.append(key)
+        if key not in all_params and key not in already_dealt_with:
+            missing.append(key)
     if missing:
         raise KeyError(
-            "Missing required streamline parameters across initial_opt_params and fixed_params: "
-            f"{missing}. The list of parameters is: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+            "Missing required streamline parameters across intial_opt_params and fixed_params: "
+            f"{missing}. "
         )
 
     if require_nonempty_opt and len(opt_params) == 0:
@@ -438,10 +458,16 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - jnp.sign(v_r0_protected) * threshold,
         v_r0_protected
         )
-    
+
     if 'mu' not in model_params:
-        mu = model_params['rc'] / model_params['r0']
+        if 'rc' in model_params:
+            mu = model_params['rc'] / model_params['r0']
+        elif 'omega' in model_params:
+            mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+        else:
+            raise ValueError("model_params must contain either 'rc' or 'omega' to derive mu=rc/r0")
         model_params['mu'] = mu
+        
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = xyz_stream(
         mass=model_params['mass'],
