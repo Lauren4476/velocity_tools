@@ -19,6 +19,7 @@ import os
 
 from . import gradient_descent
 from . import extract_streamline
+from . import errors
 
 def param_for_display(key, value):
     """
@@ -1379,34 +1380,46 @@ def plot_param_correlations(param_names, covariance, annotate=True, save_folder=
     else:
         plt.close(fig)
 
-def plot_streamline_covariance_samples(streamline_samples,
-                                      best_opt_params,
-                                      fixed_params,
-                                      distance,
-                                      data,
-                                      uncertainties,
-                                      velocity_reference=None,
-                                      save_folder=None):
+def plot_streamline_covariance_samples(best_opt_params,
+                                       initial_opt_params,
+                                       fixed_params,
+                                       data,
+                                       uncertainties,
+                                       distance,
+                                       param_bounds,
+                                       loss_method,
+                                       gradient_tol,
+                                       v_lsr=None,
+                                       n_samples=100,
+                                       save_folder=None):
     """
-    Plot streamline uncertainty from precomputed streamline samples.
+    Compute covariance, sample parameter sets from it, evaluate streamlines from those sets, and plot them all together
+    """
 
-    Parameters
-    ----------
-    streamlines : list of dict
-        Output from evaluate_streamline_samples().
-    best_params : dict
-        Best-fit optimised parameters.
-    fixed_params : dict
-        Fixed model parameters.
-    distance : float
-        Source distance in pc.
-    data : tuple
-        (ra_data, dec_data, v_data)
-    uncertainties : tuple
-        (ra_sigma, dec_sigma, v_sigma)
-    velocity_reference : float, optional
-        Draw a horizontal reference line on the velocity panel.
-    """
+    opt_keys, param_errors, cov = errors.estimate_covariance_at_best_fit(
+        best_opt_params,
+        initial_opt_params,
+        fixed_params,
+        data,
+        uncertainties,
+        distance,
+        loss_method=loss_method,
+        gradient_tol=gradient_tol
+    )
+
+    best_for_cov = {key: float(best_opt_params[key]) for key in opt_keys}
+
+    _, streamline_samples = generate_streamline_samples(
+        best_opt_params=best_for_cov,
+        covariance=cov,
+        opt_keys=opt_keys,
+        fixed_params=fixed_params,
+        distance=distance,
+        param_bounds=param_bounds,
+        n_samples=n_samples
+    )
+
+
     fig, (ax_sky, ax_v) = plt.subplots(1, 2, figsize=(10, 5))
     ra_data, dec_data, v_data = data
     ra_sigma, dec_sigma, v_sigma = uncertainties
@@ -1450,9 +1463,9 @@ def plot_streamline_covariance_samples(streamline_samples,
         rproj_data[order_data], np.asarray(v_data)[order_data], yerr=np.asarray(v_sigma)[order_data], xerr=np.asarray(rproj_sigma)[order_data],
         fmt='o', color='red', ecolor='red', ms=4, alpha=0.9, label='Data'
         )
-    if velocity_reference is not None:
+    if v_lsr is not None:
         xmin, xmax = ax_v.get_xlim()
-        ax_v.hlines(velocity_reference, xmin=xmin, xmax=xmax, colors='k', linestyles='--', alpha=0.6,)
+        ax_v.hlines(v_lsr, xmin=xmin, xmax=xmax, colors='k', linestyles='--', alpha=0.6,)
         ax_v.set_xlim(xmin, xmax)
 
     # finalise plots
@@ -1474,7 +1487,26 @@ def plot_streamline_covariance_samples(streamline_samples,
         plt.savefig(f'{save_folder}/streamline_covariance_samples.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
+        
 
+def generate_streamline_samples(best_opt_params, covariance, opt_keys, fixed_params, distance, param_bounds=None, n_samples=100):
+    """
+    wrapper of sample_parameter_sets_from_covariance() and evaluate_streamline_samples() to generate streamline samples from covariance matrix.
+    """
+    samples = sample_parameter_sets_from_covariance(
+        best_opt_params,
+        covariance,
+        opt_keys,
+        param_bounds=param_bounds,
+        n_samples=n_samples
+    )
+    streamlines = evaluate_streamlines_samples(
+        samples,
+        opt_keys,
+        fixed_params,
+        distance,
+    )
+    return samples, streamlines
 
 def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance):
     """

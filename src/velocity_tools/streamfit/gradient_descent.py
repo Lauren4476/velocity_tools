@@ -740,9 +740,10 @@ def chi2_loss(
  
  
     # Only compute chi2 on valid/retained data points 
- 
+
     chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
  
+
     if loss_method == 0:
         chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
         chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
@@ -760,14 +761,14 @@ def chi2_loss(
         sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
         r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * dec_sigma)**2 + (ra_data * ra_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
  
         chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
         chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v
  
- 
+
     data_finite_mask = (
         jnp.isfinite(ra_data)
         & jnp.isfinite(dec_data)
@@ -1022,6 +1023,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     loss_history.append(initial_loss) # 'epoch 0' loss (initial state, before any updates)
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
+    best_opt_params_norm = opt_params_norm.copy()
     best_epoch = 0
     patience_counter = 0
     loss_threshold_counter = 0
@@ -1120,7 +1122,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # Compute loss and gradients at pre-update normalised parameters.
             loss_trace = None
             (loss_before, _), norm_grads = loss_and_grad_fn(opt_params_norm)
-            grad_norm = float(gradient_l2_norm(norm_grads))
 
 
             # Perform Optax Adam step in normalised space (apply update).
@@ -1158,8 +1159,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             # normalised parameters.
             opt_params = denormalise_opt_params(opt_params_norm, normalisation_spec)
 
-            # Compute loss at the post-update state S(epoch) for logging 
-            (loss_value, (loss_trace_raw, err)), _ = loss_and_grad_fn(opt_params_norm)
+            # Compute loss and gradient at the post-update state S(epoch) for logging 
+            (loss_value, (loss_trace_raw, err)), norm_grads = loss_and_grad_fn(opt_params_norm)
+            # print the gradients by parameter for debugging
+            print("Gradients at epoch {}:".format(epoch))
+            for key in opt_param_keys:
+                print(f"  {key}: {float(norm_grads[key]):.6e}")
+            grad_norm = float(gradient_l2_norm(norm_grads))
 
             # raise any errors
             error_message = get_checkify_error_message(err)
@@ -1198,6 +1204,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             if loss_value < best_loss:
                 best_loss = loss_value
                 best_opt_params = opt_params.copy()
+                best_opt_params_norm = opt_params_norm.copy()
                 best_epoch = epoch
                 patience_counter = 0
             else:
@@ -1255,8 +1262,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             print(f"Matching trace log saved to: {trace_file}")
 
     print(f"Optimisation complete!")
-    print(f"\nFinal loss: {best_loss:.6f}")
-    print(f"Best-fit parameters found at epoch: {best_epoch}")
+    print(f"Best-fit parameters found at epoch: {best_epoch}, with loss: {best_loss:.6f}")
     for key in ordered_best_opt_params.keys():
         print(f"  {key}: {format_param(key, ordered_best_opt_params[key])}")
 
@@ -1275,12 +1281,14 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             loss_method=loss_method,
             gradient_tol=gradient_tol,
             normalisation_spec=normalisation_spec,
+            best_norm_opt_params=best_opt_params_norm,
         )
         print("\nParameter uncertainties (1-sigma):")
         for key, value in param_errors.items():
             print(f"  {key}: {format_param(key, value)}")
     except Exception as e:
-        print(f"\nWarning: parameter uncertainty estimation failed: ({e}). Continuing without error estimates")
+        print(f"\nWarning: parameter uncertainty estimation failed: ({e}).")
+        print("Continuing without error estimates")
 
     outputs.save_best_fit_params(ordered_best_opt_params, fixed_params, param_errors, save_folder=save_folder)
 

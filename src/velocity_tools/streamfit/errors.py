@@ -5,6 +5,35 @@
 
 # So we put the old (non-jit) versions of the relevant functions here, and use them in the uncertainty estimation.
 
+def estimate_covariance_at_best_fit(
+    best_opt_params,
+    initial_opt_params,
+    fixed_params,
+    data,
+    uncertainties,
+    distance,
+    loss_method=0,
+    gradient_tol=1e-1,
+):
+    """ wrapper around estimate_parameter_errors for convenient using after fit_streamline has finished"""
+    opt_keys = list(initial_opt_params.keys())
+    best_for_cov = {k: float(best_opt_params[k]) for k in opt_keys}
+    # prepare data-only quantities once
+    prepared_data = prepare_data(data, uncertainties, n_elements=len(data[0]))
+    param_errors, cov = estimate_parameter_errors(
+        best_for_cov,
+        fixed_params,
+        data,
+        uncertainties,
+        distance,
+        prepared_data,
+        loss_method=loss_method,
+        gradient_tol=gradient_tol,
+        normalisation_spec=None,
+    )
+    return opt_keys, param_errors, cov
+
+
 def estimate_parameter_errors(
     best_opt_params,
     fixed_params,
@@ -15,6 +44,7 @@ def estimate_parameter_errors(
     loss_method=0,
     gradient_tol=1e-1,
     normalisation_spec=None,
+    best_norm_opt_params=None,
 ):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
@@ -30,6 +60,9 @@ def estimate_parameter_errors(
     normalisation_spec : dict or None
         Bounds-derived normalisation metadata for optimised parameters.
         Required to evaluate gradient_tol in normalised space.
+    best_norm_opt_params : dict or None
+        Normalised parameters at best-fit state, used for gradient_tol_check.
+        If not provided, will be computed from best_opt_params and normalisation_spec, but providing it can save a redundant computation
 
     Returns
     -------
@@ -51,6 +84,7 @@ def estimate_parameter_errors(
 
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
+        print(f"loss vec params: {params}")
         chi2_total, _ = chi2_loss(
             params,
             fixed_params,
@@ -77,14 +111,17 @@ def estimate_parameter_errors(
                     f"for gradient_tol check: {missing_norm_keys}"
                 )
 
-            norm_opt_params = normalise_opt_params(best_opt_params, normalisation_spec)
-            norm_params_vec, _ = params_dict_to_vector(norm_opt_params)
+            if best_norm_opt_params is not None:
+                norm_opt_params = best_norm_opt_params
+            else:
+                norm_opt_params = normalise_opt_params(best_opt_params, normalisation_spec)
+            norm_params_vec, norm_keys = params_dict_to_vector(norm_opt_params)
 
             def norm_loss_vec(theta_norm_vec):
-                norm_params = vector_to_params_dict(theta_norm_vec, keys)
+                norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
                 physical_params = denormalise_opt_params(norm_params, normalisation_spec)
                 chi2_total, _ = chi2_loss(
-                     physical_params,
+                    physical_params,
                     fixed_params,
                     distance_pc,
                     prepared_data,
@@ -93,7 +130,11 @@ def estimate_parameter_errors(
                 return chi2_total
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
+            # print the gradient per parameter for debugging
+            for i, key in enumerate(norm_keys):
+                print(f"Gradient for {key} at best-fit parameters: {norm_grad_vec[i]:.3e}")
             norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
+            print(f"Gradient magnitude at best-fit parameters: {norm_grad_norm:.3e}")
 
             if norm_grad_norm > gradient_tol:
                 print(
@@ -105,6 +146,10 @@ def estimate_parameter_errors(
                 print("    - Increasing n_epochs")
                 print("    - Reducing learning rate for finer convergence")
                 print("    - Reducing loss_threshold if used")
+            
+
+
+
 
     # compute Hessian
     H = jax.hessian(loss_vec)(params_vec)
@@ -393,7 +438,7 @@ def forward_model(opt_params, fixed_params, distance_pc):
         - jnp.sign(v_r0_protected) * threshold,
         v_r0_protected
         )
-
+    
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = xyz_stream(
         mass=model_params['mass'],
@@ -507,8 +552,8 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
     data_span_safe = jnp.where(data_span == 0.0, 1.0, data_span)
 
     # normalise data metric
-    d_data_norm = (d_data - data_min_eff) / data_span
-    d_goal = model_min + d_data_norm * model_span
+    d_data_norm = (d_data - data_min_eff) / data_span_safe
+    d_goal = model_min + d_data_norm * model_span_safe
 
     # interpolate model at data points, using weights to ignore invalid model points 
     # by giving them huge distance values so they don't affect the interpolation
@@ -603,12 +648,13 @@ def chi2_loss(
 
     valid = jnp.asarray(valid, dtype=bool)
     # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
+    chi2_v_by_point = (((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2)
     chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
 
     if loss_method == 0:
         chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
         chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v # + chi2_penalty
+        chi2_total = chi2_ra + chi2_dec + chi2_v
     else:
         # r/theta are defined on the projected plane of the sky from (RA, Dec).
         # Use precomputed data coordinates
@@ -627,21 +673,23 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
+        # bug prints
+        print('bug prints')
+        print(jnp.min(jnp.sqrt(ra_model_interp**2 + dec_model_interp**2)))
+        print(jnp.min(jnp.sqrt(ra_data**2 + dec_data**2)))
+
         # Only compute chi2 on valid/retained data points
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
+
+    print(f"er chi2_total: {chi2_total}")
 
     if loss_method == 0:
         chi2_components = {
             'chi2_ra': chi2_ra.astype(float),
             'chi2_dec': chi2_dec.astype(float),
             'chi2_v': chi2_v.astype(float),
-            # 'chi2_penalty': float(chi2_penalty),
-            # 'low_shortfall_penalty': float(low_shortfall),
-            # 'low_excess_penalty': float(low_excess),
-            # 'high_shortfall_penalty': float(high_shortfall),
-            # 'high_excess_penalty': float(high_excess),
             'chi2_total': chi2_total.astype(float),
         }
     else:
@@ -649,11 +697,6 @@ def chi2_loss(
             'chi2_r': chi2_r.astype(float),
             'chi2_theta': chi2_theta.astype(float),
             'chi2_v': chi2_v.astype(float),
-            # 'chi2_penalty': float(chi2_penalty),
-            # 'low_shortfall_penalty': float(low_shortfall),
-            # 'low_excess_penalty': float(low_excess),
-            # 'high_shortfall_penalty': float(high_shortfall),
-            # 'high_excess_penalty': float(high_excess),
             'chi2_total': chi2_total.astype(float),
         }
 
@@ -963,9 +1006,9 @@ def rotate_xyz(x, y, z, rotation_matrix):
     return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
 
-def xyz_stream(mass=0.5, r0=1e4, theta0=30,
-               phi0=15, omega=1e-14, v_r0=0,
-               inc=0, pa=0, rmin=None, deltar=1):
+def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
+               phi0=jnp.radians(15), omega=1e-14, v_r0=0,
+               inc=jnp.radians(0), pa=jnp.radians(0), rmin=None, deltar=1):
     '''
     it gets xyz coordinates and velocities for a stream line.
     They are also rotated in PA and inclination along the line of sight.
@@ -977,12 +1020,12 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=30,
 
     :param mass: Central mass (Msun)
     :param r0: Initial radius of streamline (au)
-    :param theta0: Initial polar angle of streamline (degrees)
-    :param phi0: Initial azimuthal angle of streamline (degrees)
+    :param theta0: Initial polar angle of streamline (radians)
+    :param phi0: Initial azimuthal angle of streamline (radians)
     :param omega: Angular rotation. (defined positive), (1/s)
     :param v_r0: Initial radial velocity of the streamline, (km/s)
-    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (degrees)
-    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (degrees)
+    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (radians)
+    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (radians)
     :param rmin: smallest radius for calculation, (au)
     :param deltar: spacing between two consecutive radii in the sampling of the streamer, in (au)
     :return: x, y, z in (au), v_x, v_y, v_z in (km/s)
@@ -1078,6 +1121,62 @@ PreparedData = namedtuple('PreparedData', [
 ])
 
 
+def prepare_data(data, uncertainties, n_elements):
+    '''
+    Precompute all the constant data-only quantities used by the gradient descent,
+    to speed up later iterations
+
+    Parameterss
+    ----------
+    data : tuple of arrays (ra_data, dec_data, v_data)
+        Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
+    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
+        Uncertainties on the data
+    n_elements : int
+        Number of elements to reduce the cube to, used for computing the distance metric and its partitions
+
+    Returns
+    -------
+    PreparedData
+        Container containing the precomputed quantities
+    '''
+    ra_data = jnp.asarray(data[0], dtype=jnp.float64)
+    dec_data = jnp.asarray(data[1], dtype=jnp.float64)
+    v_data = jnp.asarray(data[2], dtype=jnp.float64)
+
+    ra_sigma = jnp.asarray(uncertainties[0], dtype=jnp.float64)
+    dec_sigma = jnp.asarray(uncertainties[1], dtype=jnp.float64)
+    v_sigma = jnp.asarray(uncertainties[2], dtype=jnp.float64)
+
+    eps = jnp.asarray(1e-8, dtype=jnp.float64)
+    ra_sigma_safe = jnp.maximum(ra_sigma, eps)
+    dec_sigma_safe = jnp.maximum(dec_sigma, eps)
+    v_sigma_safe = jnp.maximum(v_sigma, eps)
+
+    dmetric_data, _ = get_distance_metric(ra_data, dec_data, n_elements=n_elements)
+    data_finite_mask = jnp.isfinite(ra_data) & jnp.isfinite(dec_data) & jnp.isfinite(dmetric_data)
+
+    data_metric_for_min = jnp.where(data_finite_mask, dmetric_data, jnp.inf)
+    data_metric_for_max = jnp.where(data_finite_mask, dmetric_data, -jnp.inf)
+    data_min = jnp.min(data_metric_for_min)
+    data_max = jnp.max(data_metric_for_max)
+
+    r_proj_data, theta_proj_data = cartesian_to_polar(ra_data, dec_data)
+
+    return PreparedData(
+        ra_data=ra_data,
+        dec_data=dec_data,
+        v_data=v_data,
+        ra_sigma_safe=ra_sigma_safe,
+        dec_sigma_safe=dec_sigma_safe,
+        v_sigma_safe=v_sigma_safe,
+        dmetric_data=dmetric_data,
+        data_finite_mask=data_finite_mask,
+        data_min=data_min,
+        data_max=data_max,
+        r_proj_data=r_proj_data,
+        theta_proj_data=theta_proj_data,
+    )
 
 @jax.jit
 def circular_median(theta_vals, weights):
@@ -1108,32 +1207,51 @@ def wrap_to_pi(angle):
 
 
 
+def safe_percentile(values, percentile):
+    """
+    jax and jit-safe percentile ignoring invalid values, which does not change array shape
+    """
+    mask = jnp.isfinite(values)
+    
+    # Sort valid values to the front by pushing invalid ones to BIG
+    cleaned = jnp.where(mask, values, to_float64(BIG))
+    sorted_vals = jnp.sort(cleaned)  # valid values are at the front
+
+    # make a new mask which is all the not BIG values 
+    percentile_mask = sorted_vals < to_float64(BIG)
+    n_valid = jnp.sum(percentile_mask)
+    total_n = values.size
+    # Compute the index into only the valid portion
+    idx = jnp.clip(
+        jnp.floor(percentile / 100.0 * n_valid).astype(jnp.int32),
+        0,
+        jnp.maximum(n_valid - 1, 0)
+    )
+    return sorted_vals[idx]
         
-@jax.jit
-def get_distance_metric(ra_coords, dec_coords):
+def get_distance_metric(ra_coords, dec_coords, n_elements=10):
     '''
     Compute radial + angular distance metric for point cloud binning
     Uses a circular angular deviation to avoid branch-cut artifacts.
     '''
     pc_r, pc_theta = cartesian_to_polar(ra_coords, dec_coords)
+    pc_r = jnp.where(jnp.abs(pc_r) < 1e-12, to_float64(BIG), pc_r)
 
     finite_mask = jnp.isfinite(pc_r) & jnp.isfinite(pc_theta)
-    # finite_r = pc_r[finite_mask]
-    # finite_theta = pc_theta[finite_mask]
 
     # deal with if there are no valid points
     def empty_case(_):
 
-        distance_metric = jnp.full_like(pc_r, jnp.nan)
+        distance_metric = jnp.full_like(pc_r, to_float64(BIG))
         trace = {
-            "n_points": pc_r.size,
-            "n_finite_points": 0,
-            "n_reference_points": 0,
-            "r_percentile_thresh": jnp.nan,
-            "r_thresh": jnp.nan,
-            "theta_ref": 0.0,
-            "theta_weight": 1.0,
-            "close_point_count": 0,
+            "n_points":            jnp.array(pc_r.size,   dtype=jnp.int32),
+            "n_finite_points":     jnp.array(0,            dtype=jnp.int32),
+            "n_reference_points":  jnp.array(0,            dtype=jnp.int32),
+            "r_percentile_thresh": to_float64(0.0),
+            "r_thresh":            to_float64(BIG),
+            "theta_ref":           to_float64(0.0),
+            "theta_weight":        to_float64(1.0),
+            "close_point_count":   jnp.array(0,            dtype=jnp.int32),
         }
         return distance_metric, trace
 
@@ -1141,16 +1259,17 @@ def get_distance_metric(ra_coords, dec_coords):
 
         theta_weight = 1.0 # maybe make this a tunable parameter
         finite_count = jnp.sum(finite_mask)
-        # reference theta is obtained from points within a radius threshold
-        n_ref = jnp.clip(finite_count, 1, 10)
-        percentile = 100.0 / n_ref
-        # jnp.percentile can deal with nans
-        r_thresh = jnp.percentile(
-            jnp.where(finite_mask, pc_r, jnp.nan),
-            percentile)
-        
+
+        percentile = 100.0 / n_elements
+        r_thresh = safe_percentile(pc_r, percentile)
+        # close_mask gives 0s if point is not finite or outside the threshold, and 
+        # 1s if point is finite and within the threshold
+        small_enough_r = pc_r <= r_thresh
         close_mask = (finite_mask & (pc_r <= r_thresh)).astype(jnp.float64)
-        theta_ref = circular_median(pc_theta, weights=close_mask)
+        # circular median can not have nans passed in,
+        # so change nans to 0 (this is fine because they already have weight=0 in the median calculation)
+        pc_theta_no_nan = jnp.where(finite_mask, pc_theta, 0.0)
+        theta_ref = circular_median(pc_theta_no_nan, weights=close_mask)
 
         # cyclic angular deviation
         theta_dev = jnp.pi - jnp.abs(
@@ -1158,23 +1277,22 @@ def get_distance_metric(ra_coords, dec_coords):
         )
 
         distance_metric = pc_r * jnp.sqrt(1.0 + (theta_weight * theta_dev) ** 2)
-        distance_metric = jnp.where(finite_mask, distance_metric, jnp.inf)
-
+        distance_metric = jnp.where(finite_mask, distance_metric, to_float64(BIG))
         trace = {
-            "n_points": pc_r.size,
-            "n_finite_points": finite_count,
-            "n_reference_points": n_ref,
-            "r_percentile_thresh": percentile,
-            "r_thresh": r_thresh,
-            "theta_ref": theta_ref,
-            "theta_weight": theta_weight,
-            "close_point_count": close_mask.size,
+            "n_points":            jnp.array(pc_r.size,       dtype=jnp.int32),
+            "n_finite_points":     jnp.array(finite_count,    dtype=jnp.int32),
+            "n_reference_points":  jnp.array(jnp.sum(small_enough_r), dtype=jnp.int32),
+            "r_percentile_thresh": to_float64(percentile),
+            "r_thresh":            r_thresh,
+            "theta_ref":           theta_ref,
+            "theta_weight":        theta_weight,
+            "close_point_count":   jnp.array(close_mask.size, dtype=jnp.int32),
         }
 
         return distance_metric, trace
     
     return jax.lax.cond(finite_mask.any(), notempty_case, empty_case, operand=None)
-
+    
 @jax.jit
 def cartesian_to_polar(x, y):
     '''
@@ -1182,7 +1300,7 @@ def cartesian_to_polar(x, y):
     e.g. inputs could be RA and Dec offsets
     Note theta is returned in radians
     '''
-    r = jnp.sqrt(x**2 + y**2)
+    r = jnp.sqrt(x**2 + y**2 + to_float64(1e-60)) # small value for gradient stability
     theta = jnp.arctan2(y, x) # angle wrt x-axis, in radians
 
     return (r, theta)
