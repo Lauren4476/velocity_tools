@@ -9,11 +9,13 @@ The assumed input units are:
 - velocity: km/s
 - mass: solar masses
 - angles (PA, i, theta, phi...): radians
-- Omega (angular velocity): 1/s
+- mu (rc/r0): dimensionless, in (0, 1)
+- Omega (angular velocity): 1/s, only used when converting to/from mu
 - distance to source: pc
+
+Last updated: 19-06-2026
 '''
 
-#from dbm import _error
 
 import astropy.units as u
 from matplotlib.pyplot import rc
@@ -21,8 +23,6 @@ from ..helper_functions import *
 import jax
 import jax.numpy as jnp
 from jax.experimental import checkify
-# from jax import lax
-# from jax import debug
 jax.config.update("jax_enable_x64", True)
 from typing import NamedTuple
 
@@ -74,9 +74,21 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     r_cent_au = r_cent * (jnp.power(au_in_km, 2)) # in au
     return r_cent_au
 
+@jax.jit
+def omega_from_mu(mu, mass, r0):
+    omega_squared = mu * G * mass / jnp.power(r0, 3) # in km^2 au^-3
+    omega = jnp.sqrt(omega_squared) / au_in_km # in 1/s
+    return omega
 
 @jax.jit
-def build_stream_quantities(mass, r0, theta0, omega, v_r0):
+def mu_from_omega(omega, mass, r0):
+    rc = r_cent(mass=mass, omega=omega, r0=r0)
+    mu = rc / r0
+    return mu
+
+
+@jax.jit
+def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     '''
     precompute streamer quantities reused throughout file, and 
     store in class StreamState (near top)
@@ -90,8 +102,8 @@ def build_stream_quantities(mass, r0, theta0, omega, v_r0):
         v_r0  # normal values -> unchanged
         )
 
-    rc = r_cent(mass=mass, omega=omega, r0=r0)
-    mu = rc / r0
+    mu = to_float64(mu)
+    rc = mu * r0
     nu = v_r0 * jnp.sqrt(rc / (G * mass))
     sin_theta0 = jnp.sin(theta0)
     sin_theta0_sq = jnp.power(sin_theta0, 2)
@@ -187,12 +199,10 @@ def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radian
     initial radius and it describes the entire trajectory.
 
     :param r: au
-    :param mass: Msun
-    :param r0: au
+    :param r_mask: boolean mask for valid r values (r < r0 and r > 0.5*rc)
+    :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
     :param phi0: radians
-    :param omega: 1/s
-    :param v_r0: Initial radial velocity, km/s
     :return: theta, radians
     '''
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
@@ -203,12 +213,6 @@ def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radian
     # orb_ang is varphi in Mendoza+2009
     # at initial position r_to_rc = r0/rc = 1/mu
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-
-    # compute r_to_rc for the full array
-    # for invalid points (r_mask=False) substitute a safe sentinel value of 0.6.
-    # 0.6 > 0.5 so it passes through get_orb_ang / get_dphi without triggering
-    # any near-zero divisions, and its gradient stays finite
-    # but we can still compute the full arrays for jax/jit compatibility
 
     r_to_rc_raw = r / rc
     r_to_rc = jnp.where(r_mask, r_to_rc_raw, to_float64(0.6))
@@ -246,12 +250,8 @@ def stream_line_vel(
 
     :param theta: radians
     :param r: au
-    :param mass: Msun
-    :param r0: au
+    :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
-    :param phi0: radians
-    :param omega: 1/s
-    :param v_r0: Initial radial velocity, km/s
     :return: v_r, v_theta, v_phi in units of km/s
     '''
     rc = stream_state.rc
@@ -264,12 +264,6 @@ def stream_line_vel(
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
                   * jnp.sqrt(jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2))
     v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
-
-    # # turn nans to zeros for output to avoid nans in gradients.
-    # # they will be masked out later by valid_mask in the final output
-    # v_r_all = jnp.where(valid_mask, v_r_all, 0.0)
-    # v_theta_all = jnp.where(valid_mask, v_theta_all, 0.0)
-    # v_phi_all = jnp.where(valid_mask, v_phi_all, 0.0)
 
     return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
 
@@ -322,6 +316,7 @@ def rotate_xyz(x, y, z, rotation_matrix):
 
     return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
+#TODO: might not be nneeded
 def check_rc_r0(rc, r0):
     '''check that centrifugal radius is smaller than initial radius of streamline, otherwise the model is not valid'''
     checkify.check(
@@ -338,7 +333,7 @@ def check_r_array(r, r_low):
     )
 
 def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
-               phi0=jnp.radians(15), omega=1e-14, v_r0=0,
+               phi0=jnp.radians(15), mu=0.1, v_r0=0,
                inc=0, pa=0, rmin=None, deltar=1, npoints=10000):
     '''
     it gets xyz coordinates and velocities for a stream line.
@@ -353,7 +348,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :param r0: Initial radius of streamline (unitless, au)
     :param theta0: Initial polar angle of streamline (unitless, radians)
     :param phi0: Initial azimuthal angle of streamline (unitless, radians)
-    :param omega: Angular rotation. (defined positive), (unitless,1/s)
+    :param mu: dimensionless, rc/r0 in (0, 1)
     :param v_r0: Initial radial velocity of the streamline, (km/s)
     :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (unitless, radians)
     :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (unitless, radians)
@@ -370,12 +365,12 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
     theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
     phi0 = jnp.asarray(phi0, dtype=FLOAT_DTYPE)
-    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
+    mu = jnp.asarray(mu, dtype=FLOAT_DTYPE)
     v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
     inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
     pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
     deltar = jnp.asarray(deltar, dtype=FLOAT_DTYPE)
-    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, omega=omega, v_r0=v_r0)
+    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
     rc = stream_state.rc
     mu = stream_state.mu
     ecc = stream_state.ecc
@@ -411,14 +406,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     v_phi0 = stream_state.vk0 * jnp.sin(theta0) * stream_state.mu
     v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
 
-    # use mask to convert nans to zeros 
-    # r_full = jnp.where(valid_mask_full, r_full, 0.0)
-    # theta_full = jnp.where(valid_mask_full, theta_full, 0.0)
-    # phi_full = jnp.where(valid_mask_full, phi_full, 0.0)
-    # orb_ang_full = jnp.where(valid_mask_full, orb_ang_full, 0.0)
-    # v_r_full = jnp.where(valid_mask_full, v_r_full, 0.0)
-    # v_theta_full = jnp.where(valid_mask_full, v_theta_full, 0.0)
-    # v_phi_full = jnp.where(valid_mask_full, v_phi_full, 0.0)
     # convert from spherical into cartesian coordinates
     v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \
           + v_theta_full * jnp.cos(theta_full) * jnp.cos(phi_full) \

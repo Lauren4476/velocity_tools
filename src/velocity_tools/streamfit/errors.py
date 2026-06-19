@@ -188,18 +188,20 @@ CANONICAL_UNITS = {
     "inc": u.rad,
     "pa": u.rad,
     "v_r0": u.km / u.s,
-    "omega": 1 / u.s,
     "mass": u.Msun,
     "rmin": u.au,
     "deltar": u.au,
     "v_lsr": u.km / u.s,
+    "rc": u.au, 
+    # mu = rc/r0 is dimensionless, so no units
 }
 
 STREAMLINE_MODEL_PARAM_KEYS = (
     'r0',
     'theta0',
     'phi0',
-    'log_omega',
+    'rc',
+    'mu',
     'v_r0',
     'mass',
     'inc',
@@ -238,12 +240,6 @@ def to_float64(value):
     return jnp.asarray(value, dtype=jnp.float64)
 
 
-
-
-
-
-
-
 def clean_model_param_dict(params, dict_name):
     """Convert parameter dictionary to float64 and standardise it"""
     if params is None:
@@ -254,6 +250,9 @@ def clean_model_param_dict(params, dict_name):
     sanitized = {}
 
     for key, val in params.items():
+        if val is None:
+            sanitized[key] = None
+            continue
         if isinstance(val, u.Quantity):
             if key not in CANONICAL_UNITS:
                 raise ValueError(f"The parameter {key} doesn't have defined canonical units...")
@@ -261,10 +260,10 @@ def clean_model_param_dict(params, dict_name):
         # if it's already a raw number, assume it's already correct
         sanitized[key] = jnp.asarray(val, dtype=jnp.float64)
 
-    if 'omega' in sanitized and 'log_omega' not in sanitized:
-        sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
-    if 'omega' in sanitized:
-        del sanitized['omega']
+    # if 'omega' in sanitized and 'log_omega' not in sanitized:
+    #     sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
+    # if 'omega' in sanitized:
+    #     del sanitized['omega']
 
     tiny = to_float64(1e-8)
     # Protect against exact polar-angle edge values which can cause
@@ -327,7 +326,9 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
     missing = []
     for key in STREAMLINE_MODEL_PARAM_KEYS:
         if key not in opt_params and key not in fixed_params:
-            missing.append(key)
+            # append if it's not mu
+            if key != 'mu':
+                missing.append(key)
     if missing:
         raise KeyError(
             "Missing required streamline parameters across initial_opt_params and fixed_params: "
@@ -427,7 +428,6 @@ def forward_model(opt_params, fixed_params, distance_pc):
     model_params, opt_params, fixed_params = prepare_model_params(opt_params, fixed_params)
     distance_pc = to_float64(distance_pc)
 
-    omega = jnp.exp(model_params['log_omega'])
 
     # Protect near-zero v_r0 from creating singularities in physics calculations
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
@@ -439,13 +439,16 @@ def forward_model(opt_params, fixed_params, distance_pc):
         v_r0_protected
         )
     
+    if 'mu' not in model_params:
+        mu = model_params['rc'] / model_params['r0']
+        model_params['mu'] = mu
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = xyz_stream(
         mass=model_params['mass'],
         r0=model_params['r0'],
         theta0=model_params['theta0'],
         phi0=model_params['phi0'],
-        omega=omega,
+        mu=model_params['mu'],
         v_r0=v_r0_protected,
         inc=model_params['inc'],
         pa=model_params['pa'],
@@ -780,9 +783,21 @@ def r_cent(mass, omega=1e-14, r0=1e4):
     r_cent_au = r_cent * (jnp.power(au_in_km, 2)) # in au
     return r_cent_au
 
+@jax.jit
+def omega_from_mu(mu, mass, r0):
+    omega_squared = mu * G * mass / jnp.power(r0, 3) # in km^2 au^-3
+    omega = jnp.sqrt(omega_squared) / au_in_km # in 1/s
+    return omega
 
 @jax.jit
-def build_stream_quantities(mass, r0, theta0, omega, v_r0):
+def mu_from_omega(omega, mass, r0):
+    rc = r_cent(mass=mass, omega=omega, r0=r0)
+    mu = rc / r0
+    return mu
+
+
+@jax.jit
+def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     '''
     precompute streamer quantities reused throughout file, and 
     store in class StreamState (near top)
@@ -791,7 +806,7 @@ def build_stream_quantities(mass, r0, theta0, omega, v_r0):
     mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
     r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
     theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
-    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
+    mu = jnp.asarray(mu, dtype=FLOAT_DTYPE)
     v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
 
     # Protect near-zero v_r0 from creating singularities in nu calculation
@@ -803,8 +818,8 @@ def build_stream_quantities(mass, r0, theta0, omega, v_r0):
         v_r0  # normal values -> unchanged
         )
 
-    rc = r_cent(mass=mass, omega=omega, r0=r0)
-    mu = rc / r0
+
+    rc = mu * r0
     nu = v_r0 * jnp.sqrt(rc / (G * mass))
     sin_theta0 = jnp.sin(theta0)
     sin_theta0_sq = jnp.power(sin_theta0, 2)
@@ -889,12 +904,9 @@ def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     initial radius and it describes the entire trajectory.
 
     :param r: au
-    :param mass: Msun
-    :param r0: au
+    :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
     :param phi0: radians
-    :param omega: 1/s
-    :param v_r0: Initial radial velocity, km/s
     :return: theta, radians
     '''
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
@@ -936,12 +948,8 @@ def stream_line_vel(
 
     :param theta: radians
     :param r: au
-    :param mass: Msun
-    :param r0: au
+    :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
-    :param phi0: radians
-    :param omega: 1/s
-    :param v_r0: Initial radial velocity, km/s
     :return: v_r, v_theta, v_phi in units of km/s
     '''
     rc = stream_state.rc
@@ -1007,7 +1015,7 @@ def rotate_xyz(x, y, z, rotation_matrix):
 
 
 def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
-               phi0=jnp.radians(15), omega=1e-14, v_r0=0,
+               phi0=jnp.radians(15), mu=0.1, v_r0=0,
                inc=jnp.radians(0), pa=jnp.radians(0), rmin=None, deltar=1):
     '''
     it gets xyz coordinates and velocities for a stream line.
@@ -1022,7 +1030,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :param r0: Initial radius of streamline (au)
     :param theta0: Initial polar angle of streamline (radians)
     :param phi0: Initial azimuthal angle of streamline (radians)
-    :param omega: Angular rotation. (defined positive), (1/s)
+    :param mu: dimensionless parameter related to rotation, mu = r_cent/r0
     :param v_r0: Initial radial velocity of the streamline, (km/s)
     :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (radians)
     :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (radians)
@@ -1035,7 +1043,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
     theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
     phi0 = jnp.asarray(phi0, dtype=FLOAT_DTYPE)
-    omega = jnp.asarray(omega, dtype=FLOAT_DTYPE)
+    mu = jnp.asarray(mu, dtype=FLOAT_DTYPE)
     v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
     inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
     pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
@@ -1043,7 +1051,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     if rmin is not None:
         rmin = jnp.asarray(rmin, dtype=FLOAT_DTYPE)
 
-    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, omega=omega, v_r0=v_r0)
+    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
     rc = stream_state.rc
     mu = stream_state.mu
     ecc = stream_state.ecc

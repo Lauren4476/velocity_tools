@@ -25,13 +25,10 @@ def param_for_display(key, value):
     """
     Format parameter for display in output, with units. Notably:
     - converts angles (theta0, phi0, inc, pa) from radians to degrees
-    - log_omega is displayed as omega in 1/s.
     Returns (display_key, display_value, unit_str)
     """
     if key in gradient_descent.ANGLE_KEYS:
         return key, math.degrees(float(value)), 'deg'
-    if key == 'log_omega':
-        return 'omega', math.exp(float(value)), '1/s'
     unit = gradient_descent.DISPLAY_UNITS.get(key, '')
     return key, float(value), unit
 
@@ -162,9 +159,6 @@ def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folde
             raw_err = float(param_errors[raw_key])
             if raw_key in gradient_descent.ANGLE_KEYS:
                 display_err = math.degrees(raw_err)
-            elif raw_key == 'log_omega':
-                # sigma_omega = omega * sigma_log_omega
-                display_err = display_val * raw_err
             else:
                 display_err = raw_err
             entry['sigma'] = display_err
@@ -1487,7 +1481,7 @@ def plot_streamline_covariance_samples(best_opt_params,
         plt.savefig(f'{save_folder}/streamline_covariance_samples.png', dpi=300, bbox_inches='tight')
     else:
         plt.show()
-        
+
 
 def generate_streamline_samples(best_opt_params, covariance, opt_keys, fixed_params, distance, param_bounds=None, n_samples=100):
     """

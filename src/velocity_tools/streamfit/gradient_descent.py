@@ -4,7 +4,7 @@ This file contains the loss function and optimisation routines for streamfit.
 The optimisation uses adam (adaptive moment estimation) optimiser to fit
 streamline model parameters to observed data by minimizing chi-squared loss.
 
-Last updated: 02-06-26
+Last updated: 19-06-2026
 '''
 
 import os
@@ -62,11 +62,12 @@ CANONICAL_UNITS = {
     "inc": u.rad,
     "pa": u.rad,
     "v_r0": u.km / u.s,
-    "omega": 1 / u.s,
     "mass": u.Msun,
     "rmin": u.au,
     "deltar": u.au,
     "v_lsr": u.km / u.s,
+    "rc": u.au,
+    # mu = rc/r0 is dimensionless, so no units
 }
 
 ANGLE_KEYS = {'theta0', 'phi0', 'inc', 'pa'}
@@ -77,14 +78,16 @@ DISPLAY_UNITS = {
         'rmin':    'au',
         'deltar':  'au',
         'v_lsr':   'km/s',
-        'omega':   '1/s',
+        'rc':      'au',
+        # mu is dimensionless
     }
 
 STREAMLINE_MODEL_PARAM_KEYS = (
     'r0',
     'theta0',
     'phi0',
-    'log_omega',
+    'rc',
+    'mu',
     'v_r0',
     'mass',
     'inc',
@@ -188,10 +191,10 @@ def clean_model_param_dict(params, dict_name):
         # if it's already a raw number, assume it's already correct
         sanitized[key] = jnp.asarray(val, dtype=jnp.float64)
 
-    if 'omega' in sanitized and 'log_omega' not in sanitized:
-        sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
-    if 'omega' in sanitized:
-        del sanitized['omega']
+    # if 'omega' in sanitized and 'log_omega' not in sanitized:
+    #     sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
+    # if 'omega' in sanitized:
+    #     del sanitized['omega']
 
     tiny = to_float64(1e-8)
     # Protect against exact polar-angle edge values which can cause
@@ -254,7 +257,9 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
     missing = []
     for key in STREAMLINE_MODEL_PARAM_KEYS:
         if key not in opt_params and key not in fixed_params:
-            missing.append(key)
+            # append if it's not mu
+            if key != 'mu':
+                missing.append(key)
     if missing:
         raise KeyError(
             "Missing required streamline parameters across initial_opt_params and fixed_params: "
@@ -280,25 +285,25 @@ def prepare_model_params(opt_params, fixed_params):
 
 
 def standardise_param_bounds(param_bounds):
-    """Check/standardise parameter-bound keys and convert omega bounds to log-space."""
+    """Check/standardise parameter-bound keys"""
     if param_bounds is None:
         return None
 
     standardised = dict(param_bounds)
-    if 'omega' in standardised:
-        if 'log_omega' in standardised:
-            raise KeyError(
-                "param_bounds contains both 'omega' and 'log_omega'. "
-                "Please provide only one of these."
-            )
-        omega_min, omega_max = standardised.pop('omega')
-        omega_min = float(omega_min.value)
-        omega_max = float(omega_max.value)
-        if omega_min <= 0 or omega_max <= 0:
-            raise ValueError("'omega' bounds must be positive")
-        if omega_min >= omega_max:
-            raise ValueError("'omega' bounds must satisfy omega_min < omega_max")
-        standardised['log_omega'] = (math.log(omega_min), math.log(omega_max))
+    # if 'omega' in standardised:
+    #     if 'log_omega' in standardised:
+    #         raise KeyError(
+    #             "param_bounds contains both 'omega' and 'log_omega'. "
+    #             "Please provide only one of these."
+    #         )
+    #     omega_min, omega_max = standardised.pop('omega')
+    #     omega_min = float(omega_min.value)
+    #     omega_max = float(omega_max.value)
+    #     if omega_min <= 0 or omega_max <= 0:
+    #         raise ValueError("'omega' bounds must be positive")
+    #     if omega_min >= omega_max:
+    #         raise ValueError("'omega' bounds must satisfy omega_min < omega_max")
+    #     standardised['log_omega'] = (math.log(omega_min), math.log(omega_max))
 
     unknown = sorted(key for key in standardised if key not in STREAMLINE_MODEL_PARAM_KEYS)
     if unknown:
@@ -321,7 +326,7 @@ def build_normalisation_spec(opt_params, param_bounds):
     missing = []
     for key in opt_params:        
         if key not in param_bounds:
-            missing.append(key)
+                missing.append(key)
     if missing:
         raise ValueError(
             "Missing bounds for optimised parameters: "
@@ -387,26 +392,24 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
 
 
 def with_derived_omega(opt_params):
-    """Return a copy of the opt params including omega, when it is available"""
+    """Return a copy of the opt params including derived omega, when mu/mass/r0 are preesent"""
     params_with_omega = opt_params.copy()
-    if 'log_omega' in params_with_omega and 'omega' not in params_with_omega:
-        params_with_omega['omega'] = jnp.exp(params_with_omega['log_omega'])
+    if 'mu' in params_with_omega and 'omega' not in params_with_omega:
+        if 'mass' in params_with_omega and 'r0' in params_with_omega:
+            params_with_omega['omega'] = stream_lines_grad.omega_from_mu(mu=params_with_omega['mu'], mass=params_with_omega['mass'], r0=params_with_omega['r0'])
     return params_with_omega
-
 
 def format_param(key, value):
     """
     Format parameter for display in output, with units. Notably:
     - converts angles (theta0, phi0, inc, pa) from radians to degrees
-    - log_omega is displayed as omega in 1/s.
     """
     val = float(value)
     if key in ANGLE_KEYS:
         deg = math.degrees(val)
         return f"{deg:.6g} deg"
-    if key == 'log_omega':
-        omega = math.exp(val)
-        return f"{omega:.6g} 1/s  (log_omega = {val:.6g})"
+    if key == 'mu':
+        return f"{val:.6g} (rc/r0)"
     unit = DISPLAY_UNITS.get(key, '')
     if unit:
         suffix = f" {unit}"
@@ -510,8 +513,6 @@ def forward_model(model_params, distance_pc, npoints=10000):
 
     distance_pc = to_float64(distance_pc)
 
-    omega = jnp.exp(model_params['log_omega'])
-
     # Protect near-zero v_r0 from creating singularities in physics calculations
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
     v_r0_protected = model_params['v_r0']
@@ -525,16 +526,19 @@ def forward_model(model_params, distance_pc, npoints=10000):
     # Run the forward model - returns positions in au, velocities in km/s
     # valid_mask is a boolean array marking which points are valid in the returned arrays, 
     # which can be used for masking in the loss function
-    # sense check: points not covered by valid_mask should be 0 here
     rmin = model_params['rmin']
     if rmin is None:
         rmin = to_float64(0.0)  # rc*0.5 will always dominate in jnp.maximum
+    # calculate mu and add to model_params if not already present, as it's needed for the forward model
+    if 'mu' not in model_params:
+        mu = model_params['rc'] / model_params['r0']
+        model_params['mu'] = mu
     err, ((x, y, z), (vx, vy, vz), valid_mask) = stream_lines_grad.checked_xyz_stream(
         mass=model_params['mass'],
         r0=model_params['r0'],
         theta0=model_params['theta0'],
         phi0=model_params['phi0'],
-        omega=omega,
+        mu=model_params['mu'],
         v_r0=v_r0_protected,
         inc=model_params['inc'],
         pa=model_params['pa'],
@@ -940,8 +944,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
     Returns:
     --------   
-    dict: optimised parameters (same keys as initial_opt_params), including
-        derived 'omega' when 'log_omega' is optimised.
+    dict: optimised parameters (same keys as initial_opt_params), also including
+        derived 'omega' when 'mu', 'mass', and 'r0' are available
     list: Loss history (indexed by epoch: loss_history[i] = loss at epoch i)
     """
     # Initialize parameters
@@ -1015,8 +1019,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     if initial_error_message is not None:
         raise ValueError(
             f"Initial loss computation failed with error: {initial_error_message}. "
-            "Adjust initial parameter guess or bounds such that the centrifugal radius "
-            "is smaller than r0 before starting the optimisation."
         )
     
     initial_loss = float(initial_loss)
@@ -1057,7 +1059,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         log_file = open(log_file, 'w', newline='')
         # Create header: epoch, loss, then all optimisable params
         fieldnames = ['epoch', 'loss'] + opt_param_keys
-        if 'log_omega' in opt_params and 'omega' not in fieldnames:
+        if 'mu' in opt_params and 'omega' not in fieldnames:
+            # also log derived omega alonside mu for convenience in comparing to old models
             fieldnames.append('omega')
         log_writer = csv.DictWriter(log_file, fieldnames=fieldnames)
         log_writer.writeheader()
@@ -1097,8 +1100,13 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_param_keys:
             row[key] = float(opt_params[key])
-        if 'log_omega' in opt_params:
-            row['omega'] = float(jnp.exp(opt_params['log_omega']))
+        if 'mu' in opt_params:
+            # derive omega from mu, mass, r0 for logging convenience
+            mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
+            r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
+            if mass_val is not None and r0_val is not None:
+                omega_val = stream_lines_grad.omega_from_mu(mu=opt_params['mu'], mass=mass_val, r0=r0_val)
+                row['omega'] = float(omega_val)
         log_writer.writerow(row)
         log_file.flush()
     
@@ -1133,6 +1141,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 if key == 'phi0':
                     # phi0 is a cyclic parameter; wrap to [0, 1) in normalised space to enforce bounds
                     opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0) 
+                elif key == 'mu':
+                    # mu = rc/r0 must be strictly positive, as mu=0 causes rc=0 which is problematic
+                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
                 else:
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
 
@@ -1172,8 +1183,7 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             if error_message is not None:
                 print(
                     f"\nStopping at epoch {epoch}: {error_message} "
-                    "This probably means that the current parameters have become unphysical (e.g. centrifugal radius larger than r0). "
-                    "Consider tightening bounds on mass/r0/omega to avoid this region."
+                    "This probably means that the current parameters have become unphysical. Consider tightening bounds."
                 )
 
 
@@ -1186,8 +1196,12 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 row = {'epoch': epoch, 'loss': loss_value}
                 for key in opt_param_keys:
                     row[key] = float(opt_params[key])
-                if 'log_omega' in opt_params:
-                    row['omega'] = float(jnp.exp(opt_params['log_omega']))
+                if 'mu' in opt_params:
+                    mass_val = opt_params['mass'] if 'mass' in opt_params else fixed_params.get('mass', None)
+                    r0_val = opt_params['r0'] if 'r0' in opt_params else fixed_params.get('r0', None)
+                    if mass_val is not None and r0_val is not None:
+                        omega_val = stream_lines_grad.omega_from_mu(mu=opt_params['mu'], mass=mass_val, r0=r0_val)
+                        row['omega'] = float(omega_val)
                 log_writer.writerow(row)
                 log_file.flush()
         
