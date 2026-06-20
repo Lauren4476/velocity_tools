@@ -14,13 +14,14 @@ def estimate_covariance_at_best_fit(
     distance,
     loss_method=0,
     gradient_tol=1e-1,
+    rotation_key=None,
 ):
     """ wrapper around estimate_parameter_errors for convenient using after fit_streamline has finished"""
     opt_keys = list(initial_opt_params.keys())
     best_for_cov = {k: float(best_opt_params[k]) for k in opt_keys}
     # prepare data-only quantities once
     prepared_data = prepare_data(data, uncertainties, n_elements=len(data[0]))
-    param_errors, cov = estimate_parameter_errors(
+    param_errors, cov, cov_transformed_dict = estimate_parameter_errors(
         best_for_cov,
         fixed_params,
         data,
@@ -30,8 +31,9 @@ def estimate_covariance_at_best_fit(
         loss_method=loss_method,
         gradient_tol=gradient_tol,
         normalisation_spec=None,
+        rotation_key=rotation_key,
     )
-    return opt_keys, param_errors, cov
+    return opt_keys, param_errors, cov, cov_transformed_dict
 
 
 def estimate_parameter_errors(
@@ -45,6 +47,7 @@ def estimate_parameter_errors(
     gradient_tol=1e-1,
     normalisation_spec=None,
     best_norm_opt_params=None,
+    rotation_key=None,
 ):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
@@ -63,6 +66,8 @@ def estimate_parameter_errors(
     best_norm_opt_params : dict or None
         Normalised parameters at best-fit state, used for gradient_tol_check.
         If not provided, will be computed from best_opt_params and normalisation_spec, but providing it can save a redundant computation
+    rotation_key : str or None
+        If provided, must be 'rc' or 'omega'. Used to transform covariance matrix from optimised 'mu' to rotation_key
 
     Returns
     -------
@@ -70,6 +75,11 @@ def estimate_parameter_errors(
         1-sigma uncertainties for each optimisable parameter
     array
         covariance matrix
+    dict or None
+        If rotation_key was given and 'mu' was optimised: {'keys': new_keys, 'cov': new_cov, 'errors': error_dict} 
+        where new_keys is same as original keys but with 'mu' replaced by rotation_key, 
+        new_cov is the covariance matrix transformed into the original parameter space, 
+        and error_dict is the dict of 1-sigma errors for each parameter in new_keys.
     """
     if gradient_tol is not None:
         gradient_tol = float(gradient_tol)
@@ -130,9 +140,9 @@ def estimate_parameter_errors(
                 return chi2_total
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-            # print the gradient per parameter for debugging
-            for i, key in enumerate(norm_keys):
-                print(f"Gradient for {key} at best-fit parameters: {norm_grad_vec[i]:.3e}")
+            # # print the gradient per parameter for debugging
+            # for i, key in enumerate(norm_keys):
+            #     print(f"Gradient for {key} at best-fit parameters: {norm_grad_vec[i]:.3e}")
             norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
             print(f"Gradient magnitude at best-fit parameters: {norm_grad_norm:.3e}")
 
@@ -147,10 +157,6 @@ def estimate_parameter_errors(
                 print("    - Reducing learning rate for finer convergence")
                 print("    - Reducing loss_threshold if used")
             
-
-
-
-
     # compute Hessian
     H = jax.hessian(loss_vec)(params_vec)
 
@@ -162,8 +168,76 @@ def estimate_parameter_errors(
 
     error_dict = {k: float(errors[i]) for i, k in enumerate(keys)}
 
-    return error_dict, cov
+    cov_transformed_dict = None
+    if rotation_key is not None and 'mu' in keys:
+        cov_transformed_dict = rotation_param_in_cov(cov, keys, best_opt_params, fixed_params, rotation_key)
 
+    return error_dict, cov, cov_transformed_dict
+
+def rotation_param_in_cov(cov, keys, best_opt_params, fixed_params, rotation_key):
+    """Transform a covariance matrix computed in optimisation space (rotation param is mu)
+    into the equivalent covariance matrix for the original input rotation parameter (rc or omega).
+
+    Maths:
+    if A = original optimisation-space parameter vector (with mu)
+    and B = transformed parameter vector with with rc or omega instead of mu,
+    then covariance in B space is
+
+    cov_B = J @ cov_A @ J^T
+
+    where J is the Jacobian of the transformation from A to B, evaluated at the best-fit parameters
+    J = d(B) / d(A)  (identity except for row corresponding to mu)
+
+    Parameters:
+    cov: covariance matrix from estimate_parameter_errors, in same parameter order as 'keys'
+    keys: list of str. optimised parameter names, must include 'mu'
+    best_opt_params: dict of best-fit optimised parameters (the point at which we evaluate J)
+    fixed_params: dict of fixed parameters (the point at which we evaluate J)
+    rotation_key: str, 'rc' or 'omega', the original rotation parameter which we want to transform into
+
+    Returns:
+    new_cov: covariance matrix transformed into original parameter space, with same order as keys but with 'mu' replaced by rotation_key
+    new_keys: list of str, same as keys but with 'mu' replaced by rotation_key
+    errors: dict of 1-sigma errors for each parameter in new_keys
+    """
+
+    if rotation_key not in ['rc', 'omega']:
+        raise ValueError(f"rotation_key must be 'rc' or 'omega', got {rotation_key}")
+    if 'mu' not in keys:
+        raise ValueError(f"keys must include 'mu' for covariance transformation, got {keys}")
+    # check that we have mass and r0 available to convert mu to rc or omega
+    for required_key in ('mass', 'r0'):
+        if required_key not in best_opt_params and required_key not in fixed_params:
+            raise ValueError(f"'{required_key}' must be present in either best_opt_params or fixed_params")
+        
+    params_vec = jnp.array([best_opt_params[k] for k in keys], dtype=jnp.float64)
+
+    def transform(vec_A):
+        opt_params = vector_to_params_dict(vec_A, keys)
+        combined_params = {**fixed_params, **opt_params}
+        mu = combined_params['mu']
+        mass = combined_params['mass']
+        r0 = combined_params['r0']
+        if rotation_key == 'rc':
+            rotation_val = mu * r0
+        else: # 'omega'
+            rotation_val = stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
+        output = []
+        for k in keys:
+            if k == 'mu':
+                output.append(rotation_val)
+            else:
+                output.append(opt_params[k])
+        return jnp.stack(output)
+    
+    J = jax.jacobian(transform)(params_vec)
+    new_cov = J @ cov @ J.T
+
+    new_keys = [rotation_key if k == 'mu' else k for k in keys]
+    new_sigmas = jnp.sqrt(jnp.diag(new_cov))
+    error_dict = {k: float(new_sigmas[i]) for i, k in enumerate(new_keys)}
+
+    return {'keys': new_keys, 'cov': new_cov, 'errors': error_dict}
 
 #-------------------- old gradient_descent.py ---------------------
 
@@ -330,18 +404,12 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
 
     all_params = set(opt_params) | set(fixed_params)
 
-    # check that exactly one of 'rc' or 'omega' is provided
-    has_rc = 'rc' in all_params
-    has_omega = 'omega' in all_params
-    if has_rc and has_omega:
+    # check that exactly one of rc, omega, or mu (the rotation keys) is supplied
+    rotation_keys_present = [ key for key in ('rc', 'omega', 'mu') if key in all_params]
+    if len(rotation_keys_present) != 1:
         raise KeyError(
-            "Both 'rc' and 'omega' are present in parameters."
-            "Please provide only one of them, not both, because they are degenerate (mu=rc/r0=GM/omega^2/r0^3)."
+            f"Exactly one of 'rc', 'omega', or 'mu' must be provided. You have provided: {rotation_keys_present}"
         )
-    if not has_rc and not has_omega:
-        raise KeyError(
-            "Missing: Either 'rc' or 'omega' must be provided in parameters. You have input neither"
-            )
     
     # now check all other required parameters are present (except mu, rc, omega, which are already dealt with)
     already_dealt_with = {'rc', 'omega', 'mu'}
@@ -459,15 +527,17 @@ def forward_model(opt_params, fixed_params, distance_pc):
         v_r0_protected
         )
 
-    if 'mu' not in model_params:
-        if 'rc' in model_params:
-            mu = model_params['rc'] / model_params['r0']
-        elif 'omega' in model_params:
-            mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
-        else:
-            raise ValueError("model_params must contain either 'rc' or 'omega' to derive mu=rc/r0")
-        model_params['mu'] = mu
-        
+    # derive mu from rc or omega (whicever is provided)
+    if 'mu' in model_params:
+        mu = model_params['mu']
+    elif 'rc' in model_params:
+        mu = model_params['rc'] / model_params['r0']
+    elif 'omega' in model_params:
+        mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    else:
+        raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
+    model_params['mu'] = mu
+
     # Run the forward model - returns positions in au, velocities in km/s
     (x, y, z), (vx, vy, vz) = xyz_stream(
         mass=model_params['mass'],

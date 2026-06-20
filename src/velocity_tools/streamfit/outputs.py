@@ -46,7 +46,8 @@ def plot_fitting_results(
     pc_coords,
     v_lsr,
     save_folder,
-    show_plots=False
+    show_plots=False,
+    transformed_cov_result=None,
 ):
     """
     Generate and save the followingbest-fit diagnostic plots to save_folderafter optimisation:
@@ -71,6 +72,7 @@ def plot_fitting_results(
     v_lsr : float or None, km/s
     save_folder : str, directory to write figures into (created if absent).
     show_plots : bool, whether to display plots (in addition to saving). Default False
+    transformed_cov_result: dict or None. keys expected: 'keys', 'cov', 'errors'.
     """
  
     ra_data, dec_data, v_data = data
@@ -131,10 +133,18 @@ def plot_fitting_results(
  
     # Uncertainty plots (only if error estimation succeeeded)
     if param_errors is not None and cov_matrix is not None:
-        param_vals = np.array([float(ordered_best_opt_params[k]) for k in opt_param_keys], dtype=float)
-        param_errs = np.array([float(param_errors[k]) for k in opt_param_keys], dtype=float)
-        plot_param_uncertainties(opt_param_keys, param_vals, param_errs, save_folder=save_folder, show=show_plots)
-        plot_param_correlations(opt_param_keys, cov_matrix, save_folder=save_folder, show=show_plots)
+        if transformed_cov_result is not None:
+            plot_keys = transformed_cov_result['keys']   # 'mu' replaced by 'rc'/'omega'
+            plot_cov  = transformed_cov_result['cov']    # Jacobian-transformed covariance with 'mu' replaced by 'rc'/'omega'
+            plot_errors = transformed_cov_result['errors'] # 'mu' error transformed to 'rc'/'omega' error
+        else:
+            plot_keys   = opt_param_keys
+            plot_cov    = cov_matrix
+            plot_errors = param_errors
+        param_vals = np.array([float(ordered_best_opt_params.get(k, 0.0)) for k in opt_param_keys], dtype=float)
+        param_errs = np.array([float(plot_errors[k]) for k in plot_keys], dtype=float)
+        plot_param_uncertainties(plot_keys, param_vals, param_errs, save_folder=save_folder, show=show_plots)
+        plot_param_correlations(plot_keys, plot_cov, save_folder=save_folder, show=show_plots)
 
 
 def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folder='sting_results'):
@@ -1390,7 +1400,7 @@ def plot_streamline_covariance_samples(best_opt_params,
     Compute covariance, sample parameter sets from it, evaluate streamlines from those sets, and plot them all together
     """
 
-    opt_keys, param_errors, cov = errors.estimate_covariance_at_best_fit(
+    opt_keys, param_errors, cov, cov_transformed_dict = errors.estimate_covariance_at_best_fit(
         best_opt_params,
         initial_opt_params,
         fixed_params,
