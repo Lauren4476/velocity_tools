@@ -194,11 +194,6 @@ def clean_model_param_dict(params, dict_name):
         # if it's already a raw number, assume it's already correct
         sanitized[key] = jnp.asarray(val, dtype=jnp.float64)
 
-    # if 'omega' in sanitized and 'log_omega' not in sanitized:
-    #     sanitized['log_omega'] = jnp.log(to_float64(sanitized['omega']))
-    # if 'omega' in sanitized:
-    #     del sanitized['omega']
-
     tiny = to_float64(1e-8)
     # Protect against exact polar-angle edge values which can cause
     # downstream numerical issues (theta=0 or theta=pi). 
@@ -416,70 +411,6 @@ def rotation_param_from_mu(rotation_key, mu, mass, r0):
         return mu * r0
     elif rotation_key == 'omega':
         return stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
-    
-# def mu_to_rc_omega(mu_val, mass_val, r0_val):
-#     """Convert mu to both rc and omega, for convenience"""
-#     mu_val = to_float64(mu_val)
-#     mass_val = to_float64(mass_val)
-#     r0_val = to_float64(r0_val)
-#     rc_val = mu_val * r0_val
-#     omega_val = stream_lines_grad.omega_from_mu(mu=mu_val, mass=mass_val, r0=r0_val)
-#     return rc_val, omega_val
-
-def propagate_mu_sigma(mu_val, mu_sigma, mass_val, r0_val):
-    """Linear error propagation to convert uncertainty in mu to uncertainty in the rotation parameter input.
-    Returns (None, None) if sigma_mu is None, i.e. the rotation parameter was fixed in the optimisation"""
-    if mu_sigma is None:
-        return None, None
-    mu_val = to_float64(mu_val)
-    mass_val = to_float64(mass_val)
-    r0_val = to_float64(r0_val)
-    mu_sigma = to_float64(mu_sigma)
-    rc_sigma = float(r0_val * mu_sigma)
-    #derivative d omega / d mu
-    domega_dmu = jax.grad(
-        lambda mu: stream_lines_grad.omega_from_mu(mu=mu, mass=mass_val, r0=r0_val)
-    )(mu_val)
-    omega_sigma = float(jnp.abs(domega_dmu) * mu_sigma)
-
-    return rc_sigma, omega_sigma
-
-def with_rc_and_omega(opt_params, fixed_params, param_errors=None):
-    """ Convert best-fit mu into rc and omega for user-friendly output, with propagated uncertainties."""
-    new_opt_params = dict(opt_params)
-    new_fixed_params = dict(fixed_params)
-    if param_errors is not None:
-        new_param_errors = dict(param_errors)
-    else:
-        new_param_errors = None
-    
-    all_params = {**fixed_params, **opt_params}
-    if 'mu' not in all_params:
-        return new_opt_params, new_fixed_params, new_param_errors
-    
-    mu_val = all_params['mu']
-    mass_val = all_params['mass']
-    r0_val = all_params['r0']
-    rc_val = mu_val * r0_val
-    omega_val = stream_lines_grad.omega_from_mu(mu=mu_val, mass=mass_val, r0=r0_val)
-
-    if 'mu' in opt_params:
-        # mu was optimised, rc and omega are derived with uncertainties
-        new_opt_params['rc'] = rc_val
-        new_opt_params['omega'] = omega_val
-        if new_param_errors is not None:
-            mu_sigma = param_errors.get('mu', None)
-            rc_sigma, omega_sigma = propagate_mu_sigma(mu_val, mu_sigma, mass_val, r0_val)
-            if rc_sigma is not None:
-                new_param_errors['rc'] = rc_sigma
-                new_param_errors['omega'] = omega_sigma
-    else:
-        # mu was fixed, so just add rc and omega without uncertainties
-        new_fixed_params['rc'] = rc_val
-        new_fixed_params['omega'] = omega_val
-    
-    return new_opt_params, new_fixed_params, new_param_errors
-
 
 def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
     """ Replace the user's input rotation parameter (either rc or omega) with mu, which is the parameter used internally for the physics calculations and optimisation,
@@ -531,7 +462,7 @@ def format_param(key, value):
         deg = math.degrees(val)
         return f"{deg:.6g} deg"
     if key == 'mu':
-        return f"{val:.6g} (rc/r0)"
+        return f"{val:.6g}"
     if key == 'omega':
         return f"{val:.6g} 1/s"
     unit = DISPLAY_UNITS.get(key, '')
@@ -551,8 +482,8 @@ def add_rc_omega_to_log(row, opt_params, fixed_params, all_param_keys):
     if mass_val is not None and r0_val is not None and mu_val is not None:
         rc_val = mu_val * r0_val
         omega_val = stream_lines_grad.omega_from_mu(mu=mu_val, mass=mass_val, r0=r0_val)
-        row['rc'] = format_param('rc', rc_val)
-        row['omega'] = format_param('omega', omega_val)
+        row['rc'] = float(rc_val)
+        row['omega'] = float(omega_val)
     return row
 
 
@@ -1417,16 +1348,16 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
     finally:
         # Always close the CSV file if it was opened
         if log_file is not None:
+            log_path = log_file.name
             log_file.close()
-            print(f"Optimisation log saved to: {log_file}")
+            print(f"Optimisation log saved to: {log_path}")
         if trace_file is not None:
+            trace_path = trace_file.name
             trace_file.close()
-            print(f"Matching trace log saved to: {trace_file}")
+            print(f"Matching trace log saved to: {trace_path}")
 
     print(f"Optimisation complete!")
     print(f"Best-fit parameters found at epoch: {best_epoch}, with loss: {best_loss:.6f}")
-    for key in ordered_best_opt_params.keys():
-        print(f"  {key}: {format_param(key, ordered_best_opt_params[key])}")
 
     # compute errors on best-fit parameters
     print("\nEstimating parameter uncertainties from Hessian...")
@@ -1439,8 +1370,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         param_errors, cov_matrix, cov_transformed_dict = errors.estimate_parameter_errors(
             ordered_best_opt_params,
             fixed_params,
-            data,
-            uncertainties,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
@@ -1449,35 +1378,34 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             best_norm_opt_params=best_opt_params_norm,
             rotation_key=key_needs_transform,
         )
-        print("\nParameter uncertainties (1-sigma):")
-        for key, value in param_errors.items():
-            print(f"  {key}: {format_param(key, value)}")
     except Exception as e:
         print(f"\nWarning: parameter uncertainty estimation failed: ({e}).")
         print("Continuing without error estimates")
 
-    # convert best fit mu (and mu_sigma if it was optimised) back to user-facing rc/omega for display and outputs
-    display_opt_params, display_fixed_params, display_param_errors = with_rc_and_omega(
-        ordered_best_opt_params, fixed_params, param_errors)
-    
-    # the above uses a simplified propagation that treats mass/r0 as fixed at their best fit values
-    # for the param the user actually asked for,
-    # prefer the exact value from the transformed covariance matrix 
-    # which properly accounts for any covariance between mu and mass/r0,
-    # when those were also free parameters.
-    if cov_transformed_dict is not None and key_needs_transform is not None and display_param_errors is not None:
-        display_param_errors[key_needs_transform] = cov_transformed_dict['errors'][key_needs_transform]
+    display_opt_params = dict(ordered_best_opt_params)
+    display_fixed_params = dict(fixed_params)
+    display_param_errors = dict(param_errors) if param_errors is not None else None
 
-    if 'mu' in ordered_best_opt_params or 'mu' in fixed_params:
-        print("\nBest-fit rc and omega:")
-        all_display_params = {**display_fixed_params, **display_opt_params}
-        for key in ('rc', 'omega'):
-            value = all_display_params[key]
-            if display_param_errors is not None and key in display_param_errors:
-                error = display_param_errors[key]
-                print(f"  {key}: {format_param(key, value)} ± {format_param(key, error)}")
-            else:
-                print(f"  {key}: {format_param(key, value)}")
+    if cov_transformed_dict is not None and key_needs_transform is not None and display_param_errors is not None:
+        if key_needs_transform in cov_transformed_dict['keys']:
+            all_params_for_transform = {**display_fixed_params, **display_opt_params}
+            mu_best = float(ordered_best_opt_params['mu'])
+            mass_val = float(all_params_for_transform['mass'])
+            r0_val   = float(all_params_for_transform['r0'])
+            display_opt_params[key_needs_transform] = rotation_param_from_mu(key_needs_transform, mu_best, mass_val, r0_val)
+            display_opt_params.pop('mu', None)
+            display_param_errors[key_needs_transform] = cov_transformed_dict['errors'][key_needs_transform]
+            display_param_errors.pop('mu', None)
+
+    print("\nFinal parameters at best-fit:")
+    all_display_params = {**display_fixed_params, **display_opt_params}
+    for key in all_display_params.keys():
+        value = all_display_params[key]
+        if display_param_errors is not None and key in display_param_errors:
+            error = display_param_errors[key]
+            print(f"  {key}: {format_param(key, value)} ± {format_param(key, error)}")
+        else:
+            print(f"  {key}: {format_param(key, value)}")
 
     outputs.save_best_fit_params(display_opt_params, display_fixed_params, display_param_errors, save_folder=save_folder)
 

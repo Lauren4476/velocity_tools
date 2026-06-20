@@ -211,12 +211,27 @@ def _ensure_clean_dir(path):
             except OSError:
                 pass
 
+def _opt_params_from_log(optimisation_log):
+    skip = ['epoch', 'loss']
+    cols = [c for c in optimisation_log.columns if c not in skip]
+    if 'mu' in cols:
+        cols = [c for c in cols if c not in ('rc', 'omega')]
+    return cols
+
 
 def create_video_from_images(save_folder, input_pattern, output_name, fps=5):
     """Call ffmpeg to make a video from numbered image frames.
     If you don't have ffmpeg, will print an error message instead of crashing
     """
     import subprocess
+    import shutil
+
+    ffmpeg_exe = shutil.which("ffmpeg") 
+    if ffmpeg_exe is None:
+        print(
+            "ffmpeg not found. Can't create video."
+        )
+        return
 
     output_video = os.path.join(save_folder, output_name)
     ffmpeg_cmd = [
@@ -235,12 +250,6 @@ def create_video_from_images(save_folder, input_pattern, output_name, fps=5):
         print(f"Video saved to {output_video}")
     except subprocess.CalledProcessError as e:
         print(f"Error creating video: {e}")
-    except FileNotFoundError:
-        print(
-            "ffmpeg not found. Please install ffmpeg to create the video.\n"
-            "To install ffmpeg: https://ffmpeg.org/download.html "
-            "or (on Mac) `brew install ffmpeg`"
-        )
 
 def plot_loss(loss_history, save_folder='sting_results'):
     '''Plot loss as a function of epochs'''
@@ -295,7 +304,6 @@ def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, fi
     return bg_rgba, extent
 
 def plot_morphology_by_epoch(
-    param_names,
     gradient_descent,
     fixed_params,
     distance,
@@ -317,6 +325,7 @@ def plot_morphology_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    param_names = _opt_params_from_log(optimisation_log)
 
     epochs = optimisation_log['epoch'].values
 
@@ -548,7 +557,6 @@ def plot_morphology(
         plt.close(fig)
 
 def plot_ra_vel_by_epoch(
-    param_names,
     gradient_descent,
     fixed_params,
     distance,
@@ -569,6 +577,7 @@ def plot_ra_vel_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    param_names = _opt_params_from_log(optimisation_log)
 
     epochs = optimisation_log['epoch'].values
 
@@ -715,7 +724,6 @@ def plot_ra_vel(
 
 #########
 def plot_dec_vel_by_epoch(
-    param_names,
     gradient_descent,
     fixed_params,
     distance,
@@ -732,10 +740,11 @@ def plot_dec_vel_by_epoch(
     Create DEC–velocity plots for every epoch
     """
     try:
-        optimisation_log= load_optimisation_log(save_folder)
+        optimisation_log = load_optimisation_log(save_folder)
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    param_names = _opt_params_from_log(optimisation_log)
 
     epochs = optimisation_log['epoch'].values
 
@@ -1168,7 +1177,6 @@ def plot_vel_radius(
 
 
 def plot_vel_radius_by_epoch(
-    param_names,
     gradient_descent,
     fixed_params,
     distance,
@@ -1193,6 +1201,7 @@ def plot_vel_radius_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    param_names = _opt_params_from_log(optimisation_log)
     
     epochs = optimisation_log['epoch'].values
     epoch_models = []

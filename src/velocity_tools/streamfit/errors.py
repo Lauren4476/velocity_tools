@@ -24,8 +24,6 @@ def estimate_covariance_at_best_fit(
     param_errors, cov, cov_transformed_dict = estimate_parameter_errors(
         best_for_cov,
         fixed_params,
-        data,
-        uncertainties,
         distance,
         prepared_data,
         loss_method=loss_method,
@@ -39,8 +37,6 @@ def estimate_covariance_at_best_fit(
 def estimate_parameter_errors(
     best_opt_params,
     fixed_params,
-    data,
-    uncertainties,
     distance_pc,
     prepared_data,
     loss_method=0,
@@ -94,7 +90,6 @@ def estimate_parameter_errors(
 
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
-        print(f"loss vec params: {params}")
         chi2_total, _ = chi2_loss(
             params,
             fixed_params,
@@ -140,9 +135,6 @@ def estimate_parameter_errors(
                 return chi2_total
 
             norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-            # # print the gradient per parameter for debugging
-            # for i, key in enumerate(norm_keys):
-            #     print(f"Gradient for {key} at best-fit parameters: {norm_grad_vec[i]:.3e}")
             norm_grad_norm = float(gradient_l2_norm(norm_grad_vec))
             print(f"Gradient magnitude at best-fit parameters: {norm_grad_norm:.3e}")
 
@@ -170,11 +162,11 @@ def estimate_parameter_errors(
 
     cov_transformed_dict = None
     if rotation_key is not None and 'mu' in keys:
-        cov_transformed_dict = rotation_param_in_cov(cov, keys, best_opt_params, fixed_params, rotation_key)
+        cov_transformed_dict = transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key)
 
     return error_dict, cov, cov_transformed_dict
 
-def rotation_param_in_cov(cov, keys, best_opt_params, fixed_params, rotation_key):
+def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key):
     """Transform a covariance matrix computed in optimisation space (rotation param is mu)
     into the equivalent covariance matrix for the original input rotation parameter (rc or omega).
 
@@ -772,17 +764,11 @@ def chi2_loss(
         sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
 
-        # bug prints
-        print('bug prints')
-        print(jnp.min(jnp.sqrt(ra_model_interp**2 + dec_model_interp**2)))
-        print(jnp.min(jnp.sqrt(ra_data**2 + dec_data**2)))
-
         # Only compute chi2 on valid/retained data points
         chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
         chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
         chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
 
-    print(f"er chi2_total: {chi2_total}")
 
     if loss_method == 0:
         chi2_components = {
