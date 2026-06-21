@@ -377,8 +377,8 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     for key, value in norm_opt_params.items():
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
-        if key == 'phi0':
-            # special handling for phi0 because circular
+        if key in ('phi0', 'pa'):
+            # special handling for phi0/pa because circular
             denormalised[key] = jnp.mod(to_float64(value) * scale + offset, 2*jnp.pi)
         else:
             denormalised[key] = to_float64(value) * scale + offset
@@ -585,13 +585,13 @@ def forward_model(model_params, distance_pc, npoints=10000):
 
     # Protect near-zero v_r0 from creating singularities in physics calculations
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
-    v_r0_protected = model_params['v_r0']
-    threshold = to_float64(1e-6)
-    v_r0_protected = jnp.where(
-        jnp.isclose(v_r0_protected, to_float64(0.0)),
-        - jnp.sign(v_r0_protected) * threshold,
-        v_r0_protected
-        )
+    # v_r0_protected = model_params['v_r0']
+    # threshold = to_float64(1e-6)
+    # v_r0_protected = jnp.where(
+    #     jnp.isclose(v_r0_protected, to_float64(0.0)),
+    #     - jnp.sign(v_r0_protected) * threshold,
+    #     v_r0_protected
+    #     )
 
     # Run the forward model - returns positions in au, velocities in km/s
     # valid_mask is a boolean array marking which points are valid in the returned arrays, 
@@ -617,7 +617,7 @@ def forward_model(model_params, distance_pc, npoints=10000):
         theta0=model_params['theta0'],
         phi0=model_params['phi0'],
         mu=model_params['mu'],
-        v_r0=v_r0_protected,
+        v_r0=model_params['v_r0'],
         inc=model_params['inc'],
         pa=model_params['pa'],
         rmin=rmin,
@@ -1223,9 +1223,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             # Enforce normalised bounds and map back to physical/log values.
             for key in opt_param_keys:
-                if key == 'phi0':
-                    # phi0 is a cyclic parameter; wrap to [0, 1) in normalised space to enforce bounds
-                    opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0) 
+                if key in ('phi0', 'pa'):
+                    # phi0/pa are cyclic; wrap to [0, 1) in normalised space
+                    opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0)
                 elif key == 'rc':
                     # must be positive >0
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)

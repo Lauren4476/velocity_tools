@@ -5,7 +5,7 @@ and extract a 1D streamline from that.
 
 import numpy as np
 from astropy import units as u
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, FK5
 from collections import namedtuple
 import jax.numpy as jnp
 import jax
@@ -52,6 +52,34 @@ def circular_median(theta_vals, weights):
 def wrap_to_pi_numpy(angle):
     '''Wrap angles to [-pi, pi)'''
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def extract_streamer_subcube(cube, vmin=None, vmax=None, xmin=None, xmax=None, ymin=None, ymax=None, rms_thresh=None):
+    """Extract a subcube containing the streamer emission, by applying velocity and spatial limits, and masking out low SNR emission."""
+    streamer_cube = cube
+    if (vmin is not None) and (vmax is not None):
+        streamer_cube = streamer_cube.spectral_slab(vmin, vmax)
+    if (xmin is not None) and (xmax is not None) and (ymin is not None) and (ymax is not None):
+        celestial_wcs = streamer_cube.wcs.celestial
+        ny, nx = streamer_cube.shape[1], streamer_cube.shape[2]
+        # reference sky coord corresponding to the reference pixel in the WCS
+        ref_ra, ref_dec = celestial_wcs.wcs.crval
+        ref_coord = SkyCoord(ref_ra*u.deg, ref_dec*u.deg, frame=FK5)
+        # convert the limits from offsets to sky coords
+        corner1 = SkyCoord(ref_coord.ra + xmin, ref_coord.dec + ymin, frame=FK5) #'bottom left'
+        corner2 = SkyCoord(ref_coord.ra + xmax, ref_coord.dec + ymax, frame=FK5) #'top right'
+        x1, y1 = celestial_wcs.world_to_pixel(corner1)
+        x2, y2 = celestial_wcs.world_to_pixel(corner2)
+        xmin_pix = max(0, int(np.floor(min(x1, x2))))
+        xmax_pix = min(nx, int(np.ceil(max(x1, x2))))
+        ymin_pix = max(0, int(np.floor(min(y1, y2))))
+        ymax_pix = min(ny, int(np.ceil(max(y1, y2))))
+        streamer_cube = streamer_cube[:, ymin_pix:ymax_pix, xmin_pix:xmax_pix]
+    if rms_thresh is not None:
+        rms_estimate = streamer_cube.mad_std()
+        streamer_cube = streamer_cube.with_mask(streamer_cube > rms_thresh*rms_estimate) 
+
+    return streamer_cube
 
 def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     '''

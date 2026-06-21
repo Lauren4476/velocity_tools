@@ -18,7 +18,6 @@ Last updated: 19-06-2026
 
 
 import astropy.units as u
-from ..helper_functions import *
 import jax
 import jax.numpy as jnp
 from jax.experimental import checkify
@@ -29,6 +28,8 @@ from typing import NamedTuple
 ## constants 
 eps = 1e-8 # small value to avoid division by zero
 FLOAT_DTYPE = jnp.float64
+G = 6.67430e-11 * (1e-3)**2 * (1.988416e30) / (1.4959787e11) # in au (km/s)^2 * Msol^-1
+au_in_km = 1.4959787e8 #km
 
 
 ## important streamline quantities (for easy reuse)
@@ -94,16 +95,19 @@ def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     '''
     # Protect near-zero v_r0 from creating singularities in nu calculation
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
+    # threshold = to_float64(eps)
+    # v_r0 = jnp.where(
+    #     jnp.isclose(v_r0, to_float64(0.0)),
+    #     - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
+    #     v_r0  # normal values -> unchanged
+    #     )
     threshold = to_float64(eps)
-    v_r0 = jnp.where(
-        jnp.isclose(v_r0, to_float64(0.0)),
-        - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
-        v_r0  # normal values -> unchanged
-        )
+    v_r0_protected = jnp.sign(v_r0) * jnp.maximum(jnp.abs(v_r0), threshold)
+    v_r0_protected = jnp.where(v_r0 == 0.0, threshold, v_r0_protected)  # handle exact 0
 
     mu = to_float64(mu)
     rc = mu * r0
-    nu = v_r0 * jnp.sqrt(rc / (G * mass))
+    nu = v_r0_protected * jnp.sqrt(rc / (G * mass))
     sin_theta0 = jnp.sin(theta0)
     sin_theta0_sq = jnp.power(sin_theta0, 2)
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * sin_theta0_sq - 2 * mu
@@ -160,11 +164,7 @@ def get_orb_ang(r_to_rc, theta0, ecc):
     :param ecc: eccentricity
     :return orb_ang: radians
     '''
-    # valid points always have r_to_rc >= 0.5, so clamping at 0.1 never touches them
-    # this matches the sentinel used in stream_line so only affects already invalid points
-    # which will be masked out later in the final output anyway
-    r_to_rc_safe = jnp.maximum(r_to_rc, to_float64(0.1))
-    cos_orb_ang = (1/ecc) * (1 - (jnp.power(jnp.sin(theta0), 2) / r_to_rc_safe))
+    cos_orb_ang = (1/ecc) * (1 - (jnp.power(jnp.sin(theta0), 2) / r_to_rc))
     orb_ang = safe_arccos(cos_orb_ang)
     return orb_ang
 
@@ -315,7 +315,6 @@ def rotate_xyz(x, y, z, rotation_matrix):
 
     return xyz_rot[0], xyz_rot[1], xyz_rot[2]
 
-#TODO: might not be nneeded
 def check_rc_r0(rc, r0):
     '''check that centrifugal radius is smaller than initial radius of streamline, otherwise the model is not valid'''
     checkify.check(
