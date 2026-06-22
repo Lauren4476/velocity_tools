@@ -16,12 +16,10 @@ from jax.experimental import checkify
 import optax
 from . import stream_lines_grad
 from . import extract_streamline
-from . import outputs
-from . import errors
 import csv
 import astropy.units as u
 import math
-
+import traceback
 jax.config.update("jax_enable_x64", True)
 
 # settings and constants
@@ -156,6 +154,17 @@ def is_numeric_value(value):
 def to_float64(value):
     """Convert a numeric value or array-like input to float64"""
     return jnp.asarray(value, dtype=jnp.float64)
+
+@jax.jit
+def softplus(x):
+    """Softplus, used for v_r0"""
+    return jnp.logaddexp(x, 0.0)         
+
+@jax.jit
+def inv_softplus(y):
+    """used for v_r0, stable for y>0"""
+    y = to_float64(y)
+    return y + jnp.log1p(-jnp.exp(-y))
 
 
 def get_checkify_error_message(err):
@@ -310,15 +319,18 @@ def standardise_param_bounds(param_bounds):
 
 
 def build_normalisation_spec(opt_params, param_bounds):
-    """Build shift and scale for normalisation ofoptimised parameters, from bounds."""
+    """Build shift and scale for normalisation ofoptimised parameters, from bounds.
+    Doesn't include v_r0 since we use softplus transform instead for that."""
     if param_bounds is None:
         raise ValueError(
             "param_bounds is required because optimisation is performed in normalised space. "
-            "Provide bounds for every parameter you want to optimise."
+            "Provide bounds for every parameter you want to optimise (except v_r0, which is handled separately)."
         )
  
     missing = []
     for key in opt_params:        
+        if key == 'v_r0':
+            continue
         if key not in param_bounds:
                 missing.append(key)
     if missing:
@@ -329,6 +341,9 @@ def build_normalisation_spec(opt_params, param_bounds):
 
     normalisation_spec = {}
     for key, value in opt_params.items():
+        if key == 'v_r0':
+            print("Notice: Ignoring user-supplied bounds for 'v_r0' since we use a softplus transform for this parameter instead of normalisation.")
+            continue
         bounds = param_bounds[key]
         if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
             raise ValueError(
@@ -362,9 +377,16 @@ def build_normalisation_spec(opt_params, param_bounds):
 
 
 def normalise_opt_params(opt_params, normalisation_spec):
-    """normalise optimised parameters to [0, 1]"""
+    """normalise optimised parameters to [0, 1], unless v_r0 which is transformed by softplus instead"""
     normalised = {}
     for key, value in opt_params.items():
+        if key == 'v_r0':
+            # save the value 'raw' such that v_r0 = softplus(raw)
+            value = to_float64(value)
+            if value < 0:
+                raise ValueError(f"v_r0 must be non-negative, got {float(value)}")
+            normalised[key] = inv_softplus(value)
+            continue
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
         normalised[key] = (to_float64(value) - offset) / scale
@@ -375,10 +397,13 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     """Convert normalised optimised parameters back to physical/log parameter values"""
     denormalised = {}
     for key, value in norm_opt_params.items():
+        if key == 'v_r0':
+            denormalised[key] = softplus(to_float64(value))
+            continue
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
-        if key in ('phi0', 'pa'):
-            # special handling for phi0/pa because circular
+        if key == 'phi0':
+            # special handling for phi0 because circular
             denormalised[key] = jnp.mod(to_float64(value) * scale + offset, 2*jnp.pi)
         else:
             denormalised[key] = to_float64(value) * scale + offset
@@ -1026,6 +1051,9 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         derived 'omega' when 'mu', 'mass', and 'r0' are available
     list: Loss history (indexed by epoch: loss_history[i] = loss at epoch i)
     """
+    # lazy imports to avoid circular imports
+    from . import outputs
+    from . import errors
     # Initialize parameters
     loss_method = check_loss_method(loss_method)
 
@@ -1223,8 +1251,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
             # Enforce normalised bounds and map back to physical/log values.
             for key in opt_param_keys:
-                if key in ('phi0', 'pa'):
-                    # phi0/pa are cyclic; wrap to [0, 1) in normalised space
+                if key == 'phi0':
+                    # phi0 is cyclic; wrap to [0, 1) in normalised space
                     opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0)
                 elif key == 'rc':
                     # must be positive >0
@@ -1232,25 +1260,28 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                 elif key == 'omega':
                     # must be positive >0
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
+                elif key == 'v_r0':
+                    #already dealt with
+                    continue
                 else:
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
 
             # Gradient-aware epsilon protection for v_r0 near zero:
             # When v_r0 is very close to zero, use the sign of the gradient to determine
             # which direction to protect towards, allowing the optimiser to continue smoothly.
-            if 'v_r0' in opt_param_keys:
-                threshold_norm = to_float64(1e-12)  # normalised space threshold
-                v_r0_norm_val = opt_params_norm['v_r0']
-                if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
-                    # v_r0 is very close to zero; check gradient direction
-                    grad_v_r0 = norm_grads['v_r0']
-                    # In gradient descent, we move opposite to gradient:
-                    protect_sign = -jnp.sign(grad_v_r0)
-                    # Default to positive if gradient is exactly zero
-                    protect_sign = jnp.where(protect_sign == 0, 1.0, protect_sign)
-                    # Set v_r0 to small epsilon in the gradient-indicated direction
-                    epsilon_norm = threshold_norm
-                    opt_params_norm['v_r0'] = protect_sign * epsilon_norm
+            # if 'v_r0' in opt_param_keys:
+            #     threshold_norm = to_float64(1e-12)  # normalised space threshold
+            #     v_r0_norm_val = opt_params_norm['v_r0']
+            #     if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
+            #         # v_r0 is very close to zero; check gradient direction
+            #         grad_v_r0 = norm_grads['v_r0']
+            #         # In gradient descent, we move opposite to gradient:
+            #         protect_sign = -jnp.sign(grad_v_r0)
+            #         # Default to positive if gradient is exactly zero
+            #         protect_sign = jnp.where(protect_sign == 0, 1.0, protect_sign)
+            #         # Set v_r0 to small epsilon in the gradient-indicated direction
+            #         epsilon_norm = threshold_norm
+            #         opt_params_norm['v_r0'] = protect_sign * epsilon_norm
 
             # Now materialize physical parameters from the (possibly clamped)
             # normalised parameters.
@@ -1266,7 +1297,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             if error_message is not None:
                 print(
                     f"\nStopping at epoch {epoch}: {error_message} "
-                    "This probably means that the current parameters have become unphysical. Consider tightening bounds."
                 )
                 break
 
@@ -1377,9 +1407,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             normalisation_spec=normalisation_spec,
             best_norm_opt_params=best_opt_params_norm,
             rotation_key=key_needs_transform,
+            npoints=npoints,
         )
     except Exception as e:
         print(f"\nWarning: parameter uncertainty estimation failed: ({e}).")
+        traceback.print_exc()
         print("Continuing without error estimates")
 
     display_opt_params = dict(ordered_best_opt_params)

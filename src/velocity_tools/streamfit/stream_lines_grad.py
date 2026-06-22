@@ -95,12 +95,12 @@ def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     '''
     # Protect near-zero v_r0 from creating singularities in nu calculation
     # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
-    # threshold = to_float64(eps)
-    # v_r0 = jnp.where(
-    #     jnp.isclose(v_r0, to_float64(0.0)),
-    #     - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
-    #     v_r0  # normal values -> unchanged
-    #     )
+    threshold = to_float64(eps)
+    v_r0 = jnp.where(
+        jnp.isclose(v_r0, to_float64(0.0)),
+        - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
+        v_r0  # normal values -> unchanged
+        )
     threshold = to_float64(eps)
     v_r0_protected = jnp.sign(v_r0) * jnp.maximum(jnp.abs(v_r0), threshold)
     v_r0_protected = jnp.where(v_r0 == 0.0, threshold, v_r0_protected)  # handle exact 0
@@ -241,6 +241,7 @@ def stream_line_vel(
     orb_ang,
     stream_state,
     theta0=jnp.radians(30),
+    r_mask=None
 ):
     '''
     It calculates the velocity along the stream line following Mendoza+(2009)
@@ -251,17 +252,26 @@ def stream_line_vel(
     :param r: au
     :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
+    :param r_mask: boolean mask
     :return: v_r, v_theta, v_phi in units of km/s
     '''
     rc = stream_state.rc
     ecc = stream_state.ecc
     vk0 = stream_state.vk0
 
-    r_to_rc = r / rc
+    r_to_rc_raw = r / rc
+    if r_mask is not None:
+        # see sentnel value used for r_to_rc in stream_line. this is the same thing.
+        r_to_rc = jnp.where(r_mask, r_to_rc_raw, to_float64(0.6))
+    else:
+        r_to_rc = r_to_rc_raw
     #
     v_r_all = -ecc * jnp.sin(theta0) * jnp.sin(orb_ang) / r_to_rc /(1 - ecc*jnp.cos(orb_ang))
+    sqrt_arg = jnp.power(jnp.cos(theta0), 2) - jnp.power(jnp.cos(theta), 2)
+    sqrt_arg_safe = jnp.maximum(sqrt_arg, eps)  # eps = 1e-8 or similar
+
     v_theta_all = jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
-                  * jnp.sqrt(jnp.power(jnp.cos(theta0),2) - jnp.power(jnp.cos(theta),2))
+                  * jnp.sqrt(sqrt_arg_safe)
     v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
 
     return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
@@ -390,7 +400,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     # calculate positions and velocities inside r0
     # the valid_mask will later be used to mask out invalid points. currently these values are zero
     orb_ang, theta, phi, valid_mask = stream_line(r, r_mask, stream_state=stream_state, theta0=theta0, phi0=phi0)
-    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0)
+    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0, r_mask=r_mask)
     # prepend initial positions and velocities at r0
     valid_mask_full = jnp.concatenate((jnp.asarray([True], dtype=bool), valid_mask))
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))

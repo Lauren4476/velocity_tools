@@ -19,7 +19,6 @@ import os
 
 from . import gradient_descent
 from . import extract_streamline
-from . import errors
 
 def param_for_display(key, value):
     """
@@ -1408,7 +1407,8 @@ def plot_streamline_covariance_samples(best_opt_params,
     """
     Compute covariance, sample parameter sets from it, evaluate streamlines from those sets, and plot them all together
     """
-
+    #lazy import to avoid circular import
+    from . import errors
     opt_keys, param_errors, cov, cov_transformed_dict = errors.estimate_covariance_at_best_fit(
         best_opt_params,
         initial_opt_params,
@@ -1416,6 +1416,7 @@ def plot_streamline_covariance_samples(best_opt_params,
         data,
         uncertainties,
         distance,
+        param_bounds,
         loss_method=loss_method,
         gradient_tol=gradient_tol
     )
@@ -1504,7 +1505,7 @@ def plot_streamline_covariance_samples(best_opt_params,
 
 def generate_streamline_samples(best_opt_params, covariance, opt_keys, fixed_params, distance, param_bounds=None, n_samples=100):
     """
-    wrapper of sample_parameter_sets_from_covariance() and evaluate_streamline_samples() to generate streamline samples from covariance matrix.
+    wrapper of sample_parameter_sets_from_covariance() and evaluate_streamlines_samples() to generate streamline samples from covariance matrix.
     """
     samples = sample_parameter_sets_from_covariance(
         best_opt_params,
@@ -1541,7 +1542,7 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
             key: float(value)
             for key, value in zip(opt_keys, sample)
         }
-        sample_params_full, sample_params, fixed_params = gradient_descent.prepare_model_params(sample_params, fixed_params)
+        sample_params_full, _, _ = gradient_descent.prepare_model_params(sample_params, fixed_params)
         ra, dec, vel, valid_mask, err = gradient_descent.forward_model(sample_params_full, distance)
         ra = np.asarray(ra, dtype=float)
         dec = np.asarray(dec, dtype=float)

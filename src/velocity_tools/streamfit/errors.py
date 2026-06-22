@@ -1,9 +1,9 @@
-# For computing the uncertainties, we must use the old versions of the forward model, loss, etc.
-# This is because the new versions were modified to be jit compatible by having constant length arrays.
-# But this has a side effect of requiring computations such as argsort,
-# which are not compatible with taking second derivatives for the Hessian-based uncertainty estimation.
+# For computing the uncertainties, we must use some slightly different versions of the functions,
+# because the original versions use jax.jit, which is great for optimization,
+# but not compatble with taking second derivatives for the Hessian-based uncertainty estimation
+# because they have a side effect of requiring computations such as argsort.
 
-# So we put the old (non-jit) versions of the relevant functions here, and use them in the uncertainty estimation.
+# So we put the slower but hessian-compatible versions of the relevant functions here, and use them in the uncertainty estimation.
 
 import jax.numpy as jnp
 import jax
@@ -58,6 +58,199 @@ STREAMLINE_MODEL_PARAM_KEYS = (
 )
 
 
+def match_model_to_data_curve_hsafe(
+    ra_model,
+    dec_model,
+    v_model,
+    valid_mask_model,
+    ra_data,
+    dec_data,
+    model_sort_idx,
+    dmetric_model_frozen, #precomputed at best fit params and treated as constant
+    data_valid,
+):
+    """Second-derivative-safe version of match_model_to_data_curve, with the argsort replaced by a precomputed static integer index array"""
+    ra_model = jnp.asarray(ra_model, dtype=jnp.float64)
+    dec_model = jnp.asarray(dec_model, dtype=jnp.float64)
+    v_model = jnp.asarray(v_model, dtype=jnp.float64)
+    ra_data = jnp.asarray(ra_data, dtype=jnp.float64)
+    dec_data = jnp.asarray(dec_data, dtype=jnp.float64)
+
+    dmetric_model = dmetric_model_frozen
+    dmetric_data, _ = extract_streamline.get_distance_metric(ra_data, dec_data) # this is not precomputed because it only depends on the data
+    model_valid = valid_mask_model.astype(bool)
+
+    d_data_valid = jnp.where(data_valid, dmetric_data, jnp.inf)
+    data_min = jnp.min(d_data_valid)
+    model_keep = model_valid & (dmetric_model >= data_min) & (dmetric_model < BIG)
+    w_model = model_keep.astype(jnp.float64)
+
+    d_model = jnp.where(model_keep, dmetric_model, 0.0)
+    d_data = jnp.where(data_valid, dmetric_data, 0.0)
+
+    # apply precomputed sort index to model
+    d_model_s = d_model[model_sort_idx]
+    ra_s = ra_model[model_sort_idx]
+    dec_s = dec_model[model_sort_idx]
+    v_s = v_model[model_sort_idx]
+    w_model_s = w_model[model_sort_idx]
+
+    data_min_eff = jnp.min(jnp.where(data_valid, dmetric_data, jnp.inf))
+    data_max_eff = jnp.max(jnp.where(data_valid, dmetric_data, -jnp.inf))
+    model_min = jnp.min(jnp.where(model_keep, dmetric_model, jnp.inf))
+    model_max = jnp.max(jnp.where(model_keep, dmetric_model, -jnp.inf))
+
+    model_span = model_max - model_min
+    data_span = data_max_eff - data_min_eff
+    model_span_safe = jnp.where(model_span > 0.0, model_span, 1.0)
+    data_span_safe = jnp.where(data_span > 0.0, data_span, 1.0)
+
+    d_data_norm = (d_data - data_min_eff) / data_span_safe
+    d_goal = model_min + d_data_norm * model_span_safe
+
+    xp = jnp.where(w_model_s > 0, d_model_s, BIG)
+    ra_interp = jnp.interp(d_goal, xp, ra_s)
+    dec_interp = jnp.interp(d_goal, xp, dec_s)
+    v_interp = jnp.interp(d_goal, xp, v_s)
+
+    valid = data_valid
+    return ra_interp, dec_interp, v_interp, valid
+
+def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model_sort_idx, dmetric_model_frozen,npoints=10000):
+    """Second-derivative-safe version of chi2_loss, using match_model_to_data_curve_hsafe"""
+    distance_pc = jnp.asarray(distance_pc, dtype=jnp.float64)
+
+    rmin = model_params['rmin']
+    if rmin is None:
+        rmin = jnp.asarray(0.0, dtype=jnp.float64)
+
+    if 'mu' in model_params:
+        mu = model_params['mu']
+    elif 'rc' in model_params:
+        mu = model_params['rc'] / model_params['r0']
+    elif 'omega' in model_params:
+        mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    else:
+        raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
+    
+    model_params = dict(model_params)
+    model_params['mu'] = mu
+
+    (x, y, z), (vx, vy, vz), valid_mask = stream_lines_grad.xyz_stream(
+        mass=model_params['mass'],
+        r0=model_params['r0'],
+        theta0=model_params['theta0'],
+        phi0=model_params['phi0'],
+        mu=model_params['mu'],
+        v_r0=model_params['v_r0'],
+        inc=model_params['inc'],
+        pa=model_params['pa'],
+        rmin=rmin,
+        deltar=model_params['deltar'],
+        npoints=npoints,
+    )
+
+    ra_model = -x / distance_pc
+    dec_model = z / distance_pc
+    v_model = vy + model_params['v_lsr']
+    ra_model = jnp.where(valid_mask, ra_model, jnp.nan)
+    dec_model = jnp.where(valid_mask, dec_model, jnp.nan)
+    v_model = jnp.where(valid_mask, v_model, jnp.nan)
+
+    ra_data = prepared_data.ra_data
+    dec_data = prepared_data.dec_data
+    v_data = prepared_data.v_data
+    ra_sigma = prepared_data.ra_sigma_safe
+    dec_sigma = prepared_data.dec_sigma_safe
+    v_sigma = prepared_data.v_sigma_safe
+    data_valid = prepared_data.data_finite_mask
+
+
+    ra_interp, dec_interp, v_interp, valid = match_model_to_data_curve_hsafe(
+        ra_model, dec_model, v_model, valid_mask, 
+        ra_data, dec_data, 
+        model_sort_idx,
+        dmetric_model_frozen,
+        data_valid
+    )
+
+    valid_weights = valid.astype(jnp.float64)
+
+    chi2_v = jnp.sum(valid_weights * ((v_data - v_interp) / v_sigma)**2)
+
+    if loss_method == 0:
+        chi2_ra = jnp.sum(valid_weights * ((ra_data - ra_interp) / ra_sigma)**2)
+        chi2_dec = jnp.sum(valid_weights * ((dec_data - dec_interp) / dec_sigma)**2)
+        chi2_total = chi2_ra + chi2_dec + chi2_v
+    else:
+        r_proj_data = prepared_data.r_proj_data
+        theta_proj_data = prepared_data.theta_proj_data
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(ra_interp, dec_interp)
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+        r_eps = jnp.asarray(1e-8, dtype=jnp.float64)
+        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+        sigma_theta = jnp.sqrt((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2) / r_safe**2
+        sigma_theta = jnp.maximum(sigma_theta, r_eps)
+        chi2_r = jnp.sum(valid_weights * ((r_proj_data - r_proj_model) / sigma_r)**2)
+        chi2_theta = jnp.sum(valid_weights * (dtheta / sigma_theta)**2)
+        chi2_total = chi2_r + chi2_theta + chi2_v
+    
+    return chi2_total
+
+def compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_data, npoints=10000):
+    """Evaluate forward model once at best-fit parameters, and compute sort index that can be reused for Hessian-based uncertainty estimation"""
+    model_params = {**best_opt_params, **fixed_params}
+    rmin = model_params.get('rmin', None)
+    if rmin is None:
+        rmin = 0.0
+
+    if 'mu' in model_params:
+        mu = float(model_params['mu'])
+    elif 'rc' in model_params:
+        mu = float(model_params['rc']) / float(model_params['r0'])
+    elif 'omega' in model_params:
+        mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    else:
+        raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
+    
+    model_params = dict(model_params)
+    model_params['mu'] = mu
+
+    (x, y, z), (vx, vy, vz), valid_mask = stream_lines_grad.xyz_stream(
+        mass=float(model_params['mass']),
+        r0=float(model_params['r0']),
+        theta0=float(model_params['theta0']),
+        phi0=float(model_params['phi0']),
+        mu=float(model_params['mu']),
+        v_r0=float(model_params['v_r0']),
+        inc=float(model_params['inc']),
+        pa=float(model_params['pa']),
+        rmin=float(rmin),
+        deltar=float(model_params['deltar']),
+        npoints=npoints,
+    )
+
+    ra_model = jnp.asarray(-x, dtype=jnp.float64) / float(distance_pc)
+    dec_model = jnp.asarray(z, dtype=jnp.float64) / float(distance_pc)
+    ra_model = jnp.where(valid_mask, ra_model, jnp.nan)
+    dec_model = jnp.where(valid_mask, dec_model, jnp.nan)
+
+    dmetric_model, _ = extract_streamline.get_distance_metric(ra_model, dec_model)
+
+    data_valid = prepared_data.data_finite_mask
+    dmetric_data = prepared_data.dmetric_data
+    data_min = jnp.min(jnp.where(data_valid, dmetric_data, jnp.inf))
+
+    model_keep = valid_mask.astype(bool) & (dmetric_model >= data_min) & (dmetric_model < BIG)
+    w_model = model_keep.astype(jnp.float64)
+    d_model = jnp.where(model_keep, dmetric_model, 0.0)
+
+    # return integer array of indices that would sort the model points by distance metric, with invalid points at the end
+    model_sort_key = d_model + (1.0 - w_model) * BIG    
+
+    return jnp.argsort(model_sort_key), dmetric_model
+
 def estimate_covariance_at_best_fit(
     best_opt_params,
     initial_opt_params,
@@ -65,6 +258,7 @@ def estimate_covariance_at_best_fit(
     data,
     uncertainties,
     distance,
+    param_bounds,
     loss_method=0,
     gradient_tol=1e-1,
     rotation_key=None,
@@ -74,6 +268,8 @@ def estimate_covariance_at_best_fit(
     best_for_cov = {k: float(best_opt_params[k]) for k in opt_keys}
     # prepare data-only quantities once
     prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
+    param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
+    normalisation_spec = gradient_descent.build_normalisation_spec(best_for_cov, param_bounds)
     param_errors, cov, cov_transformed_dict = estimate_parameter_errors(
         best_for_cov,
         fixed_params,
@@ -81,7 +277,7 @@ def estimate_covariance_at_best_fit(
         prepared_data,
         loss_method=loss_method,
         gradient_tol=gradient_tol,
-        normalisation_spec=None,
+        normalisation_spec=normalisation_spec,
         rotation_key=rotation_key,
     )
     return opt_keys, param_errors, cov, cov_transformed_dict
@@ -97,9 +293,12 @@ def estimate_parameter_errors(
     normalisation_spec=None,
     best_norm_opt_params=None,
     rotation_key=None,
+    npoints=10000,
 ):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
+    Hessian is computed in normalised parameter space to keep eery parameter on O(1) scale.
+    Then resulting covariance is transformed back to physical parameter space.
 
     Parameters
     ----------
@@ -109,11 +308,10 @@ def estimate_parameter_errors(
         Tolerance on gradient norm in normalised space. If provided and
         normalised-space gradient norm > gradient_tol at best params, a
         warning is issued because the quadratic approximation may not be valid.
-    normalisation_spec : dict or None
+    normalisation_spec : dict
         Bounds-derived normalisation metadata for optimised parameters.
-        Required to evaluate gradient_tol in normalised space.
     best_norm_opt_params : dict or None
-        Normalised parameters at best-fit state, used for gradient_tol_check.
+        Normalised parameters at best-fit state
         If not provided, will be computed from best_opt_params and normalisation_spec, but providing it can save a redundant computation
     rotation_key : str or None
         If provided, must be 'rc' or 'omega'. Used to transform covariance matrix from optimised 'mu' to rotation_key
@@ -136,77 +334,126 @@ def estimate_parameter_errors(
             raise ValueError('gradient_tol must be finite when provided.')
         if gradient_tol <= 0:
             raise ValueError('gradient_tol must be positive when provided.')
+        
+    if normalisation_spec is None:
+        raise ValueError("normalisation_spec not provided")
+    
+
+    # evaluate hessian in raw_v_r0 space (v_r0 = softplus(raw_v_r0))
+    has_v_r0 = 'v_r0' in best_opt_params
+    params_for_hessian = dict(best_opt_params)
+    if has_v_r0:
+        v_r0_best = gradient_descent.to_float64(params_for_hessian['v_r0'])
+        if not bool(v_r0_best > 0): #should never be triggered
+            raise ValueError(f"best fit v_r0 must be positive, got v_r0={v_r0_best}")
+        params_for_hessian['v_r0'] = gradient_descent.inv_softplus(v_r0_best)
+
 
     # convert dict -> vector
-    params_vec, keys = params_dict_to_vector(best_opt_params)
+    params_vec, keys = params_dict_to_vector(params_for_hessian)
     loss_method = gradient_descent.check_loss_method(loss_method)
 
-    def loss_vec(theta_vec):
-        params = vector_to_params_dict(theta_vec, keys)
-        chi2_total, _ = chi2_loss(
-            params,
-            fixed_params,
+    # precompute model sort index at best fit params
+    model_sort_idx, dmetric_model = compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_data, npoints=npoints)
+
+    if best_norm_opt_params is not None:
+        norm_opt_params = best_norm_opt_params
+    else:
+        norm_opt_params = gradient_descent.normalise_opt_params(best_opt_params, normalisation_spec)
+
+    norm_params_vec, norm_keys = params_dict_to_vector(norm_opt_params)
+    missing_norm_keys = [key for key in keys if key not in normalisation_spec and key != 'v_r0']
+    if missing_norm_keys:
+        raise ValueError(
+            f"normalisation_spec is missing optimised parameter keys required: {missing_norm_keys} "
+        )
+
+    def loss_vec_norm(theta_norm_vec):
+        norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
+        physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
+        model_params = {**physical_params, **fixed_params}
+        chi2_total = chi2_loss_hsafe(
+            model_params,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
+            model_sort_idx=model_sort_idx,
+            dmetric_model_frozen=dmetric_model,
+            npoints=npoints,
         )
         return chi2_total
+    
+    def loss_vec(theta_vec):
+        params = vector_to_params_dict(theta_vec, keys)
+        if has_v_r0:
+            params = dict(params)
+            params['v_r0'] = gradient_descent.softplus(params['v_r0'])
+        model_params = {**params, **fixed_params}
+        chi2_total = chi2_loss_hsafe(
+            model_params,
+            distance_pc,
+            prepared_data,
+            loss_method=loss_method,
+            model_sort_idx=model_sort_idx,
+            dmetric_model_frozen=dmetric_model,
+            npoints=npoints,
+        )
+        return chi2_total
+    
 
     
     # Check gradient magnitude at best-fit parameters in normalised space.
     if gradient_tol is not None:
-        if normalisation_spec is None:
-            print(
-                "WARNING: gradient_tol is interpreted in normalised space, but "
-                "normalisation_spec was not provided. Skipping gradient_tol check "
-                "for uncertainty estimation."
+        def norm_loss_vec(theta_norm_vec):
+            norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
+            physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
+            model_params = {**physical_params, **fixed_params}
+            chi2_total, _, _ = gradient_descent.chi2_loss(
+                model_params,
+                distance_pc,
+                prepared_data,
+                loss_method=loss_method,
             )
-        else:
-            missing_norm_keys = [key for key in keys if key not in normalisation_spec]
-            if missing_norm_keys:
-                raise ValueError(
-                    "normalisation_spec is missing optimised parameter keys required "
-                    f"for gradient_tol check: {missing_norm_keys}"
-                )
+            return chi2_total        
 
-            if best_norm_opt_params is not None:
-                norm_opt_params = best_norm_opt_params
-            else:
-                norm_opt_params = gradient_descent.normalise_opt_params(best_opt_params, normalisation_spec)
-            norm_params_vec, norm_keys = params_dict_to_vector(norm_opt_params)
+        norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
+        
+        norm_grad_norm = float(gradient_descent.gradient_l2_norm(norm_grad_vec))
 
-            def norm_loss_vec(theta_norm_vec):
-                norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
-                physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
-                chi2_total, _ = chi2_loss(
-                    physical_params,
-                    fixed_params,
-                    distance_pc,
-                    prepared_data,
-                    loss_method=loss_method,
-                )
-                return chi2_total
-
-            norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-            norm_grad_norm = float(gradient_descent.gradient_l2_norm(norm_grad_vec))
-            print(f"Gradient magnitude at best-fit parameters: {norm_grad_norm:.3e}")
-
-            if norm_grad_norm > gradient_tol:
-                print(
-                    "WARNING: normalised-space gradient norm at best fit = "
-                    f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
-                )
-                print("optimisation may not have reached a minimum yet.")
-                print("Parameter uncertainties may be unreliable or incalculable. Consider:")
-                print("    - Increasing n_epochs")
-                print("    - Reducing learning rate for finer convergence")
-                print("    - Reducing loss_threshold if used")
+        if norm_grad_norm > gradient_tol:
+            print(
+                "WARNING: normalised-space gradient norm at best fit = "
+                f"{norm_grad_norm:.3e} exceeds tolerance {gradient_tol:.3e}"
+            )
+            print("Optimisation may not have reached a minimum yet.")
+            print("Parameter uncertainties may be less reliable. Consider:")
+            print("    - Increasing n_epochs")
+            print("    - Reducing learning rate for finer convergence")
+            print("    - Reducing loss_threshold, if used, to allow more optimisation steps")
             
-    # compute Hessian
-    H = jax.hessian(loss_vec)(params_vec)
+    # compute Hessian in normalised space
+    H_norm = jax.hessian(loss_vec_norm)(norm_params_vec)
 
-    # invert to get covariance
-    cov = jnp.linalg.inv(H)
+    # invert to get covariance in normalised space
+    cov_norm = jnp.linalg.inv(H_norm)
+
+    # transform from normalised space to physical space
+    def denormalise_vec(theta_norm_vec):
+        norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
+        physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
+        # denormalise_opt_params returns v_r0 already passed through softplus - convert back to raw space here so that J is correct for the transformation from raw_v_r0 to v_r0
+        if has_v_r0:
+            physical_params = dict(physical_params)
+            physical_params['v_r0'] = gradient_descent.inv_softplus(physical_params['v_r0'])
+        output = [physical_params[k] for k in keys]
+        return jnp.stack(output)
+    
+    J = jax.jacobian(denormalise_vec)(norm_params_vec)
+    cov = J @ cov_norm @ J.T
+    
+    if has_v_r0:
+        v_r0_transformed = transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=None, v_r0_is_raw=True)
+        cov = v_r0_transformed['cov']
 
     # parameter errors
     errors = jnp.sqrt(jnp.diag(cov))
@@ -219,58 +466,71 @@ def estimate_parameter_errors(
 
     return error_dict, cov, cov_transformed_dict
 
-def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key):
-    """Transform a covariance matrix computed in optimisation space (rotation param is mu)
-    into the equivalent covariance matrix for the original input rotation parameter (rc or omega).
+def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=None, v_r0_is_raw=False):
+    """Transform a covariance matrix from optimisation space to physical/output space.
 
     Maths:
-    if A = original optimisation-space parameter vector (with mu)
-    and B = transformed parameter vector with with rc or omega instead of mu,
+    if A = original optimisation-space parameter vector
+    and B = transformed parameter vector,
     then covariance in B space is
 
     cov_B = J @ cov_A @ J^T
 
     where J is the Jacobian of the transformation from A to B, evaluated at the best-fit parameters
-    J = d(B) / d(A)  (identity except for row corresponding to mu)
+    J = d(B) / d(A)  (identity except for rows being tranformed)
 
     Parameters:
     cov: covariance matrix from estimate_parameter_errors, in same parameter order as 'keys'
-    keys: list of str. optimised parameter names, must include 'mu'
-    best_opt_params: dict of best-fit optimised parameters (the point at which we evaluate J)
+    keys: list of str. optimised parameter names
+    best_opt_params: dict of best-fit optimised parameters in physical space (the point at which we evaluate J)
     fixed_params: dict of fixed parameters (the point at which we evaluate J)
-    rotation_key: str, 'rc' or 'omega', the original rotation parameter which we want to transform into
+    rotation_key: str of None, the original rotation parameter which we want to transform into ('rc' or 'omega')
+    v_r0_is_raw: bool, whether v_r0 is in raw space (before softplus transformation)
 
     Returns:
-    new_cov: covariance matrix transformed into original parameter space, with same order as keys but with 'mu' replaced by rotation_key
-    new_keys: list of str, same as keys but with 'mu' replaced by rotation_key
+    new_cov: covariance matrix transformed into original parameter space, with same order as keys but with 'mu' replaced by rotation_key if rotation_key is not None
+    new_keys: list of str, same as keys but with 'mu' replaced by rotation_key if rotation_key is not None
     errors: dict of 1-sigma errors for each parameter in new_keys
     """
+    if rotation_key is not None:
+        if rotation_key not in ['rc', 'omega']:
+            raise ValueError(f"rotation_key must be 'rc' or 'omega', got {rotation_key}")
+        if 'mu' not in keys:
+            raise ValueError(f"keys must include 'mu' for covariance transformation, got {keys}")
+        # check that we have mass and r0 available to convert mu to rc or omega
+        for required_key in ('mass', 'r0'):
+            if required_key not in best_opt_params and required_key not in fixed_params:
+                raise ValueError(f"'{required_key}' must be present in either best_opt_params or fixed_params")
 
-    if rotation_key not in ['rc', 'omega']:
-        raise ValueError(f"rotation_key must be 'rc' or 'omega', got {rotation_key}")
-    if 'mu' not in keys:
-        raise ValueError(f"keys must include 'mu' for covariance transformation, got {keys}")
-    # check that we have mass and r0 available to convert mu to rc or omega
-    for required_key in ('mass', 'r0'):
-        if required_key not in best_opt_params and required_key not in fixed_params:
-            raise ValueError(f"'{required_key}' must be present in either best_opt_params or fixed_params")
-        
-    params_vec = jnp.array([best_opt_params[k] for k in keys], dtype=jnp.float64)
+    # build the vector at which to evaluate the jacobian
+    params_list = []
+    for k in keys:
+        if k == 'v_r0' and v_r0_is_raw:
+            v_r0_best = gradient_descent.to_float64(best_opt_params[k])
+            if not bool(v_r0_best > 0): #should never be triggered
+                raise ValueError(f"best fit v_r0 must be positive, got v_r0={v_r0_best}")
+            params_list.append(gradient_descent.inv_softplus(v_r0_best))
+        else:
+            params_list.append(float(best_opt_params[k]))
+    params_vec = jnp.array(params_list, dtype=jnp.float64)
 
     def transform(vec_A):
         opt_params = vector_to_params_dict(vec_A, keys)
         combined_params = {**fixed_params, **opt_params}
-        mu = combined_params['mu']
-        mass = combined_params['mass']
-        r0 = combined_params['r0']
-        if rotation_key == 'rc':
-            rotation_val = mu * r0
-        else: # 'omega'
-            rotation_val = stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
+        if rotation_key is not None:
+            mu = combined_params['mu']
+            mass = combined_params['mass']
+            r0 = combined_params['r0']
+            if rotation_key == 'rc':
+                rotation_val = mu * r0
+            else: # 'omega'
+                rotation_val = stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
         output = []
         for k in keys:
-            if k == 'mu':
+            if k == 'mu' and rotation_key is not None:
                 output.append(rotation_val)
+            elif k == 'v_r0' and v_r0_is_raw:
+                output.append(gradient_descent.softplus(opt_params[k]))
             else:
                 output.append(opt_params[k])
         return jnp.stack(output)
@@ -278,15 +538,13 @@ def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key)
     J = jax.jacobian(transform)(params_vec)
     new_cov = J @ cov @ J.T
 
-    new_keys = [rotation_key if k == 'mu' else k for k in keys]
+    new_keys = [rotation_key if (k == 'mu' and rotation_key is not None) else k for k in keys]
     new_sigmas = jnp.sqrt(jnp.diag(new_cov))
     error_dict = {k: float(new_sigmas[i]) for i, k in enumerate(new_keys)}
 
     return {'keys': new_keys, 'cov': new_cov, 'errors': error_dict}
 
 #-------------------- old gradient_descent.py ---------------------
-
-
 
 def params_dict_to_vector(opt_params):
     """Convert parameter dict to ordered vector"""
@@ -297,82 +555,6 @@ def params_dict_to_vector(opt_params):
 def vector_to_params_dict(vec, keys):
     """Convert parameter vector back to dict"""
     return {k: vec[i] for i, k in enumerate(keys)}
-
-
-def forward_model(opt_params, fixed_params, distance_pc):
-    """
-    Run the forward model using xyz_stream
-    
-    Parameters:
-    -----------
-    opt_params : dict
-        Dictionary containing optimisable parameters (any subset of
-        STREAMLINE_MODEL_PARAM_KEYS)
-    fixed_params : dict
-        Dictionary containing fixed parameters (the complementary subset)
-        Together with opt_params, this must define all keys in
-        STREAMLINE_MODEL_PARAM_KEYS exactly once
-    distance_pc : float
-        Distance to source in parsecs
-        
-    Returns:
-    --------
-    tuple: (ra_offsets, dec_offsets, velocities)
-        - RA offsets in arcsec (negative for standard convention)
-        - Dec offsets in arcsec
-        - Line-of-sight velocities in km/s, relative to v_lsr
-    """
-    model_params, opt_params, fixed_params = gradient_descent.prepare_model_params(opt_params, fixed_params)
-    distance_pc = extract_streamline.to_float64(distance_pc)
-
-
-    # Protect near-zero v_r0 from creating singularities in physics calculations
-    # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
-    v_r0_protected = model_params['v_r0']
-    threshold = extract_streamline.to_float64(1e-6)
-    v_r0_protected = jnp.where(
-        jnp.isclose(v_r0_protected, extract_streamline.to_float64(0.0)),
-        - jnp.sign(v_r0_protected) * threshold,
-        v_r0_protected
-        )
-
-    # derive mu from rc or omega (whicever is provided)
-    if 'mu' in model_params:
-        mu = model_params['mu']
-    elif 'rc' in model_params:
-        mu = model_params['rc'] / model_params['r0']
-    elif 'omega' in model_params:
-        mu = stream_lines_grad.mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
-    else:
-        raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
-    model_params['mu'] = mu
-
-    # Run the forward model - returns positions in au, velocities in km/s
-    (x, y, z), (vx, vy, vz) = xyz_stream(
-        mass=model_params['mass'],
-        r0=model_params['r0'],
-        theta0=model_params['theta0'],
-        phi0=model_params['phi0'],
-        mu=model_params['mu'],
-        v_r0=v_r0_protected,
-        inc=model_params['inc'],
-        pa=model_params['pa'],
-        rmin=model_params['rmin'],
-        deltar=model_params['deltar']
-    )
-     
-    # Convert positions from au to arcsec offsets
-    # x = RA offset (with negative for standard RA convention)
-    # z = Dec offset
-    # y = line-of-sight velocity
-    ra_model = -x / distance_pc  # arcsec
-    dec_model = z / distance_pc  # arcsec
-    # make velocity absolute by adding back v_lsr
-    v_model = vy + model_params['v_lsr']  # km/s 
-
-    return ra_model, dec_model, v_model
-
-
 
 @jax.jit
 def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
@@ -428,7 +610,6 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
     # weights: 0 = ignore, 1 = use. This is for jax/jit compatibility
     w_model = model_keep.astype(jnp.float64)
-    w_data = data_valid.astype(jnp.float64)
 
     d_model = jnp.where(model_keep, dmetric_model, 0.0)
     d_data  = jnp.where(data_valid, dmetric_data, 0.0)
@@ -490,8 +671,6 @@ def match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data):
 
     return ra_interp, dec_interp, v_interp, valid, dmetric_model, matching_trace
 
-
-
 checked_matching = checkify.checkify(match_model_to_data_curve)
 
 def checked_match_model_to_data_curve(*args, **kwargs):
@@ -499,277 +678,6 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors, result = checked_matching(*args, **kwargs)
     errors.throw()
     return result
-
-
-#@jax.jit(static_argnames=("loss_method"))
-def chi2_loss(
-    opt_params,
-    fixed_params,
-    distance_pc,
-    prepared_data,
-    loss_method=0,
-):
-    """
-    Compute chi-squared loss between model and data using one of two modes:
-    - 0: RA, Dec, and LOS velocity residuals
-    - 1: projected radial distance, polar angle, and LOS velocity residuals
-    
-    Parameters:
-    -----------
-    opt_params : dict
-        optimisable streamline model parameters (any subset of
-        STREAMLINE_MODEL_PARAM_KEYS). already unitless
-    fixed_params : dict
-        Fixed streamline model parameters (complementary subset). already unitless
-    distance_pc : float
-        Distance to source in parsecs
-    prepared_data : PreparedData
-        Precomputed data-only quantities (distance metrics, bounds, polar coords).
-        Created via extract_streamline.prepare_data(data, uncertainties).
-
-        
-            Created via extract_streamline.prepare_data(data, uncertainties).
-    --------
-    float: Chi-squared loss value
-    """
-
-    loss_method = gradient_descent.check_loss_method(loss_method)
-
-    opt_params, fixed_params = gradient_descent.sanitize_param_partition(opt_params, fixed_params)
-    distance_pc = extract_streamline.to_float64(distance_pc)
-
-    ra_data = prepared_data.ra_data
-    dec_data = prepared_data.dec_data
-    v_data = prepared_data.v_data
-    ra_sigma = prepared_data.ra_sigma_safe
-    dec_sigma = prepared_data.dec_sigma_safe
-    v_sigma = prepared_data.v_sigma_safe
-
-    # Run forward model
-    ra_model, dec_model, v_model = forward_model(opt_params, fixed_params, distance_pc)
-    
-
-    # Match model to data using arc-length parameterisation
-    ra_model_interp, dec_model_interp, v_model_interp, valid, dmetric_model, matching_trace = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, ra_data, dec_data)
-    )
-
-    valid = jnp.asarray(valid, dtype=bool)
-    # Only compute chi2 on valid/retained data points to avoid penalizing points outside overlap domain
-    chi2_v_by_point = (((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2)
-    chi2_v = jnp.sum((((v_data[valid] - v_model_interp[valid]) / v_sigma[valid]) ** 2))
-
-    if loss_method == 0:
-        chi2_ra = jnp.sum((((ra_data[valid] - ra_model_interp[valid]) / ra_sigma[valid]) ** 2))
-        chi2_dec = jnp.sum((((dec_data[valid] - dec_model_interp[valid]) / dec_sigma[valid]) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v
-    else:
-        # r/theta are defined on the projected plane of the sky from (RA, Dec).
-        # Use precomputed data coordinates
-        r_proj_data = prepared_data.r_proj_data
-        theta_proj_data = prepared_data.theta_proj_data
-        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
-            ra_model_interp,
-            dec_model_interp,
-        )
-
-        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
-
-        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
-        r_eps = extract_streamline.to_float64(1e-8)
-        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
-        sigma_theta = jnp.maximum(sigma_theta, r_eps)
-
-        # Only compute chi2 on valid/retained data points
-        chi2_r = jnp.sum((((r_proj_data[valid] - r_proj_model[valid]) / sigma_r[valid]) ** 2))
-        chi2_theta = jnp.sum(((dtheta[valid] / sigma_theta[valid]) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v # + chi2_penalty
-
-
-    if loss_method == 0:
-        chi2_components = {
-            'chi2_ra': chi2_ra.astype(float),
-            'chi2_dec': chi2_dec.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
-    else:
-        chi2_components = {
-            'chi2_r': chi2_r.astype(float),
-            'chi2_theta': chi2_theta.astype(float),
-            'chi2_v': chi2_v.astype(float),
-            'chi2_total': chi2_total.astype(float),
-        }
-
-    loss_trace = {
-        'chi2_components': chi2_components,
-        'matching': matching_trace,
-        'loss_method': loss_method,
-    }
-    return chi2_total, loss_trace
-
-
-
-
-# ------------------ old stream_lines_grad.py --------------------
-
-
-## important streamline quantities (for easy reuse)
-class StreamState(NamedTuple):
-    rc: jnp.ndarray
-    mu: jnp.ndarray
-    nu: jnp.ndarray
-    epsilon: jnp.ndarray
-    ecc: jnp.ndarray
-    vk0: jnp.ndarray
-
-
-
-@jax.jit
-def stream_line(r, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
-    '''
-    It calculates the stream line following Mendoza et al. (2009),
-    only for r < r0. Point r = r0 is handled outside the function.
-    It takes the radial velocity and rotation at the streamline
-    initial radius and it describes the entire trajectory.
-
-    :param r: au
-    :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
-    :param theta0: radians
-    :param phi0: radians
-    :return: theta, radians
-    '''
-    r = jnp.asarray(r, dtype=FLOAT_DTYPE)
-    rc = stream_state.rc
-    mu = stream_state.mu
-    ecc = stream_state.ecc
-
-    # orb_ang is varphi in Mendoza+2009
-    # at initial position r_to_rc = r0/rc = 1/mu
-    orb_ang0 = stream_lines_grad.get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-
-    # vectorised computation over array of r values
-    r_to_rc = r / rc
-    orb_ang = stream_lines_grad.get_orb_ang(r_to_rc=r_to_rc, theta0=theta0, ecc=ecc)
-    theta = stream_lines_grad.get_theta(theta0, orb_ang, orb_ang0)
-    phi = phi0 + stream_lines_grad.get_dphi(theta, theta0=theta0)
-
-    # remove values where r_to_rc < 0.5 (inside centrifugal radius)
-    mask = r_to_rc >= 0.5
-    orb_ang = jnp.where(mask, orb_ang, jnp.nan)
-    theta = jnp.where(mask, theta, jnp.nan)
-    phi = jnp.where(mask, phi, jnp.nan)
-
-    return orb_ang, theta, phi #in radians
-
-
-def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
-               phi0=jnp.radians(15), mu=0.1, v_r0=0,
-               inc=jnp.radians(0), pa=jnp.radians(0), rmin=None, deltar=1):
-    '''
-    it gets xyz coordinates and velocities for a stream line.
-    They are also rotated in PA and inclination along the line of sight.
-    This is a wrapper around stream_line() and stream_lines_grad.rotate_xyz()
-
-    Spherical into cartesian transformation is done for position and velocity
-    using:
-    https://en.wikipedia.org/wiki/Vector_fields_in_cylindrical_and_spherical_coordinates
-
-    :param mass: Central mass (Msun)
-    :param r0: Initial radius of streamline (au)
-    :param theta0: Initial polar angle of streamline (radians)
-    :param phi0: Initial azimuthal angle of streamline (radians)
-    :param mu: dimensionless parameter related to rotation, mu = r_cent/r0
-    :param v_r0: Initial radial velocity of the streamline, (km/s)
-    :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (radians)
-    :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (radians)
-    :param rmin: smallest radius for calculation, (au)
-    :param deltar: spacing between two consecutive radii in the sampling of the streamer, in (au)
-    :return: x, y, z in (au), v_x, v_y, v_z in (km/s)
-    '''
-
-    mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
-    r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
-    theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
-    phi0 = jnp.asarray(phi0, dtype=FLOAT_DTYPE)
-    mu = jnp.asarray(mu, dtype=FLOAT_DTYPE)
-    v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
-    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
-    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
-    deltar = jnp.asarray(deltar, dtype=FLOAT_DTYPE)
-    if rmin is not None:
-        rmin = jnp.asarray(rmin, dtype=FLOAT_DTYPE)
-
-    stream_state = stream_lines_grad.build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
-    rc = stream_state.rc
-    mu = stream_state.mu
-    ecc = stream_state.ecc
-
-    rotation_matrix = stream_lines_grad.build_rotation_matrix(inc, pa)
-
-
-    # checkify.check(rc <= r0, "Centrifugal radius is larger that start of streamline.")
-
-    r_low = jnp.maximum(rmin, rc*0.5) if rmin is not None else rc*0.5
-    # r is values internal to the initial radius r0 for computation
-    r = jnp.arange(r0 - deltar, r_low, step=-1*deltar, dtype=FLOAT_DTYPE)
-
-    # calculate positions and velocities inside r0
-    orb_ang, theta, phi = stream_line(r, stream_state=stream_state, theta0=theta0, phi0=phi0)
-    v_r, v_theta, v_phi = stream_lines_grad.stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0)
-
-    # prepend initial positions and velocities at r0
-    r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
-    theta_full = jnp.concatenate((jnp.asarray([theta0], dtype=FLOAT_DTYPE), theta))
-    phi_full = jnp.concatenate((jnp.asarray([phi0], dtype=FLOAT_DTYPE), phi))
-    orb_ang0 = stream_lines_grad.get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
-    orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
-    v_r_full = jnp.concatenate((jnp.asarray([v_r0], dtype=FLOAT_DTYPE), v_r))
-    v_theta_full = jnp.concatenate((jnp.asarray([0.0], dtype=FLOAT_DTYPE), v_theta))
-    # we need to calculate v_phi0
-    v_phi0 = stream_state.vk0 * jnp.sin(theta0) * stream_state.mu
-    v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
-
-    # convert from spherical into cartesian coordinates
-    v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \
-          + v_theta_full * jnp.cos(theta_full) * jnp.cos(phi_full) \
-          - v_phi_full * jnp.sin(phi_full)
-    v_y = v_r_full * jnp.sin(theta_full) * jnp.sin(phi_full) \
-          + v_theta_full * jnp.cos(theta_full) * jnp.sin(phi_full) \
-          + v_phi_full * jnp.cos(phi_full)
-    v_z = v_r_full * jnp.cos(theta_full) \
-          - v_theta_full * jnp.sin(theta_full)
-    x = r_full * jnp.sin(theta_full) * jnp.cos(phi_full)
-    y = r_full * jnp.sin(theta_full) * jnp.sin(phi_full)
-    z = r_full * jnp.cos(theta_full)
-    # get mask from smallest radius for calculation
-    if rmin is None:
-        gd_rmin = jnp.ones_like(r, dtype=bool)
-    else:
-        gd_rmin = (r_full > rmin)
-    gd_rmin = gd_rmin.astype(x.dtype)
-    # apply mask before rotation
-    x = jnp.where(gd_rmin, x, jnp.nan)  
-    y = jnp.where(gd_rmin, y, jnp.nan)
-    z = jnp.where(gd_rmin, z, jnp.nan)
-    v_x = jnp.where(gd_rmin, v_x, jnp.nan)
-    v_y = jnp.where(gd_rmin, v_y, jnp.nan)
-    v_z = jnp.where(gd_rmin, v_z, jnp.nan)
-    # rotate
-    return stream_lines_grad.rotate_xyz(x, y, z, rotation_matrix=rotation_matrix), \
-           stream_lines_grad.rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
-
-# ----------------- old extract_streamline.py ------------------
-
-PreparedData = namedtuple('PreparedData', [
-    'ra_data', 'dec_data', 'v_data',
-    'ra_sigma_safe', 'dec_sigma_safe', 'v_sigma_safe',
-    'dmetric_data', 'data_finite_mask',
-    'data_min', 'data_max',
-    'r_proj_data', 'theta_proj_data',
-])
-
 
 
     

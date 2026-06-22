@@ -10,8 +10,10 @@ from collections import namedtuple
 import jax.numpy as jnp
 import jax
 
-from velocity_tools.streamfit.gradient_descent import BIG
-from velocity_tools.streamfit.stream_lines_grad import to_float64
+BIG = 1e30
+
+def to_float64(value):
+    return jnp.asarray(value, dtype=jnp.float64)
 
 PreparedData = namedtuple('PreparedData', [
     'ra_data', 'dec_data', 'v_data',
